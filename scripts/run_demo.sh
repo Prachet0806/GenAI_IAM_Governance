@@ -63,8 +63,14 @@ python3 lambdas/risk_evaluation/handler.py
 # --------------------------------------------------
 # 5. Certification Campaign Generation
 # --------------------------------------------------
-echo -e "\n[4/6] Generating Access Certification Campaign..."
+echo -e "\n[4/7] Generating Access Certification Campaign..."
 python3 lambdas/generate_reviews/handler.py
+
+# --------------------------------------------------
+# 6. AI Risk Explanation (High Risk Only)
+# --------------------------------------------------
+echo -e "\n[5/7] Generating AI risk explanations (HIGH only)..."
+python3 lambdas/ai_explanation/handler.py
 
 # --------------------------------------------------
 # INTERMISSION: Simulate Human Review
@@ -110,16 +116,16 @@ fi
 echo "      ✅ Review decisions recorded."
 
 # --------------------------------------------------
-# 6. Remediation (Dry Run)
+# 7. Remediation (Dry Run)
 # --------------------------------------------------
-echo -e "\n[5/6] Executing Remediation Engine (DRY RUN)..."
+echo -e "\n[6/7] Executing Remediation Engine (DRY RUN)..."
 export DRY_RUN=True
 python3 lambdas/remediation/handler.py
 
 # --------------------------------------------------
-# 7. Audit Report Export
+# 8. Audit Report Export
 # --------------------------------------------------
-echo -e "\n[6/6] Exporting Audit Report..."
+echo -e "\n[7/7] Exporting Audit Report..."
 python3 reports/export_audit.py
 
 # --------------------------------------------------

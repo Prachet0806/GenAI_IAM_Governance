@@ -132,6 +132,38 @@ def list_revocations(conn) -> List[Tuple[str, str, str, str]]:
     return cur.fetchall()
 
 
+def list_high_risk_reviews_missing_ai(conn) -> List[Tuple[str, str, str, str, str, str]]:
+    cur = conn.cursor()
+    db.execute(
+        cur,
+        """
+        SELECT r.review_id, r.user_id, r.role_id, u.user_name, rol.role_name, rol.risk_level
+        FROM access_reviews r
+        JOIN users u ON r.user_id = u.user_id
+        JOIN roles rol ON r.role_id = rol.role_id
+        WHERE rol.risk_level = 'HIGH'
+          AND (r.ai_risk_summary IS NULL OR r.ai_risk_summary = '')
+        """,
+    )
+    return cur.fetchall()
+
+
+def fetch_review_context(conn, review_id: str) -> Tuple[str, str, str, str, str, str] | None:
+    cur = conn.cursor()
+    db.execute(
+        cur,
+        """
+        SELECT r.review_id, r.user_id, r.role_id, u.user_name, rol.role_name, rol.risk_level
+        FROM access_reviews r
+        JOIN users u ON r.user_id = u.user_id
+        JOIN roles rol ON r.role_id = rol.role_id
+        WHERE r.review_id = ?
+        """,
+        (review_id,),
+    )
+    return cur.fetchone()
+
+
 def mark_remediated(conn, review_id: str, ts: str):
     db.execute(
         conn.cursor(),
@@ -157,6 +189,7 @@ def fetch_reviews_for_export(conn) -> List[Tuple[Any, ...]]:
             rol.risk_level,
             r.status,
             r.reviewer_comment,
+            r.ai_risk_summary,
             r.created_at,
             r.reviewed_at,
             r.remediated_at

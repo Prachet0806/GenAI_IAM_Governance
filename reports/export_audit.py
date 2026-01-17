@@ -59,6 +59,7 @@ def export_audit_report():
                 "Risk Level",
                 "Decision Status",
                 "Reviewer Comment",
+                "AI Risk Summary",
                 "Created At",
                 "Reviewed At",
                 "Remediated At"
@@ -75,9 +76,10 @@ def export_audit_report():
                 "risk_level": r[4],
                 "status": r[5],
                 "reviewer_comment": r[6],
-                "created_at": r[7],
-                "reviewed_at": r[8],
-                "remediated_at": r[9],
+                "ai_risk_summary": r[7],
+                "created_at": r[8],
+                "reviewed_at": r[9],
+                "remediated_at": r[10],
             }
             for r in rows
         ]

@@ -1,3 +1,4 @@
+#sql/schema_base.sql
 -- Portable base schema (SQLite/Postgres compatible types)
 
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS access_reviews (
     role_id TEXT NOT NULL,
     status TEXT CHECK (status IN ('PENDING','APPROVED','REVOKED')) DEFAULT 'PENDING',
     reviewer_comment TEXT,
+    ai_risk_summary TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     reviewed_at TIMESTAMP,
     remediated_at TIMESTAMP,

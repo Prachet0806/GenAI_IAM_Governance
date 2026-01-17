@@ -1,3 +1,4 @@
+#scripts/migrate.py
 import os
 import sys
 from pathlib import Path
@@ -54,6 +55,12 @@ def apply_sqlite():
         cursor = conn.cursor()
         cursor.executescript(base_sql)
         cursor.executescript(sqlite_sql)
+        _ensure_sqlite_column(
+            conn,
+            table="access_reviews",
+            column="ai_risk_summary",
+            column_def="TEXT",
+        )
         cursor.execute(
             "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
             (config.SCHEMA_VERSION,),
@@ -101,6 +108,17 @@ def apply_postgres():
         )
     finally:
         conn.close()
+
+
+def _ensure_sqlite_column(conn, table: str, column: str, column_def: str):
+    """
+    Add a column if it does not exist (SQLite has no IF NOT EXISTS for columns).
+    """
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in cur.fetchall()}
+    if column not in existing:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
 
 
 def main():

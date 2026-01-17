@@ -34,7 +34,7 @@ AUDIT_S3_PREFIX = os.getenv("AUDIT_S3_PREFIX", "")
 LOCAL_ONLY = _get_bool("LOCAL_ONLY", False)
 
 # Schema/versioning
-SCHEMA_VERSION = "2026-01-phase1"
+SCHEMA_VERSION = "2026-01-phase2"
 
 
 def _parsed_db_url():
