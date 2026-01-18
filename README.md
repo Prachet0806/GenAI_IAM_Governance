@@ -1,4 +1,4 @@
-# IAM Access Certification Engine
+# GenAI-Enhanced IAM Access Certification Engine
 
 A Python-based, serverless-style prototype for IAM access certification. It discovers IAM users and their attached managed policies, classifies entitlement risk, generates campaign-based access reviews, simulates reviewer decisions, performs gated remediation, and exports audit artifacts (CSV + JSON) locally and optionally to S3.
 
