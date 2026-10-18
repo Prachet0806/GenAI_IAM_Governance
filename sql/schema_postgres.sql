@@ -82,6 +82,7 @@ ALTER TABLE roles ADD COLUMN IF NOT EXISTS policy_document TEXT;
 ALTER TABLE roles ADD COLUMN IF NOT EXISTS observed_at TIMESTAMPTZ;
 ALTER TABLE access_reviews ADD COLUMN IF NOT EXISTS reviewer_sub TEXT;
 ALTER TABLE remediation_approvals ADD COLUMN IF NOT EXISTS discovery_run_id TEXT;
+ALTER TABLE remediation_claims ADD COLUMN IF NOT EXISTS fencing_token INTEGER NOT NULL DEFAULT 0;
 
 -- Indexes (idempotent)
 CREATE INDEX IF NOT EXISTS idx_reviews_status ON access_reviews(status);

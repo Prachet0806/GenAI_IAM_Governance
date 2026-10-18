@@ -1,5 +1,5 @@
 # common/repo.py
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from typing import Any, Iterable, List, Tuple
 
@@ -116,9 +116,19 @@ def record_remediation_approval(conn, approval_id: str, review_id: str, approver
     cur = conn.cursor()
     db.execute(cur, """INSERT INTO remediation_approvals
         (approval_id,review_id,approver_sub,approved_at,discovery_run_id)
-        VALUES (?,?,?,?,?) ON CONFLICT(review_id) DO NOTHING""",
+        VALUES (?,?,?,?,?) ON CONFLICT(review_id) DO UPDATE SET
+        approval_id=excluded.approval_id,approver_sub=excluded.approver_sub,
+        approved_at=excluded.approved_at,discovery_run_id=excluded.discovery_run_id
+        WHERE COALESCE(remediation_approvals.discovery_run_id,'') <> excluded.discovery_run_id""",
         (approval_id, review_id, approver_sub, approved_at, discovery_run_id))
     return cur.rowcount == 1
+
+
+def get_remediation_approval(conn, review_id: str):
+    cur = conn.cursor()
+    db.execute(cur, "SELECT approver_sub,approved_at,discovery_run_id FROM remediation_approvals WHERE review_id=?",
+               (review_id,))
+    return cur.fetchone()
 
 
 def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool:
@@ -130,19 +140,47 @@ def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool
     return cur.fetchone() is not None
 
 
-def claim_remediation(conn, review_id: str, claim_token: str, now: str, lease_expires_at: str) -> bool:
+def claim_remediation(conn, review_id: str, claim_token: str, now: str, lease_expires_at: str):
     cur = conn.cursor()
-    db.execute(cur, """INSERT INTO remediation_claims (review_id,claim_token,lease_expires_at)
-        VALUES (?,?,?) ON CONFLICT(review_id) DO UPDATE SET
-        claim_token=excluded.claim_token,lease_expires_at=excluded.lease_expires_at
+    db.execute(cur, """INSERT INTO remediation_claims
+        (review_id,claim_token,lease_expires_at,fencing_token)
+        VALUES (?,?,?,1) ON CONFLICT(review_id) DO UPDATE SET
+        claim_token=excluded.claim_token,lease_expires_at=excluded.lease_expires_at,
+        fencing_token=remediation_claims.fencing_token+1
         WHERE remediation_claims.lease_expires_at <= ?""",
         (review_id, claim_token, lease_expires_at, now))
+    if cur.rowcount != 1:
+        return None
+    db.execute(cur, "SELECT fencing_token FROM remediation_claims WHERE review_id=? AND claim_token=?",
+               (review_id, claim_token))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def renew_remediation_claim(conn, review_id: str, claim_token: str, fencing_token: int,
+                            now: str, lease_expires_at: str) -> bool:
+    cur = conn.cursor()
+    db.execute(cur, """UPDATE remediation_claims SET lease_expires_at=?
+        WHERE review_id=? AND claim_token=? AND fencing_token=? AND lease_expires_at>?""",
+        (lease_expires_at, review_id, claim_token, fencing_token, now))
     return cur.rowcount == 1
 
 
-def release_remediation_claim(conn, review_id: str, claim_token: str):
-    db.execute(conn.cursor(), "DELETE FROM remediation_claims WHERE review_id=? AND claim_token=?",
-               (review_id, claim_token))
+def release_remediation_claim(conn, review_id: str, claim_token: str, fencing_token: int):
+    released_at = datetime.now(timezone.utc).isoformat()
+    db.execute(conn.cursor(), """UPDATE remediation_claims SET lease_expires_at=?
+        WHERE review_id=? AND claim_token=? AND fencing_token=?""",
+        (released_at, review_id, claim_token, fencing_token))
+
+
+def lock_inventory_remediation(conn):
+    """Serialize snapshot publication with a remediation's final check and AWS call.
+
+    The row update holds a write lock until the surrounding transaction commits
+    or rolls back on both SQLite and PostgreSQL.
+    """
+    db.execute(conn.cursor(), """UPDATE governance_mutex SET lock_version=lock_version+1
+        WHERE lock_name='inventory_remediation'""")
 
 
 def is_current_entitlement(conn, review_id: str) -> bool:

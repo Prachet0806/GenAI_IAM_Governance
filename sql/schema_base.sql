@@ -79,8 +79,16 @@ CREATE TABLE IF NOT EXISTS remediation_claims (
     review_id TEXT PRIMARY KEY,
     claim_token TEXT NOT NULL,
     lease_expires_at TIMESTAMP NOT NULL,
+    fencing_token INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(review_id) REFERENCES access_reviews(review_id)
 );
+
+CREATE TABLE IF NOT EXISTS governance_mutex (
+    lock_name TEXT PRIMARY KEY,
+    lock_version INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO governance_mutex (lock_name, lock_version)
+VALUES ('inventory_remediation', 0) ON CONFLICT(lock_name) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS audit_logs (
     id TEXT PRIMARY KEY,

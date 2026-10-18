@@ -77,6 +77,24 @@ def _is_group_policy(iam, user_name: str, policy_arn: str) -> bool:
     return False
 
 
+def _is_supported_fresh_discovery(run, expected_run_id: str | None = None) -> bool:
+    if (not run or run[2] != "COMPLETE"
+            or not str(run[3] or "").startswith("AWS:iam-users-direct-and-group-managed-and-inline-policies-v2")
+            or (expected_run_id is not None and run[0] != expected_run_id)
+            or not run[1]):
+        return False
+    try:
+        observed = run[1]
+        if not isinstance(observed, datetime):
+            observed = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds() / 3600
+        return -0.1 <= age_hours <= config.get_max_discovery_age_hours()
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def remediate_access(event, context):
     dry_run = config.is_dry_run()
     enabled = config.is_remediation_enabled()
@@ -113,23 +131,11 @@ def remediate_access(event, context):
         discovery_run_id = None
         if not dry_run and enabled:
             latest = repo.latest_discovery_run(conn)
-            if (not latest or latest[2] != "COMPLETE" or not latest[1]
-                    or not str(latest[3] or "").startswith("AWS:iam-users-direct-and-group-managed-and-inline-policies-v2")):
+            if not _is_supported_fresh_discovery(latest):
                 logger.log("remediate_access", "error", "Live remediation blocked: no latest complete inventory scan",
                            level="ERROR")
                 return {"status": "blocked", "reason": "inventory_not_complete", "remediated": 0, "skipped": 0, "dry_run": dry_run}
             discovery_run_id = latest[0]
-            observed = latest[1]
-            if not isinstance(observed, datetime):
-                observed = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
-            if observed.tzinfo is None:
-                observed = observed.replace(tzinfo=timezone.utc)
-            age_hours = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds() / 3600
-            if age_hours < -0.1 or age_hours > config.get_max_discovery_age_hours():
-                logger.log("remediate_access", "error", "Live remediation blocked: inventory scan is stale or has an invalid timestamp",
-                           level="ERROR", details={"age_hours": round(age_hours, 2),
-                                                    "max_age_hours": config.get_max_discovery_age_hours()})
-                return {"status": "blocked", "reason": "inventory_stale", "remediated": 0, "skipped": 0, "dry_run": dry_run}
         revocations = repo.list_revocations(conn)
 
         if dry_run or not enabled:
@@ -150,6 +156,7 @@ def remediate_access(event, context):
 
         for review_id, user_name, role_name, role_arn in revocations:
             claim_token = None
+            fencing_token = None
             logger.log(
                 "remediate_access",
                 "processing",
@@ -188,8 +195,9 @@ def remediate_access(event, context):
                     claim_token = str(uuid.uuid4())
                     claimed_at = datetime.now(timezone.utc)
                     lease_until = claimed_at + timedelta(minutes=5)
-                    if not repo.claim_remediation(conn, review_id, claim_token,
-                                                  claimed_at.isoformat(), lease_until.isoformat()):
+                    fencing_token = repo.claim_remediation(conn, review_id, claim_token,
+                                                           claimed_at.isoformat(), lease_until.isoformat())
+                    if fencing_token is None:
                         logger.log("remediate_access", "skip", "Another worker holds the remediation lease",
                                    entity_type="access_review", entity_id=review_id)
                         skipped_count += 1
@@ -197,12 +205,13 @@ def remediate_access(event, context):
                     # Make the lease visible before calling AWS so another worker
                     # cannot pass the same eligibility check concurrently.
                     conn.commit()
+                    repo.lock_inventory_remediation(conn)
                     current_discovery = repo.latest_discovery_run(conn)
-                    if (not current_discovery or current_discovery[0] != discovery_run_id
-                            or current_discovery[2] != "COMPLETE"
+                    if (not _is_supported_fresh_discovery(current_discovery, discovery_run_id)
                             or not repo.is_current_entitlement(conn, review_id)
                             or not repo.is_remediation_approved(conn, review_id, discovery_run_id)):
-                        repo.release_remediation_claim(conn, review_id, claim_token)
+                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        conn.commit()
                         logger.log("remediate_access", "skip", "Review, approval, entitlement, or discovery snapshot changed",
                                    entity_type="access_review", entity_id=review_id)
                         skipped_count += 1
@@ -210,7 +219,8 @@ def remediate_access(event, context):
                     # This worker only knows how to detach a direct managed user
                     # policy. Inline and group-derived grants need distinct workflows.
                     if not role_arn.startswith("arn:aws:iam::"):
-                        repo.release_remediation_claim(conn, review_id, claim_token)
+                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        conn.commit()
                         logger.log("remediate_access", "skip", "Entitlement is not a detachable managed-policy ARN",
                                    entity_type="access_review", entity_id=review_id)
                         skipped_count += 1
@@ -218,17 +228,37 @@ def remediate_access(event, context):
                     if iam is None:
                         iam = _get_iam_client()
                     if _is_group_policy(iam, user_name, role_arn):
-                        repo.release_remediation_claim(conn, review_id, claim_token)
+                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        conn.commit()
                         logger.log("remediate_access", "skip", "Policy is also inherited through an IAM group",
                                    entity_type="access_review", entity_id=review_id)
                         skipped_count += 1
                         continue
                     if not _is_policy_attached(iam, user_name, role_arn):
                         repo.mark_remediated(conn, review_id, datetime.now(timezone.utc).isoformat())
-                        repo.release_remediation_claim(conn, review_id, claim_token)
+                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        conn.commit()
                         logger.log("remediate_access", "success", "Revoked entitlement was already absent in AWS",
                                    entity_type="access_review", entity_id=review_id)
                         action_count += 1
+                        continue
+                    # Recheck the owner epoch and the approved snapshot after all
+                    # AWS reads, immediately before the destructive AWS call.
+                    final_now = datetime.now(timezone.utc)
+                    final_lease = final_now + timedelta(minutes=5)
+                    current_discovery = repo.latest_discovery_run(conn)
+                    claim_owned = repo.renew_remediation_claim(
+                        conn, review_id, claim_token, fencing_token,
+                        final_now.isoformat(), final_lease.isoformat())
+                    if (not claim_owned
+                            or not _is_supported_fresh_discovery(current_discovery, discovery_run_id)
+                            or not repo.is_current_entitlement(conn, review_id)
+                            or not repo.is_remediation_approved(conn, review_id, discovery_run_id)):
+                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        conn.commit()
+                        logger.log("remediate_access", "skip", "Final ownership or snapshot validation failed",
+                                   entity_type="access_review", entity_id=review_id)
+                        skipped_count += 1
                         continue
                     iam.detach_user_policy(UserName=user_name, PolicyArn=role_arn)
                     logger.log(
@@ -241,13 +271,19 @@ def remediate_access(event, context):
                     # Only mark remediated after a verified detach — never on
                     # skip or dry-run, otherwise future runs hide the row forever.
                     repo.mark_remediated(conn, review_id, datetime.now(timezone.utc).isoformat())
-                    repo.release_remediation_claim(conn, review_id, claim_token)
+                    repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                    conn.commit()
                     action_count += 1
 
             except Exception as e:
-                if claim_token:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                if claim_token and fencing_token is not None:
                     try:
-                        repo.release_remediation_claim(conn, review_id, claim_token)
+                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        conn.commit()
                     except Exception:
                         pass
                 logger.log(

@@ -160,11 +160,15 @@ def discover_identities(event, context):
     mode = "MOCK" if _is_mock() else "AWS"
     scope = "iam-users-direct-and-group-managed-and-inline-policies-v2"
     with db.get_connection() as conn:
+        repo.lock_inventory_remediation(conn)
         repo.start_discovery_run(conn, run_id, started, f"{mode}:{scope}")
     user_count, errors = 0, 0
     pairs = set()
     try:
         with db.get_connection() as conn:
+            # Hold the shared database lock through reconciliation and commit so
+            # a remediation cannot detach against a snapshot being published.
+            repo.lock_inventory_remediation(conn)
             for user in _iter_identities():
                 try:
                     u_id = user['UserId']

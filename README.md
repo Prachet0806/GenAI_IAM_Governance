@@ -83,6 +83,8 @@ Copy `.env.example` for local configuration. Do not commit credentials.
 
 The portable base schema and engine-specific files are in `sql/`; `scripts/migrate.py` applies them and additive compatibility changes. Export artifacts are written under `reports/` using date plus unique run ID, with a `.manifest.json` file. Set `LOCAL_ONLY=true` to skip S3.
 
+GitHub Actions runs `pytest -q` on pushes and pull requests using mock IAM and SQLite in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+
 ## Known boundaries
 
 - Name heuristics remain as a fallback signal when policy evidence is unavailable; incomplete IAM surface coverage prevents full effective-access conclusions. Group membership changes and policy reads are currently reconciled only for discovered users; stale user/group/policy entities may remain in the descriptive tables after a complete scan.

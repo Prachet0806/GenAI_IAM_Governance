@@ -106,6 +106,66 @@ def test_ai_handler_disabled_without_key(monkeypatch):
     assert ai.handler(None, None)["status"] == "DISABLED"
 
 
+def test_group_attached_policy_uses_group_iam_operation():
+    from lambdas.identity_discovery.handler import _list_all_attached_policies
+
+    class FakeIam:
+        def __init__(self):
+            self.calls = []
+
+        def list_attached_user_policies(self, **kwargs):
+            self.calls.append(("user", kwargs))
+            return {"AttachedPolicies": [{"PolicyArn": "arn:user-policy"}]}
+
+        def list_attached_group_policies(self, **kwargs):
+            self.calls.append(("group", kwargs))
+            return {"AttachedPolicies": [{"PolicyArn": "arn:group-policy"}]}
+
+    iam = FakeIam()
+    user = _list_all_attached_policies(iam, "alice", "user")
+    group = _list_all_attached_policies(iam, "engineering", "group")
+    assert user[0]["PolicyArn"] == "arn:user-policy"
+    assert group[0]["PolicyArn"] == "arn:group-policy"
+    assert iam.calls == [("user", {"UserName": "alice"}), ("group", {"GroupName": "engineering"})]
+
+
+def test_remediation_approval_renews_and_fencing_rejects_stale_worker(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_URL", f"sqlite:///{tmp_path / 'remediation.db'}")
+    from scripts import migrate
+    migrate.apply_sqlite()
+    from common import repo
+    from common.db import db
+
+    with db.get_connection() as conn:
+        repo.insert_user(conn, "U1", "user", "arn:aws:iam::123:user/user", "2026-01-01T00:00:00+00:00")
+        repo.insert_role(conn, "R1", "ReadOnlyAccess")
+        repo.link_user_role(conn, "U1", "R1")
+        repo.create_campaign(conn, "C1", "test", "2026-01-01T00:00:00+00:00")
+        repo.create_review(conn, "REV1", "C1", "U1", "R1", "2026-01-01T00:00:00+00:00")
+        cur = conn.cursor()
+        db.execute(cur, "UPDATE access_reviews SET status='REVOKED', reviewer_comment='test', reviewer_sub='reviewer' WHERE review_id='REV1'")
+
+        assert repo.record_remediation_approval(conn, "A1", "REV1", "approver", "2026-01-01T00:00:00+00:00", "RUN1")
+        assert repo.is_remediation_approved(conn, "REV1", "RUN1")
+        assert repo.record_remediation_approval(conn, "A2", "REV1", "approver", "2026-01-02T00:00:00+00:00", "RUN2")
+        assert not repo.is_remediation_approved(conn, "REV1", "RUN1")
+        assert repo.is_remediation_approved(conn, "REV1", "RUN2")
+        assert not repo.record_remediation_approval(conn, "A3", "REV1", "other-approver", "2026-01-02T00:00:00+00:00", "RUN2")
+
+        t0 = "2026-01-01T00:00:00+00:00"
+        expiry = "2026-01-01T00:05:00+00:00"
+        old_epoch = repo.claim_remediation(conn, "REV1", "worker-1", t0, expiry)
+        assert old_epoch == 1
+        assert repo.claim_remediation(conn, "REV1", "worker-2", "2026-01-01T00:04:59+00:00", "2026-01-01T00:09:59+00:00") is None
+        new_epoch = repo.claim_remediation(conn, "REV1", "worker-2", expiry, "2026-01-01T00:10:00+00:00")
+        assert new_epoch == 2
+        assert not repo.renew_remediation_claim(conn, "REV1", "worker-1", old_epoch,
+                                                "2026-01-01T00:05:01+00:00", "2026-01-01T00:10:01+00:00")
+        repo.release_remediation_claim(conn, "REV1", "worker-1", old_epoch)
+        assert repo.renew_remediation_claim(conn, "REV1", "worker-2", new_epoch,
+                                            "2026-01-01T00:05:01+00:00", "2026-01-01T00:10:01+00:00")
+
+
 def test_mock_org_12_users():
     from lambdas.identity_discovery.handler import _mock_identities
     users = _mock_identities()

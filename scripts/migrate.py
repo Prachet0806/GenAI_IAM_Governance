@@ -143,6 +143,7 @@ def apply_sqlite():
         _ensure_sqlite_column(conn, "roles", "observed_at", "TIMESTAMP")
         _ensure_sqlite_column(conn, "access_reviews", "reviewer_sub", "TEXT")
         _ensure_sqlite_column(conn, "remediation_approvals", "discovery_run_id", "TEXT")
+        _ensure_sqlite_column(conn, "remediation_claims", "fencing_token", "INTEGER NOT NULL DEFAULT 0")
         cursor.execute(
             "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
             (config.SCHEMA_VERSION,),

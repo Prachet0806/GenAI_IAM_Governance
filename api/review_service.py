@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -126,8 +126,9 @@ def assign_reviewer(campaign_id: str, request: ReviewerAssignmentRequest,
             "status": "assigned" if created else "already_assigned"}
 
 
-@app.post("/reviews/{review_id}/remediation-approval", status_code=201)
-def approve_remediation(review_id: str, claims: dict = Depends(current_reviewer)):
+@app.post("/reviews/{review_id}/remediation-approval")
+def approve_remediation(review_id: str, response: Response,
+                        claims: dict = Depends(current_reviewer)):
     try:
         auth.require_group(claims, os.getenv("REMEDIATION_APPROVER_GROUP", ""))
     except auth.AuthorizationError:
@@ -146,14 +147,18 @@ def approve_remediation(review_id: str, claims: dict = Depends(current_reviewer)
         if (not discovery or discovery[2] != "COMPLETE"
                 or not str(discovery[3] or "").startswith("AWS:iam-users-direct-and-group-managed-and-inline-policies-v2")):
             raise HTTPException(status_code=409, detail="A complete supported AWS discovery run is required")
+        previous = repo.get_remediation_approval(conn, review_id)
         now = datetime.now(timezone.utc)
         created = repo.record_remediation_approval(conn, str(uuid.uuid4()), review_id,
                                                    claims["sub"], now.isoformat(), discovery[0])
         if not created:
-            raise HTTPException(status_code=409, detail="A remediation approval already exists for this review")
-        repo.insert_audit_log(conn, str(uuid.uuid4()), now, "INFO", "remediation_approval", "approved",
-                              "Independent authenticated approver authorized remediation",
+            raise HTTPException(status_code=409, detail="A remediation approval already exists for this discovery run")
+        renewed = previous is not None
+        response.status_code = 200 if renewed else 201
+        status = "renewed" if renewed else "approved"
+        repo.insert_audit_log(conn, str(uuid.uuid4()), now, "INFO", "remediation_approval", status,
+                              "Independent authenticated approver authorized or renewed remediation",
                               entity_type="access_review", entity_id=review_id,
                               details={"approver_sub": claims["sub"], "reviewer_sub": review[5],
-                                       "discovery_run_id": discovery[0]})
-    return {"review_id": review_id, "status": "approved"}
+                                       "discovery_run_id": discovery[0], "renewed": renewed})
+    return {"review_id": review_id, "status": status, "discovery_run_id": discovery[0]}
