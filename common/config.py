@@ -32,8 +32,8 @@ DRY_RUN = _get_bool("DRY_RUN", True)
 ENABLE_REMEDIATION = _get_bool("ENABLE_REMEDIATION", False)
 ALLOWLIST = _parse_list("REMEDIATION_ALLOWLIST")
 DENYLIST = _parse_list("REMEDIATION_DENYLIST")
-if not DENYLIST:
-    DENYLIST.update({"administratoraccess", "breakglass", "break-glass"})
+MANDATORY_DENYLIST = frozenset({"*administratoraccess*", "*breakglass*", "*break-glass*"})
+DENYLIST.update(MANDATORY_DENYLIST)
 
 # Audit export
 AUDIT_S3_BUCKET = os.getenv("AUDIT_S3_BUCKET")
@@ -45,7 +45,7 @@ GENAI_MODEL = os.getenv("GENAI_MODEL", "gemini-3.8-flash")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Schema/versioning
-SCHEMA_VERSION = "2026-10-p1-1"
+SCHEMA_VERSION = "2026-10-p1-2"
 
 
 # --- Runtime getters (avoid import-time freezing for Lambda) ---
@@ -77,10 +77,7 @@ def get_allowlist() -> set:
 
 
 def get_denylist() -> set:
-    denies = _parse_list("REMEDIATION_DENYLIST")
-    if not denies:
-        denies.update({"administratoraccess", "breakglass", "break-glass"})
-    return denies
+    return set(MANDATORY_DENYLIST) | _parse_list("REMEDIATION_DENYLIST")
 
 
 def get_log_level() -> str:

@@ -1,8 +1,9 @@
 #lambdas/remediation/handler.py
 import boto3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 import sys
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,7 +22,10 @@ def _should_detach(role_name: str, role_arn: str = "", allowlist: set | None = N
     """Exact/bounded matching: denylist blocks exact names or explicit substrings
     only when wrapped; allowlist (if non-empty) requires exact match on name or ARN."""
     allow = {_norm(a) for a in (allowlist if allowlist is not None else config.get_allowlist())}
-    deny = {_norm(d) for d in (denylist if denylist is not None else config.get_denylist())}
+    # Mandatory protections cannot be bypassed by custom configuration or a
+    # caller-supplied denylist used in tests/tools.
+    deny = {_norm(d) for d in config.MANDATORY_DENYLIST}
+    deny.update(_norm(d) for d in (denylist if denylist is not None else config.get_denylist()))
     name = _norm(role_name)
     arn = _norm(role_arn)
     # Deny: exact match on name/arn, or substring only if the denylist entry
@@ -106,6 +110,7 @@ def remediate_access(event, context):
         )
 
     with db.get_connection() as conn:
+        discovery_run_id = None
         if not dry_run and enabled:
             latest = repo.latest_discovery_run(conn)
             if (not latest or latest[2] != "COMPLETE" or not latest[1]
@@ -113,6 +118,7 @@ def remediate_access(event, context):
                 logger.log("remediate_access", "error", "Live remediation blocked: no latest complete inventory scan",
                            level="ERROR")
                 return {"status": "blocked", "reason": "inventory_not_complete", "remediated": 0, "skipped": 0, "dry_run": dry_run}
+            discovery_run_id = latest[0]
             observed = latest[1]
             if not isinstance(observed, datetime):
                 observed = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
@@ -143,6 +149,7 @@ def remediate_access(event, context):
         iam = None
 
         for review_id, user_name, role_name, role_arn in revocations:
+            claim_token = None
             logger.log(
                 "remediate_access",
                 "processing",
@@ -172,15 +179,38 @@ def remediate_access(event, context):
                         entity_id=review_id,
                     )
                     skipped_count += 1
-                elif not repo.is_remediation_approved(conn, review_id):
+                elif not repo.is_remediation_approved(conn, review_id, discovery_run_id):
                     logger.log("remediate_access", "skip",
                                "Independent authenticated remediation approval is required",
                                entity_type="access_review", entity_id=review_id)
                     skipped_count += 1
                 else:
+                    claim_token = str(uuid.uuid4())
+                    claimed_at = datetime.now(timezone.utc)
+                    lease_until = claimed_at + timedelta(minutes=5)
+                    if not repo.claim_remediation(conn, review_id, claim_token,
+                                                  claimed_at.isoformat(), lease_until.isoformat()):
+                        logger.log("remediate_access", "skip", "Another worker holds the remediation lease",
+                                   entity_type="access_review", entity_id=review_id)
+                        skipped_count += 1
+                        continue
+                    # Make the lease visible before calling AWS so another worker
+                    # cannot pass the same eligibility check concurrently.
+                    conn.commit()
+                    current_discovery = repo.latest_discovery_run(conn)
+                    if (not current_discovery or current_discovery[0] != discovery_run_id
+                            or current_discovery[2] != "COMPLETE"
+                            or not repo.is_current_entitlement(conn, review_id)
+                            or not repo.is_remediation_approved(conn, review_id, discovery_run_id)):
+                        repo.release_remediation_claim(conn, review_id, claim_token)
+                        logger.log("remediate_access", "skip", "Review, approval, entitlement, or discovery snapshot changed",
+                                   entity_type="access_review", entity_id=review_id)
+                        skipped_count += 1
+                        continue
                     # This worker only knows how to detach a direct managed user
                     # policy. Inline and group-derived grants need distinct workflows.
                     if not role_arn.startswith("arn:aws:iam::"):
+                        repo.release_remediation_claim(conn, review_id, claim_token)
                         logger.log("remediate_access", "skip", "Entitlement is not a detachable managed-policy ARN",
                                    entity_type="access_review", entity_id=review_id)
                         skipped_count += 1
@@ -188,12 +218,14 @@ def remediate_access(event, context):
                     if iam is None:
                         iam = _get_iam_client()
                     if _is_group_policy(iam, user_name, role_arn):
+                        repo.release_remediation_claim(conn, review_id, claim_token)
                         logger.log("remediate_access", "skip", "Policy is also inherited through an IAM group",
                                    entity_type="access_review", entity_id=review_id)
                         skipped_count += 1
                         continue
                     if not _is_policy_attached(iam, user_name, role_arn):
                         repo.mark_remediated(conn, review_id, datetime.now(timezone.utc).isoformat())
+                        repo.release_remediation_claim(conn, review_id, claim_token)
                         logger.log("remediate_access", "success", "Revoked entitlement was already absent in AWS",
                                    entity_type="access_review", entity_id=review_id)
                         action_count += 1
@@ -209,9 +241,15 @@ def remediate_access(event, context):
                     # Only mark remediated after a verified detach — never on
                     # skip or dry-run, otherwise future runs hide the row forever.
                     repo.mark_remediated(conn, review_id, datetime.now(timezone.utc).isoformat())
+                    repo.release_remediation_claim(conn, review_id, claim_token)
                     action_count += 1
 
             except Exception as e:
+                if claim_token:
+                    try:
+                        repo.release_remediation_claim(conn, review_id, claim_token)
+                    except Exception:
+                        pass
                 logger.log(
                     "remediate_access",
                     "error",

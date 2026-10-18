@@ -63,7 +63,7 @@ Run the API behind a TLS-terminating gateway with restricted network access:
 uvicorn api.review_service:app --host 127.0.0.1 --port 8080
 ```
 
-Campaign administrators assign reviewers using `POST /campaigns/{campaign_id}/reviewers`; assigned reviewers can read and decide reviews in that campaign. A different authenticated principal in the remediation approver group must approve a revoked review through `POST /reviews/{review_id}/remediation-approval` before any non-production live detach. The API validates signed OIDC access tokens and requires exact group membership. Configure token claims and TLS at the identity provider and gateway.
+Campaign administrators assign reviewers using `POST /campaigns/{campaign_id}/reviewers`; assigned reviewers can read and decide reviews in that campaign. A different authenticated principal in the remediation approver group must approve a revoked review through `POST /reviews/{review_id}/remediation-approval` before any non-production live detach. The approval is bound to the latest complete discovery run and must be renewed after a new snapshot. The API validates signed OIDC access tokens and requires exact group membership. Configure token claims and TLS at the identity provider and gateway.
 
 ## Configuration
 
@@ -71,7 +71,7 @@ Campaign administrators assign reviewers using `POST /campaigns/{campaign_id}/re
 - `AWS_REGION`, `AWS_PROFILE`: AWS account discovery settings. IAM discovery also needs group membership, group policy, and inline policy read permissions (`iam:ListGroupsForUser`, `iam:ListAttachedGroupPolicies`, `iam:ListGroupPolicies`, `iam:GetGroupPolicy`, `iam:ListUserPolicies`, `iam:GetUserPolicy`).
 - `MOCK_IAM`: use the seeded data instead of AWS.
 - `ENABLE_GENAI`, `GOOGLE_API_KEY`, `GENAI_MODEL`: optional explanation provider controls.
-- `DRY_RUN`, `ENABLE_REMEDIATION`, `ALLOW_LIVE_REMEDIATION`, `REMEDIATION_ALLOWLIST`, `REMEDIATION_DENYLIST`: remediation gates.
+- `DRY_RUN`, `ENABLE_REMEDIATION`, `ALLOW_LIVE_REMEDIATION`, `REMEDIATION_ALLOWLIST`, `REMEDIATION_DENYLIST`: remediation gates. Mandatory administrator and break-glass deny patterns cannot be removed by configuration.
 - `AUDIT_S3_BUCKET`, `AUDIT_S3_PREFIX`, `LOCAL_ONLY`: audit export target.
 - `APP_ENV`: environment mode; production live remediation is intentionally blocked in code pending deployment and staging acceptance. The review API always requires valid OIDC configuration.
 - `MAX_DISCOVERY_AGE_HOURS`: maximum age of a complete AWS scan for non-production live remediation (default 24, maximum 168).

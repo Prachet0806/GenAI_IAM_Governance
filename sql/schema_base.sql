@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS remediation_approvals (
     review_id TEXT NOT NULL UNIQUE,
     approver_sub TEXT NOT NULL,
     approved_at TIMESTAMP NOT NULL,
+    discovery_run_id TEXT,
+    FOREIGN KEY(review_id) REFERENCES access_reviews(review_id)
+);
+
+CREATE TABLE IF NOT EXISTS remediation_claims (
+    review_id TEXT PRIMARY KEY,
+    claim_token TEXT NOT NULL,
+    lease_expires_at TIMESTAMP NOT NULL,
     FOREIGN KEY(review_id) REFERENCES access_reviews(review_id)
 );
 

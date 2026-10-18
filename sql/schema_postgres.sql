@@ -81,6 +81,7 @@ ALTER TABLE access_reviews
 ALTER TABLE roles ADD COLUMN IF NOT EXISTS policy_document TEXT;
 ALTER TABLE roles ADD COLUMN IF NOT EXISTS observed_at TIMESTAMPTZ;
 ALTER TABLE access_reviews ADD COLUMN IF NOT EXISTS reviewer_sub TEXT;
+ALTER TABLE remediation_approvals ADD COLUMN IF NOT EXISTS discovery_run_id TEXT;
 
 -- Indexes (idempotent)
 CREATE INDEX IF NOT EXISTS idx_reviews_status ON access_reviews(status);

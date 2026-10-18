@@ -111,20 +111,45 @@ def fetch_review_for_decision(conn, review_id: str):
     return cur.fetchone()
 
 
-def record_remediation_approval(conn, approval_id: str, review_id: str, approver_sub: str, approved_at: str):
+def record_remediation_approval(conn, approval_id: str, review_id: str, approver_sub: str,
+                               approved_at: str, discovery_run_id: str):
     cur = conn.cursor()
-    db.execute(cur, """INSERT INTO remediation_approvals (approval_id,review_id,approver_sub,approved_at)
-        VALUES (?,?,?,?) ON CONFLICT(review_id) DO NOTHING""",
-        (approval_id, review_id, approver_sub, approved_at))
+    db.execute(cur, """INSERT INTO remediation_approvals
+        (approval_id,review_id,approver_sub,approved_at,discovery_run_id)
+        VALUES (?,?,?,?,?) ON CONFLICT(review_id) DO NOTHING""",
+        (approval_id, review_id, approver_sub, approved_at, discovery_run_id))
     return cur.rowcount == 1
 
 
-def is_remediation_approved(conn, review_id: str) -> bool:
+def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool:
     cur = conn.cursor()
     db.execute(cur, """SELECT 1 FROM remediation_approvals a
         JOIN access_reviews r ON r.review_id=a.review_id
         WHERE a.review_id=? AND r.status='REVOKED' AND r.reviewer_sub IS NOT NULL
-          AND a.approver_sub <> r.reviewer_sub""", (review_id,))
+          AND a.approver_sub <> r.reviewer_sub AND a.discovery_run_id=?""", (review_id, discovery_run_id))
+    return cur.fetchone() is not None
+
+
+def claim_remediation(conn, review_id: str, claim_token: str, now: str, lease_expires_at: str) -> bool:
+    cur = conn.cursor()
+    db.execute(cur, """INSERT INTO remediation_claims (review_id,claim_token,lease_expires_at)
+        VALUES (?,?,?) ON CONFLICT(review_id) DO UPDATE SET
+        claim_token=excluded.claim_token,lease_expires_at=excluded.lease_expires_at
+        WHERE remediation_claims.lease_expires_at <= ?""",
+        (review_id, claim_token, lease_expires_at, now))
+    return cur.rowcount == 1
+
+
+def release_remediation_claim(conn, review_id: str, claim_token: str):
+    db.execute(conn.cursor(), "DELETE FROM remediation_claims WHERE review_id=? AND claim_token=?",
+               (review_id, claim_token))
+
+
+def is_current_entitlement(conn, review_id: str) -> bool:
+    cur = conn.cursor()
+    db.execute(cur, """SELECT 1 FROM access_reviews r JOIN user_roles ur
+        ON ur.user_id=r.user_id AND ur.role_id=r.role_id
+        WHERE r.review_id=? AND r.status='REVOKED'""", (review_id,))
     return cur.fetchone() is not None
 
 

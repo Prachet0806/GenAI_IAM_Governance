@@ -142,12 +142,18 @@ def approve_remediation(review_id: str, claims: dict = Depends(current_reviewer)
             raise HTTPException(status_code=409, detail="Review does not have a verified reviewer subject")
         if review[5] == claims["sub"]:
             raise HTTPException(status_code=403, detail="The reviewer cannot approve their own remediation")
+        discovery = repo.latest_discovery_run(conn)
+        if (not discovery or discovery[2] != "COMPLETE"
+                or not str(discovery[3] or "").startswith("AWS:iam-users-direct-and-group-managed-and-inline-policies-v2")):
+            raise HTTPException(status_code=409, detail="A complete supported AWS discovery run is required")
         now = datetime.now(timezone.utc)
-        created = repo.record_remediation_approval(conn, str(uuid.uuid4()), review_id, claims["sub"], now.isoformat())
+        created = repo.record_remediation_approval(conn, str(uuid.uuid4()), review_id,
+                                                   claims["sub"], now.isoformat(), discovery[0])
         if not created:
             raise HTTPException(status_code=409, detail="A remediation approval already exists for this review")
         repo.insert_audit_log(conn, str(uuid.uuid4()), now, "INFO", "remediation_approval", "approved",
                               "Independent authenticated approver authorized remediation",
                               entity_type="access_review", entity_id=review_id,
-                              details={"approver_sub": claims["sub"], "reviewer_sub": review[5]})
+                              details={"approver_sub": claims["sub"], "reviewer_sub": review[5],
+                                       "discovery_run_id": discovery[0]})
     return {"review_id": review_id, "status": "approved"}

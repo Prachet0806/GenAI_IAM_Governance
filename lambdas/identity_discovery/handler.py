@@ -73,7 +73,7 @@ def _list_all_attached_policies(iam_client, principal_name: str, principal_type:
         kwargs = {parameter: principal_name}
         if marker:
             kwargs["Marker"] = marker
-        resp = iam_client.list_attached_user_policies(**kwargs)
+        resp = getattr(iam_client, operation)(**kwargs)
         policies.extend(resp.get("AttachedPolicies", []))
         if resp.get("IsTruncated"):
             next_marker = resp.get("Marker")
