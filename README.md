@@ -1,164 +1,91 @@
-# GenAI-Enhanced IAM Access Certification Engine
+# IAM Access Certification Engine
 
-A Python-based, serverless-style prototype for IAM access certification. It discovers IAM users and their attached managed policies, classifies entitlement risk, generates campaign-based access reviews, simulates reviewer decisions, performs gated remediation, and exports audit artifacts (CSV + JSON) locally and optionally to S3.
+A Python prototype for IAM inventory, entitlement risk assessment, access review campaigns, gated remediation, and audit exports. It supports local SQLite/Postgres and a seeded mock IAM dataset. It is not production-ready; see [production readiness](docs/production-readiness.md) for limitations and required controls.
 
-### Features
-- Identity discovery from AWS IAM (or mock data for offline use).
-- Deterministic risk scoring on role/policy names.
-- Campaign generation with per-entitlement review tasks.
-- Safety-gated remediation (double opt-in, allow/deny lists, dry-run by default).
-- Audit export with integrity checks, hashes, and optional S3 upload.
-- Works with SQLite (local) or Postgres (RDS) via a shared repository layer.
+## Current capabilities
 
----
+- Discovers IAM users, their direct managed and inline policies, and the managed/inline policies inherited through IAM groups. Managed policy default versions are recorded. It does not yet discover IAM roles, Identity Center, permission boundaries, SCPs, or resource policies.
+- Records discovery runs. Only a complete scan replaces current user-policy links; failed/incomplete scans retain the previous links.
+- Evaluates discovered policy documents with a conservative rule set, records evidence and rule version, and escalates missing/invalid or unsupported evidence to HIGH for manual review. This is not a full AWS effective-permissions evaluator.
+- Creates review campaigns with race-safe pending-review insertion.
+- Offers a local prototype reviewer CLI restricted to mock data for decisions, plus an OIDC-protected review API with campaign assignments.
+- Keeps remediation in dry-run mode by default. Live detachment additionally requires `ENABLE_REMEDIATION=true`, `ALLOW_LIVE_REMEDIATION=true`, `DRY_RUN=false`, and a non-empty exact-match allowlist. The current worker only detaches direct managed user policies; group-derived and inline policies are skipped.
+- Exports unique CSV/JSON artifacts and a manifest with SHA-256 hashes. S3 uploads use a per-export run path and surface upload errors.
+- Persists audit events for key stages and stores AI generations with explicit provenance.
 
-### GenAI Risk Explanation Layer (Explainable Access Governance)
+## GenAI explanation
 
-This engine includes an optional GenAI augmentation that converts technical IAM entitlements into human-readable risk justifications for access reviewers and auditors.
+GenAI is advisory and disabled by default. For eligible pending HIGH-risk reviews, the handler loads trusted database context, pseudonymizes the user identifier, sends policy/risk evidence to the configured provider, validates structured output, and records an append-only generation. It does not approve, revoke, or execute access changes. A deterministic fallback is recorded with `source=FALLBACK` when a provider call fails.
 
-#### Purpose
-
-Traditional access reviews fail because managers cannot interpret raw IAM policies. This layer solves the “review fatigue” problem by automatically explaining:
-
-* **Why** a specific entitlement is risky for a given user.
-* **What** remediation action is recommended.
-* **How** the entitlement violates the Principle of Least Privilege.
-
-> **Note:** The AI does not make decisions. It only produces explanations that support compliant human review.
-
-#### How It Works
-
-1. **Evaluation:** During risk evaluation, roles are classified using deterministic rules.
-2. **Trigger:** High-risk access reviews trigger the GenAI explanation lambda (`lambdas/ai_explanation/handler.py`).
-3. **Context:** The lambda sends structured context to the LLM:
-* User identity and role
-* IAM policy metadata
-* Deterministic risk classification
-
-
-4. **Generation:** The model returns a concise, plain-English explanation:
-* Risk rationale
-* Recommended action
-
-
-5. **Storage:** The explanation is stored in the database as an immutable audit artifact.
-
-#### Governance & Safety Controls
-
-* **Scope:** Explanations are generated *only* for **HIGH-risk** entitlements.
-* **Override:** Deterministic logic *always* overrides the AI.
-* **Resilience:** Fallback text is used if the model fails.
-* **Authority:** The AI **never** approves or revokes access.
-
-#### Auditability
-
-The generated explanation is persisted in the `access_reviews.ai_risk_summary` column.
-
-**Example Artifact:**
-
-> "User bob@example.com has AdministratorAccess but belongs to a non-admin role. This creates excessive privilege risk and should be revoked to enforce least privilege."
-
-This creates a traceable chain:
-**Identity → Risk Rules → AI Explanation → Human Review → Remediation → Audit Export**
-
-Auditors can now see **why** access was revoked, not just *that* it was revoked.
-
-### Configuration
-
-Add one environment variable:
+Enable it only after reviewing provider and data-handling requirements:
 
 ```bash
+export ENABLE_GENAI=true
 export GOOGLE_API_KEY=your_key_here
-
+export GENAI_MODEL=gemini-3.8-flash
 ```
 
-No other changes are required. If the key is missing, the system runs safely without AI.
+The policy documents remain sensitive information even though direct user identifiers are removed. See the production-readiness guide before sending real identity data to a provider.
 
-### Why This Matters
+## Local mock quickstart
 
-This transforms the engine from a rules-based access checker into a GenAI-governed identity compliance platform, enabling:
-
-* **Faster access reviews**
-* **Lower reviewer error rates**
-* **Stronger audit defensibility**
-* **Clear separation** of AI assistance and human authority
-
----
-### Prerequisites
-- Python 3.10+
-- AWS CLI (for real IAM/S3 use)
-- SQLite (stdlib) or Postgres (with psycopg2-binary installed)
-- Optional: AWS credentials with IAM list permissions and S3 write permissions
-
----
-### Quickstart (local, mock IAM, SQLite)
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+# Activate the environment for your shell, then:
 pip install -r requirements.txt
 export DB_URL=sqlite:///iam_governance.db
 export MOCK_IAM=true
-export LOCAL_ONLY=true   # skip S3
-bash scripts/run_demo.sh
+export LOCAL_ONLY=true
+python scripts/migrate.py
+python lambdas/identity_discovery/handler.py
+python lambdas/risk_evaluation/handler.py
+python lambdas/generate_reviews/handler.py
+python lambdas/ai_explanation/handler.py  # skips provider if disabled
+python scripts/review.py list --status PENDING
 ```
 
----
-### Running with AWS IAM (SQLite or Postgres)
+The demo script runs these stages and a simulated reviewer cycle. It preserves the configured database; select a fresh `DB_URL` when you want a clean demo database.
+
+## Reviewer CLI
+
 ```bash
-export DB_URL=postgres://USER:PASS@HOST:PORT/DBNAME?sslmode=require
-export AWS_REGION=us-east-1
-# Optionally: AWS_PROFILE=your_profile
-# S3 export:
-# export AUDIT_S3_BUCKET=your-bucket
-# export AUDIT_S3_PREFIX=access-reviews
-export LOCAL_ONLY=false
-export MOCK_IAM=false
-bash scripts/run_demo.sh
+python scripts/review.py list --status PENDING --risk HIGH
+python scripts/review.py decide --review-id <id> --decision REVOKED --comment "Least privilege review"
+python scripts/review.py stats
+python scripts/review.py audit --tail 20
 ```
----
-### Safety controls
-- `DRY_RUN` (default true): no detachments executed.
-- `ENABLE_REMEDIATION` (default false): must be true AND DRY_RUN=false to detach.
-- `REMEDIATION_ALLOWLIST` / `REMEDIATION_DENYLIST`: comma-separated substrings; default deny includes AdministratorAccess/break-glass.
 
----
-### Environment variables
-- `DB_URL`: sqlite:///path or postgres URL
-- `AWS_REGION`, `AWS_PROFILE` (optional)
-- `MOCK_IAM`: true to use seeded mock identities (no AWS calls)
-- `DRY_RUN`, `ENABLE_REMEDIATION`, `REMEDIATION_ALLOWLIST`, `REMEDIATION_DENYLIST`
-- `AUDIT_S3_BUCKET`, `AUDIT_S3_PREFIX`, `LOCAL_ONLY` (skip S3 when true)
-- `LOG_LEVEL`
-- `GOOGLE_API_KEY`: Optional to enable AI explanation layer
+`auto-demo` creates simulated decisions and is restricted to `MOCK_IAM=true`. CLI decisions are restricted to mock data. Use the OIDC review API for real review decisions after configuring issuer, audience, JWKS, reviewer group, and campaign administrator group.
 
----
-### Data flow
-1. Identity discovery (`lambdas/identity_discovery/handler.py`)
-2. Risk evaluation (`lambdas/risk_evaluation/handler.py`)
-3. Campaign generation (`lambdas/generate_reviews/handler.py`)
-4. GenAI risk explanation (explainable governance layer)
-5. Simulated reviewer decisions (demo script)
-6. Remediation (`lambdas/remediation/handler.py`) with safety gates
-7. Audit export (`reports/export_audit.py`) to CSV/JSON and optional S3
+Run the API behind a TLS-terminating gateway with restricted network access:
 
----
-### Schema
-- Base schema in `sql/schema_base.sql` with deltas for SQLite (`schema_sqlite.sql`) and Postgres (`schema_postgres.sql`).
-- `scripts/migrate.py` applies base + engine delta based on `DB_URL`.
+```bash
+uvicorn api.review_service:app --host 127.0.0.1 --port 8080
+```
 
----
-### S3 export
-- Set `AUDIT_S3_BUCKET` (name only) and optional `AUDIT_S3_PREFIX`.
-- Artifacts: CSV + JSON under `access_reviews/<date>/` with SHA-256 hashes in metadata.
-- Set `LOCAL_ONLY=true` to skip uploads.
+Campaign administrators assign reviewers using `POST /campaigns/{campaign_id}/reviewers`; assigned reviewers can read and decide reviews in that campaign. A different authenticated principal in the remediation approver group must approve a revoked review through `POST /reviews/{review_id}/remediation-approval` before any non-production live detach. The API validates signed OIDC access tokens and requires exact group membership. Configure token claims and TLS at the identity provider and gateway.
 
----
-### Testing notes
-- Pipeline can run fully offline with `MOCK_IAM=true`.
-- For Postgres usage, ensure psycopg2-binary is installed and DB_URL reachable.
+## Configuration
 
----
-### Caveats
-- Discovery currently covers IAM users and attached managed policies only (no groups/inline/SCP).
-- Risk scoring is name-heuristic, not policy-document aware.
-- Audit_logs table exists; lambdas log to stdout (CloudWatch in Lambda) and can be extended to persist logs if needed.
+- `DB_URL`: SQLite path or Postgres URL.
+- `AWS_REGION`, `AWS_PROFILE`: AWS account discovery settings. IAM discovery also needs group membership, group policy, and inline policy read permissions (`iam:ListGroupsForUser`, `iam:ListAttachedGroupPolicies`, `iam:ListGroupPolicies`, `iam:GetGroupPolicy`, `iam:ListUserPolicies`, `iam:GetUserPolicy`).
+- `MOCK_IAM`: use the seeded data instead of AWS.
+- `ENABLE_GENAI`, `GOOGLE_API_KEY`, `GENAI_MODEL`: optional explanation provider controls.
+- `DRY_RUN`, `ENABLE_REMEDIATION`, `ALLOW_LIVE_REMEDIATION`, `REMEDIATION_ALLOWLIST`, `REMEDIATION_DENYLIST`: remediation gates.
+- `AUDIT_S3_BUCKET`, `AUDIT_S3_PREFIX`, `LOCAL_ONLY`: audit export target.
+- `APP_ENV`: environment mode; production live remediation is intentionally blocked in code pending deployment and staging acceptance. The review API always requires valid OIDC configuration.
+- `MAX_DISCOVERY_AGE_HOURS`: maximum age of a complete AWS scan for non-production live remediation (default 24, maximum 168).
+- `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`, `OIDC_GROUP_CLAIM`, `REVIEWER_GROUP`, `CAMPAIGN_ADMIN_GROUP`, `REMEDIATION_APPROVER_GROUP`: OIDC and authorization configuration for the review API.
 
+Copy `.env.example` for local configuration. Do not commit credentials.
+
+## Schema and audit outputs
+
+The portable base schema and engine-specific files are in `sql/`; `scripts/migrate.py` applies them and additive compatibility changes. Export artifacts are written under `reports/` using date plus unique run ID, with a `.manifest.json` file. Set `LOCAL_ONLY=true` to skip S3.
+
+## Known boundaries
+
+- Name heuristics remain as a fallback signal when policy evidence is unavailable; incomplete IAM surface coverage prevents full effective-access conclusions. Group membership changes and policy reads are currently reconciled only for discovered users; stale user/group/policy entities may remain in the descriptive tables after a complete scan.
+- The reviewer CLI is not an authentication system.
+- Deployment infrastructure, event sources, secret-manager integration, provider retention approval, and production alerting are not defined here.
+- Local execution does not establish AWS, Postgres, S3, or provider readiness.
