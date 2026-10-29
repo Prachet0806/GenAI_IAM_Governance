@@ -1,5 +1,7 @@
 # scripts/migrate.py
 import sys
+import hashlib
+import re
 from pathlib import Path
 
 # Ensure repository root is on sys.path for module imports
@@ -21,11 +23,22 @@ except ImportError:
     psycopg2 = None  # type: ignore
 
 
-SQL_DIR = ROOT / "sql"
+MIGRATIONS_DIR = ROOT / "sql" / "migrations"
+
+# Additions for databases created before these baseline columns existed.
+# This list is included in migration 0001's checksum and must remain stable.
+SQLITE_BASELINE_COLUMNS = (
+    ("access_reviews", "ai_risk_summary", "TEXT"),
+    ("roles", "policy_document", "TEXT"),
+    ("roles", "observed_at", "TIMESTAMP"),
+    ("access_reviews", "reviewer_sub", "TEXT"),
+    ("remediation_approvals", "discovery_run_id", "TEXT"),
+    ("remediation_claims", "fencing_token", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 def load_sql(name: str) -> str:
-    path = SQL_DIR / name
+    path = MIGRATIONS_DIR / name
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     # Tolerate stray '#' header lines (not valid SQL); treat as comments.
@@ -34,9 +47,6 @@ def load_sql(name: str) -> str:
         for line in content.splitlines()
     )
     return cleaned
-
-
-import re
 
 
 def _split_statements(sql_blob: str):
@@ -124,41 +134,82 @@ def _execute_statements(cur, sql_blob: str):
         cur.execute(stmt)
 
 
+def _migration_plan(dialect: str):
+    """Return ordered migration SQL and stable checksums for one backend."""
+    if dialect not in ("sqlite", "postgres"):
+        raise ValueError(f"Unsupported dialect: {dialect}")
+    plan = []
+    for path in sorted(MIGRATIONS_DIR.iterdir()):
+        if not re.fullmatch(r"\d{4}_[a-z0-9_]+\.sql", path.name):
+            continue
+        version = path.stem
+        engine_path = path.with_name(f"{version}.{dialect}.sql")
+        common = load_sql(path.name)
+        engine = load_sql(engine_path.name) if engine_path.exists() else ""
+        compatibility = (
+            repr(SQLITE_BASELINE_COLUMNS)
+            if dialect == "sqlite" and version == "0001_baseline"
+            else ""
+        )
+        digest = hashlib.sha256(
+            (version + "\0" + common + "\0" + engine + "\0" + compatibility).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        plan.append((version, common, engine, digest))
+    numbers = [int(version[:4]) for version, _, _, _ in plan]
+    if not plan or numbers != list(range(1, len(plan) + 1)):
+        raise RuntimeError("Migration files must start at 0001 and be consecutive")
+    return plan
+
+
+def _pending_migrations(cur, dialect: str):
+    plan = _migration_plan(dialect)
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "version TEXT PRIMARY KEY, checksum TEXT NOT NULL, "
+        "applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    cur.execute("SELECT version, checksum FROM schema_migrations ORDER BY version")
+    applied = cur.fetchall()
+    expected = [(version, digest) for version, _, _, digest in plan]
+    if applied != expected[: len(applied)]:
+        raise RuntimeError("Applied migration history differs from migration files")
+    return plan[len(applied) :]
+
+
 def apply_sqlite():
     if sqlite3 is None:
         raise RuntimeError("sqlite3 module not available")
-
     db_path = config.require_sqlite_path()
-    base_sql = load_sql("schema_base.sql")
-    sqlite_sql = load_sql("schema_sqlite.sql")
-
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
     try:
-        cursor = conn.cursor()
-        cursor.executescript(base_sql)
-        cursor.executescript(sqlite_sql)
-        _ensure_sqlite_column(
-            conn,
-            table="access_reviews",
-            column="ai_risk_summary",
-            column_def="TEXT",
-        )
-        _ensure_sqlite_column(conn, "roles", "policy_document", "TEXT")
-        _ensure_sqlite_column(conn, "roles", "observed_at", "TIMESTAMP")
-        _ensure_sqlite_column(conn, "access_reviews", "reviewer_sub", "TEXT")
-        _ensure_sqlite_column(conn, "remediation_approvals", "discovery_run_id", "TEXT")
-        _ensure_sqlite_column(
-            conn, "remediation_claims", "fencing_token", "INTEGER NOT NULL DEFAULT 0"
-        )
-        cursor.execute(
-            "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
-            (config.SCHEMA_VERSION,),
-        )
-        conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.cursor()
+            for version, common, engine, digest in _pending_migrations(cur, "sqlite"):
+                _execute_statements(cur, common)
+                if version == "0001_baseline":
+                    for table, column, definition in SQLITE_BASELINE_COLUMNS:
+                        _ensure_sqlite_column(conn, table, column, definition)
+                _execute_statements(cur, engine)
+                cur.execute(
+                    "INSERT INTO schema_migrations (version, checksum) VALUES (?, ?)",
+                    (version, digest),
+                )
+                cur.execute(
+                    "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                    (config.SCHEMA_VERSION,),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         logger.log(
-            action="migrate",
-            status="success",
-            message=f"Applied schema version {config.SCHEMA_VERSION} to SQLite at {db_path}",
+            "migrate",
+            "success",
+            f"Applied SQLite migrations at {db_path}",
             details={"db_path": db_path},
         )
     finally:
@@ -168,31 +219,23 @@ def apply_sqlite():
 def apply_postgres():
     if psycopg2 is None:
         raise RuntimeError("psycopg2 is required for Postgres migrations")
-
-    base_sql = load_sql("schema_base.sql")
-    pg_sql = load_sql("schema_postgres.sql")
-
-    conn = psycopg2.connect(
-        config.get_db_url(),
-        connect_timeout=10,  # Phase 1 default safety
-    )
+    conn = psycopg2.connect(config.get_db_url(), connect_timeout=10)
     try:
         with conn, conn.cursor() as cur:
-            _execute_statements(cur, base_sql)
-            if pg_sql.strip():
-                _execute_statements(cur, pg_sql)
-            cur.execute(
-                """
-        INSERT INTO schema_version (version, applied_at)
-                    VALUES (%s, NOW()) ON CONFLICT (version) DO NOTHING
-                    """,
-                (config.SCHEMA_VERSION,),
-            )
-        logger.log(
-            action="migrate",
-            status="success",
-            message=f"Applied schema version {config.SCHEMA_VERSION} to Postgres",
-        )
+            # Serialize concurrent installs, including before the ledger exists.
+            cur.execute("SELECT pg_advisory_xact_lock(481701, 1)")
+            for version, common, engine, digest in _pending_migrations(cur, "postgres"):
+                _execute_statements(cur, common)
+                _execute_statements(cur, engine)
+                cur.execute(
+                    "INSERT INTO schema_migrations (version, checksum) VALUES (%s, %s)",
+                    (version, digest),
+                )
+                cur.execute(
+                    "INSERT INTO schema_version (version) VALUES (%s) ON CONFLICT (version) DO NOTHING",
+                    (config.SCHEMA_VERSION,),
+                )
+        logger.log("migrate", "success", "Applied Postgres migrations")
     finally:
         conn.close()
 

@@ -1,5 +1,4 @@
--- sql/schema_base.sql
--- Portable base schema (SQLite/Postgres compatible types)
+-- 0001 baseline: portable schema for SQLite and Postgres.
 
 CREATE TABLE IF NOT EXISTS schema_version (
     version TEXT PRIMARY KEY,

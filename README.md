@@ -81,9 +81,9 @@ Copy `.env.example` for local configuration. Do not commit credentials.
 
 ## Schema and audit outputs
 
-The portable base schema and engine-specific files are in `sql/`; `scripts/migrate.py` applies them and additive compatibility changes. Export artifacts are written under `reports/` using date plus unique run ID, with a `.manifest.json` file. Set `LOCAL_ONLY=true` to skip S3.
+Ordered migrations are in `sql/migrations/`. Each numbered portable SQL file may have a matching `.sqlite.sql` or `.postgres.sql` file. Run `python scripts/migrate.py` before starting workers or the review API. The runner applies pending migrations transactionally, records a SHA-256 checksum in `schema_migrations`, and rejects edited or missing applied migrations. Migration 0001 also upgrades older databases that predate its compatibility columns. Add new numbered files for future schema changes; do not edit an applied migration. Export artifacts are written under `reports/` using date plus unique run ID, with a `.manifest.json` file. Set `LOCAL_ONLY=true` to skip S3.
 
-GitHub Actions runs `pytest -q` on pushes and pull requests using mock IAM and SQLite in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+GitHub Actions runs the SQLite suite and a separate Postgres 17 service job for fresh and legacy migrations and concurrent remediation claims in [.github/workflows/ci.yml](.github/workflows/ci.yml). AWS, S3, and AI provider integrations are not part of these CI jobs.
 
 ## Known boundaries
 
