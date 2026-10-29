@@ -1,5 +1,4 @@
-#scripts/migrate.py
-import os
+# scripts/migrate.py
 import sys
 from pathlib import Path
 
@@ -77,7 +76,12 @@ def _split_statements(sql_blob: str):
             buf.append("/*")
             i += 2
             continue
-        if not in_single and not in_double and not in_line_comment and sql_blob.startswith("$$", i):
+        if (
+            not in_single
+            and not in_double
+            and not in_line_comment
+            and sql_blob.startswith("$$", i)
+        ):
             in_dollar = not in_dollar
             buf.append("$$")
             i += 2
@@ -143,7 +147,9 @@ def apply_sqlite():
         _ensure_sqlite_column(conn, "roles", "observed_at", "TIMESTAMP")
         _ensure_sqlite_column(conn, "access_reviews", "reviewer_sub", "TEXT")
         _ensure_sqlite_column(conn, "remediation_approvals", "discovery_run_id", "TEXT")
-        _ensure_sqlite_column(conn, "remediation_claims", "fencing_token", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_sqlite_column(
+            conn, "remediation_claims", "fencing_token", "INTEGER NOT NULL DEFAULT 0"
+        )
         cursor.execute(
             "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
             (config.SCHEMA_VERSION,),
@@ -171,18 +177,17 @@ def apply_postgres():
         connect_timeout=10,  # Phase 1 default safety
     )
     try:
-        with conn:
-            with conn.cursor() as cur:
-                _execute_statements(cur, base_sql)
-                if pg_sql.strip():
-                    _execute_statements(cur, pg_sql)
-                cur.execute(
-                    """
+        with conn, conn.cursor() as cur:
+            _execute_statements(cur, base_sql)
+            if pg_sql.strip():
+                _execute_statements(cur, pg_sql)
+            cur.execute(
+                """
         INSERT INTO schema_version (version, applied_at)
                     VALUES (%s, NOW()) ON CONFLICT (version) DO NOTHING
                     """,
-                    (config.SCHEMA_VERSION,),
-                )
+                (config.SCHEMA_VERSION,),
+            )
         logger.log(
             action="migrate",
             status="success",
@@ -223,4 +228,3 @@ if __name__ == "__main__":
     except Exception as exc:  # pragma: no cover
         logger.log("migrate", "error", f"Migration failed: {exc}", level="ERROR")
         sys.exit(1)
-

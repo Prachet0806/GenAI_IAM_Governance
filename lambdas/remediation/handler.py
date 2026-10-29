@@ -1,10 +1,11 @@
-#lambdas/remediation/handler.py
-import boto3
-from datetime import datetime, timedelta, timezone
+# lambdas/remediation/handler.py
 import os
 import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import boto3
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -18,14 +19,24 @@ def _norm(value: str) -> str:
     return (value or "").strip().lower()
 
 
-def _should_detach(role_name: str, role_arn: str = "", allowlist: set | None = None, denylist: set | None = None):
+def _should_detach(
+    role_name: str,
+    role_arn: str = "",
+    allowlist: set | None = None,
+    denylist: set | None = None,
+):
     """Exact/bounded matching: denylist blocks exact names or explicit substrings
     only when wrapped; allowlist (if non-empty) requires exact match on name or ARN."""
-    allow = {_norm(a) for a in (allowlist if allowlist is not None else config.get_allowlist())}
+    allow = {
+        _norm(a)
+        for a in (allowlist if allowlist is not None else config.get_allowlist())
+    }
     # Mandatory protections cannot be bypassed by custom configuration or a
     # caller-supplied denylist used in tests/tools.
     deny = {_norm(d) for d in config.MANDATORY_DENYLIST}
-    deny.update(_norm(d) for d in (denylist if denylist is not None else config.get_denylist()))
+    deny.update(
+        _norm(d) for d in (denylist if denylist is not None else config.get_denylist())
+    )
     name = _norm(role_name)
     arn = _norm(role_arn)
     # Deny: exact match on name/arn, or substring only if the denylist entry
@@ -46,22 +57,31 @@ def _should_detach(role_name: str, role_arn: str = "", allowlist: set | None = N
 
 def _get_iam_client():
     from botocore.config import Config as BotoConfig
+
     kwargs = {"region_name": config.get_aws_region()}
-    client_config = BotoConfig(connect_timeout=5, read_timeout=20,
-                               retries={"mode": "standard", "max_attempts": 3})
+    client_config = BotoConfig(
+        connect_timeout=5,
+        read_timeout=20,
+        retries={"mode": "standard", "max_attempts": 3},
+    )
     profile = config.get_aws_profile()
     if profile:
         import boto3 as _boto3
-        session = _boto3.Session(profile_name=profile, region_name=kwargs["region_name"])
+
+        session = _boto3.Session(
+            profile_name=profile, region_name=kwargs["region_name"]
+        )
         return session.client("iam", config=client_config)
     return boto3.client("iam", region_name=kwargs["region_name"], config=client_config)
 
 
 def _is_policy_attached(iam, user_name: str, policy_arn: str) -> bool:
     paginator = iam.get_paginator("list_attached_user_policies")
-    return any(policy.get("PolicyArn") == policy_arn
-               for page in paginator.paginate(UserName=user_name)
-               for policy in page.get("AttachedPolicies", []))
+    return any(
+        policy.get("PolicyArn") == policy_arn
+        for page in paginator.paginate(UserName=user_name)
+        for policy in page.get("AttachedPolicies", [])
+    )
 
 
 def _is_group_policy(iam, user_name: str, policy_arn: str) -> bool:
@@ -70,18 +90,25 @@ def _is_group_policy(iam, user_name: str, policy_arn: str) -> bool:
     for page in groups.paginate(UserName=user_name):
         for group in page.get("Groups", []):
             policies = iam.get_paginator("list_attached_group_policies")
-            if any(p.get("PolicyArn") == policy_arn
-                   for policy_page in policies.paginate(GroupName=group["GroupName"])
-                   for p in policy_page.get("AttachedPolicies", [])):
+            if any(
+                p.get("PolicyArn") == policy_arn
+                for policy_page in policies.paginate(GroupName=group["GroupName"])
+                for p in policy_page.get("AttachedPolicies", [])
+            ):
                 return True
     return False
 
 
 def _is_supported_fresh_discovery(run, expected_run_id: str | None = None) -> bool:
-    if (not run or run[2] != "COMPLETE"
-            or not str(run[3] or "").startswith("AWS:iam-users-direct-and-group-managed-and-inline-policies-v2")
-            or (expected_run_id is not None and run[0] != expected_run_id)
-            or not run[1]):
+    if (
+        not run
+        or run[2] != "COMPLETE"
+        or not str(run[3] or "").startswith(
+            "AWS:iam-users-direct-and-group-managed-and-inline-policies-v2"
+        )
+        or (expected_run_id is not None and run[0] != expected_run_id)
+        or not run[1]
+    ):
         return False
     try:
         observed = run[1]
@@ -89,7 +116,9 @@ def _is_supported_fresh_discovery(run, expected_run_id: str | None = None) -> bo
             observed = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
         if observed.tzinfo is None:
             observed = observed.replace(tzinfo=timezone.utc)
-        age_hours = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds() / 3600
+        age_hours = (
+            datetime.now(timezone.utc) - observed.astimezone(timezone.utc)
+        ).total_seconds() / 3600
         return -0.1 <= age_hours <= config.get_max_discovery_age_hours()
     except (TypeError, ValueError, OverflowError):
         return False
@@ -102,18 +131,47 @@ def remediate_access(event, context):
     live_authorized = config.is_live_remediation_explicitly_allowed()
     production = os.getenv("APP_ENV", "development").lower() == "production"
     if not dry_run and enabled and production:
-        logger.log("remediate_access", "error",
-                   "Live remediation is disabled in production until an authenticated approval service is integrated",
-                   level="ERROR")
-        return {"status": "blocked", "reason": "production_approval_integration_missing", "remediated": 0, "skipped": 0, "dry_run": dry_run}
+        logger.log(
+            "remediate_access",
+            "error",
+            "Live remediation is disabled in production until an authenticated approval service is integrated",
+            level="ERROR",
+        )
+        return {
+            "status": "blocked",
+            "reason": "production_approval_integration_missing",
+            "remediated": 0,
+            "skipped": 0,
+            "dry_run": dry_run,
+        }
     if not dry_run and enabled and config.is_mock_iam():
-        logger.log("remediate_access", "error", "Live remediation is forbidden while MOCK_IAM is enabled", level="ERROR")
-        return {"status": "blocked", "reason": "mock_mode", "remediated": 0, "skipped": 0, "dry_run": dry_run}
+        logger.log(
+            "remediate_access",
+            "error",
+            "Live remediation is forbidden while MOCK_IAM is enabled",
+            level="ERROR",
+        )
+        return {
+            "status": "blocked",
+            "reason": "mock_mode",
+            "remediated": 0,
+            "skipped": 0,
+            "dry_run": dry_run,
+        }
     if not dry_run and enabled and (not live_authorized or not allowlist):
-        logger.log("remediate_access", "error",
-                   "Live remediation blocked: explicit ALLOW_LIVE_REMEDIATION and a non-empty allowlist are required",
-                   level="ERROR")
-        return {"status": "blocked", "reason": "missing_live_safety_configuration", "remediated": 0, "skipped": 0, "dry_run": dry_run}
+        logger.log(
+            "remediate_access",
+            "error",
+            "Live remediation blocked: explicit ALLOW_LIVE_REMEDIATION and a non-empty allowlist are required",
+            level="ERROR",
+        )
+        return {
+            "status": "blocked",
+            "reason": "missing_live_safety_configuration",
+            "remediated": 0,
+            "skipped": 0,
+            "dry_run": dry_run,
+        }
     logger.log(
         "remediate_access",
         "start",
@@ -132,16 +190,25 @@ def remediate_access(event, context):
         if not dry_run and enabled:
             latest = repo.latest_discovery_run(conn)
             if not _is_supported_fresh_discovery(latest):
-                logger.log("remediate_access", "error", "Live remediation blocked: no latest complete inventory scan",
-                           level="ERROR")
-                return {"status": "blocked", "reason": "inventory_not_complete", "remediated": 0, "skipped": 0, "dry_run": dry_run}
+                logger.log(
+                    "remediate_access",
+                    "error",
+                    "Live remediation blocked: no latest complete inventory scan",
+                    level="ERROR",
+                )
+                return {
+                    "status": "blocked",
+                    "reason": "inventory_not_complete",
+                    "remediated": 0,
+                    "skipped": 0,
+                    "dry_run": dry_run,
+                }
             discovery_run_id = latest[0]
         revocations = repo.list_revocations(conn)
 
         if dry_run or not enabled:
             preview = [
-                {"review_id": r_id, "role": r}
-                for r_id, _u, r, _arn in revocations[:10]
+                {"review_id": r_id, "role": r} for r_id, _u, r, _arn in revocations[:10]
             ]
             logger.log(
                 "remediate_access",
@@ -167,7 +234,9 @@ def remediate_access(event, context):
             )
 
             try:
-                allowed, reason = _should_detach(role_name, role_arn, allowlist=allowlist)
+                allowed, reason = _should_detach(
+                    role_name, role_arn, allowlist=allowlist
+                )
                 if not allowed:
                     logger.log(
                         "remediate_access",
@@ -186,20 +255,36 @@ def remediate_access(event, context):
                         entity_id=review_id,
                     )
                     skipped_count += 1
-                elif not repo.is_remediation_approved(conn, review_id, discovery_run_id):
-                    logger.log("remediate_access", "skip",
-                               "Independent authenticated remediation approval is required",
-                               entity_type="access_review", entity_id=review_id)
+                elif not repo.is_remediation_approved(
+                    conn, review_id, discovery_run_id
+                ):
+                    logger.log(
+                        "remediate_access",
+                        "skip",
+                        "Independent authenticated remediation approval is required",
+                        entity_type="access_review",
+                        entity_id=review_id,
+                    )
                     skipped_count += 1
                 else:
                     claim_token = str(uuid.uuid4())
                     claimed_at = datetime.now(timezone.utc)
                     lease_until = claimed_at + timedelta(minutes=5)
-                    fencing_token = repo.claim_remediation(conn, review_id, claim_token,
-                                                           claimed_at.isoformat(), lease_until.isoformat())
+                    fencing_token = repo.claim_remediation(
+                        conn,
+                        review_id,
+                        claim_token,
+                        claimed_at.isoformat(),
+                        lease_until.isoformat(),
+                    )
                     if fencing_token is None:
-                        logger.log("remediate_access", "skip", "Another worker holds the remediation lease",
-                                   entity_type="access_review", entity_id=review_id)
+                        logger.log(
+                            "remediate_access",
+                            "skip",
+                            "Another worker holds the remediation lease",
+                            entity_type="access_review",
+                            entity_id=review_id,
+                        )
                         skipped_count += 1
                         continue
                     # Make the lease visible before calling AWS so another worker
@@ -207,39 +292,75 @@ def remediate_access(event, context):
                     conn.commit()
                     repo.lock_inventory_remediation(conn)
                     current_discovery = repo.latest_discovery_run(conn)
-                    if (not _is_supported_fresh_discovery(current_discovery, discovery_run_id)
-                            or not repo.is_current_entitlement(conn, review_id)
-                            or not repo.is_remediation_approved(conn, review_id, discovery_run_id)):
-                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                    if (
+                        not _is_supported_fresh_discovery(
+                            current_discovery, discovery_run_id
+                        )
+                        or not repo.is_current_entitlement(conn, review_id)
+                        or not repo.is_remediation_approved(
+                            conn, review_id, discovery_run_id
+                        )
+                    ):
+                        repo.release_remediation_claim(
+                            conn, review_id, claim_token, fencing_token
+                        )
                         conn.commit()
-                        logger.log("remediate_access", "skip", "Review, approval, entitlement, or discovery snapshot changed",
-                                   entity_type="access_review", entity_id=review_id)
+                        logger.log(
+                            "remediate_access",
+                            "skip",
+                            "Review, approval, entitlement, or discovery snapshot changed",
+                            entity_type="access_review",
+                            entity_id=review_id,
+                        )
                         skipped_count += 1
                         continue
                     # This worker only knows how to detach a direct managed user
                     # policy. Inline and group-derived grants need distinct workflows.
                     if not role_arn.startswith("arn:aws:iam::"):
-                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        repo.release_remediation_claim(
+                            conn, review_id, claim_token, fencing_token
+                        )
                         conn.commit()
-                        logger.log("remediate_access", "skip", "Entitlement is not a detachable managed-policy ARN",
-                                   entity_type="access_review", entity_id=review_id)
+                        logger.log(
+                            "remediate_access",
+                            "skip",
+                            "Entitlement is not a detachable managed-policy ARN",
+                            entity_type="access_review",
+                            entity_id=review_id,
+                        )
                         skipped_count += 1
                         continue
                     if iam is None:
                         iam = _get_iam_client()
                     if _is_group_policy(iam, user_name, role_arn):
-                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        repo.release_remediation_claim(
+                            conn, review_id, claim_token, fencing_token
+                        )
                         conn.commit()
-                        logger.log("remediate_access", "skip", "Policy is also inherited through an IAM group",
-                                   entity_type="access_review", entity_id=review_id)
+                        logger.log(
+                            "remediate_access",
+                            "skip",
+                            "Policy is also inherited through an IAM group",
+                            entity_type="access_review",
+                            entity_id=review_id,
+                        )
                         skipped_count += 1
                         continue
                     if not _is_policy_attached(iam, user_name, role_arn):
-                        repo.mark_remediated(conn, review_id, datetime.now(timezone.utc).isoformat())
-                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        repo.mark_remediated(
+                            conn, review_id, datetime.now(timezone.utc).isoformat()
+                        )
+                        repo.release_remediation_claim(
+                            conn, review_id, claim_token, fencing_token
+                        )
                         conn.commit()
-                        logger.log("remediate_access", "success", "Revoked entitlement was already absent in AWS",
-                                   entity_type="access_review", entity_id=review_id)
+                        logger.log(
+                            "remediate_access",
+                            "success",
+                            "Revoked entitlement was already absent in AWS",
+                            entity_type="access_review",
+                            entity_id=review_id,
+                        )
                         action_count += 1
                         continue
                     # Recheck the owner epoch and the approved snapshot after all
@@ -248,16 +369,34 @@ def remediate_access(event, context):
                     final_lease = final_now + timedelta(minutes=5)
                     current_discovery = repo.latest_discovery_run(conn)
                     claim_owned = repo.renew_remediation_claim(
-                        conn, review_id, claim_token, fencing_token,
-                        final_now.isoformat(), final_lease.isoformat())
-                    if (not claim_owned
-                            or not _is_supported_fresh_discovery(current_discovery, discovery_run_id)
-                            or not repo.is_current_entitlement(conn, review_id)
-                            or not repo.is_remediation_approved(conn, review_id, discovery_run_id)):
-                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        conn,
+                        review_id,
+                        claim_token,
+                        fencing_token,
+                        final_now.isoformat(),
+                        final_lease.isoformat(),
+                    )
+                    if (
+                        not claim_owned
+                        or not _is_supported_fresh_discovery(
+                            current_discovery, discovery_run_id
+                        )
+                        or not repo.is_current_entitlement(conn, review_id)
+                        or not repo.is_remediation_approved(
+                            conn, review_id, discovery_run_id
+                        )
+                    ):
+                        repo.release_remediation_claim(
+                            conn, review_id, claim_token, fencing_token
+                        )
                         conn.commit()
-                        logger.log("remediate_access", "skip", "Final ownership or snapshot validation failed",
-                                   entity_type="access_review", entity_id=review_id)
+                        logger.log(
+                            "remediate_access",
+                            "skip",
+                            "Final ownership or snapshot validation failed",
+                            entity_type="access_review",
+                            entity_id=review_id,
+                        )
                         skipped_count += 1
                         continue
                     iam.detach_user_policy(UserName=user_name, PolicyArn=role_arn)
@@ -270,8 +409,12 @@ def remediate_access(event, context):
                     )
                     # Only mark remediated after a verified detach — never on
                     # skip or dry-run, otherwise future runs hide the row forever.
-                    repo.mark_remediated(conn, review_id, datetime.now(timezone.utc).isoformat())
-                    repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                    repo.mark_remediated(
+                        conn, review_id, datetime.now(timezone.utc).isoformat()
+                    )
+                    repo.release_remediation_claim(
+                        conn, review_id, claim_token, fencing_token
+                    )
                     conn.commit()
                     action_count += 1
 
@@ -282,7 +425,9 @@ def remediate_access(event, context):
                     pass
                 if claim_token and fencing_token is not None:
                     try:
-                        repo.release_remediation_claim(conn, review_id, claim_token, fencing_token)
+                        repo.release_remediation_claim(
+                            conn, review_id, claim_token, fencing_token
+                        )
                         conn.commit()
                     except Exception:
                         pass
@@ -301,18 +446,33 @@ def remediate_access(event, context):
             "remediate_access",
             "complete",
             f"Remediation Complete. Detached {action_count}, skipped {skipped_count}.",
-            details={"remediated": action_count, "skipped": skipped_count, "dry_run": dry_run},
+            details={
+                "remediated": action_count,
+                "skipped": skipped_count,
+                "dry_run": dry_run,
+            },
         )
         try:
             import uuid
+
             repo.insert_audit_log(
-                conn, str(uuid.uuid4()), datetime.now(timezone.utc), "INFO",
-                "remediate_access", "complete",
+                conn,
+                str(uuid.uuid4()),
+                datetime.now(timezone.utc),
+                "INFO",
+                "remediate_access",
+                "complete",
                 f"Remediation Complete. Detached {action_count}, skipped {skipped_count}.",
-                details={"remediated": action_count, "skipped": skipped_count, "dry_run": dry_run},
+                details={
+                    "remediated": action_count,
+                    "skipped": skipped_count,
+                    "dry_run": dry_run,
+                },
             )
         except Exception as e:
-            logger.log("remediate_access", "warn", f"audit log write failed: {e}", level="WARN")
+            logger.log(
+                "remediate_access", "warn", f"audit log write failed: {e}", level="WARN"
+            )
         return {
             "status": "success",
             "remediated": action_count,

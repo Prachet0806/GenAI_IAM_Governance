@@ -49,4 +49,3 @@ def log(
     output = json.dumps(payload, default=str)
     stream = sys.stderr if level == "ERROR" else sys.stdout
     print(output, file=stream)
-

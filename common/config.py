@@ -1,4 +1,4 @@
-#common/config.py
+# common/config.py
 import os
 import re
 from urllib.parse import urlparse
@@ -14,9 +14,7 @@ def _get_str(name: str, default: str = "") -> str:
 
 def _parse_list(name: str) -> set:
     return {
-        item.strip().lower()
-        for item in os.getenv(name, "").split(",")
-        if item.strip()
+        item.strip().lower() for item in os.getenv(name, "").split(",") if item.strip()
     }
 
 
@@ -32,7 +30,9 @@ DRY_RUN = _get_bool("DRY_RUN", True)
 ENABLE_REMEDIATION = _get_bool("ENABLE_REMEDIATION", False)
 ALLOWLIST = _parse_list("REMEDIATION_ALLOWLIST")
 DENYLIST = _parse_list("REMEDIATION_DENYLIST")
-MANDATORY_DENYLIST = frozenset({"*administratoraccess*", "*breakglass*", "*break-glass*"})
+MANDATORY_DENYLIST = frozenset(
+    {"*administratoraccess*", "*breakglass*", "*break-glass*"}
+)
 DENYLIST.update(MANDATORY_DENYLIST)
 
 # Audit export
@@ -122,32 +122,67 @@ def redact_db_url(url: str | None = None) -> str:
             parsed = parsed._replace(netloc=netloc)
         if parsed.query:
             from urllib.parse import parse_qsl, urlencode
-            query = urlencode([(k, "***" if any(s in k.lower() for s in ("password", "secret", "token", "key")) else v)
-                               for k, v in parse_qsl(parsed.query, keep_blank_values=True)])
+
+            query = urlencode(
+                [
+                    (
+                        k,
+                        "***"
+                        if any(
+                            s in k.lower()
+                            for s in ("password", "secret", "token", "key")
+                        )
+                        else v,
+                    )
+                    for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+                ]
+            )
             return parsed._replace(query=query).geturl()
         return parsed.geturl()
     except Exception:
         return "***"
 
 
-_SENSITIVE_KEYS = {"password", "passwd", "secret", "token", "api_key", "apikey", "db_url"}
+_SENSITIVE_KEYS = {
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "db_url",
+}
 
 
 def sanitize_details(details: dict | None) -> dict | None:
     """Redact sensitive keys before logging/persisting."""
     if not details:
         return details
+
     def clean(value, key=""):
         kl = str(key).lower()
         if kl == "db_url":
             return redact_db_url(str(value))
-        if kl in _SENSITIVE_KEYS or any(s in kl for s in ("password", "secret", "token", "api_key", "apikey", "authorization", "prompt", "policy_document")):
+        if kl in _SENSITIVE_KEYS or any(
+            s in kl
+            for s in (
+                "password",
+                "secret",
+                "token",
+                "api_key",
+                "apikey",
+                "authorization",
+                "prompt",
+                "policy_document",
+            )
+        ):
             return "[REDACTED]"
         if isinstance(value, dict):
             return {k: clean(v, k) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return [clean(v, key) for v in value]
         return value
+
     return clean(details)
 
 
@@ -220,4 +255,3 @@ def require_sqlite_path() -> str:
     if not db_is_sqlite():
         raise ValueError("Only SQLite is supported in this execution path.")
     return get_sqlite_path()
-

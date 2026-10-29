@@ -1,4 +1,5 @@
 """Evidence-grounded, advisory-only explanations for pending high-risk reviews."""
+
 import hashlib
 import json
 import os
@@ -30,18 +31,31 @@ def _get_client():
     try:
         from google import genai
         from google.genai import types
-        return genai.Client(api_key=api_key, http_options=types.HttpOptions(
-            timeout=12_000,
-            retry_options=types.HttpRetryOptions(attempts=2, initial_delay=0.2, max_delay=0.2, jitter=0.1),
-        ))
+
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=12_000,
+                retry_options=types.HttpRetryOptions(
+                    attempts=2, initial_delay=0.2, max_delay=0.2, jitter=0.1
+                ),
+            ),
+        )
     except Exception as exc:
-        logger.log("ai_explanation", "warn", "GenAI client unavailable", level="WARN",
-                   details={"error_type": type(exc).__name__})
+        logger.log(
+            "ai_explanation",
+            "warn",
+            "GenAI client unavailable",
+            level="WARN",
+            details={"error_type": type(exc).__name__},
+        )
         return None
 
 
 def _canonical(value) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+    )
 
 
 def _clean_text(value: str, limit: int = 1200) -> str:
@@ -58,9 +72,14 @@ def generate_ai_summary(context: dict) -> str:
         raise ValueError("Evidence exceeds configured prompt size")
     response = client.models.generate_content(
         model=config.get_genai_model(),
-        contents=SYSTEM_PROMPT + "\n\nUntrusted evidence JSON:\n" + json.dumps(context, ensure_ascii=False),
-        config={"temperature": 0.0, "max_output_tokens": 700,
-                "response_mime_type": "application/json"},
+        contents=SYSTEM_PROMPT
+        + "\n\nUntrusted evidence JSON:\n"
+        + json.dumps(context, ensure_ascii=False),
+        config={
+            "temperature": 0.0,
+            "max_output_tokens": 700,
+            "response_mime_type": "application/json",
+        },
     )
     raw = getattr(response, "text", None)
     if not raw:
@@ -68,23 +87,51 @@ def generate_ai_summary(context: dict) -> str:
     if len(raw.encode("utf-8")) > 16_000:
         raise ValueError("GenAI response exceeds the configured size limit")
     parsed = json.loads(raw)
-    if not isinstance(parsed, dict) or set(parsed) != {"rationale", "evidence_refs", "limitations"}:
+    if not isinstance(parsed, dict) or set(parsed) != {
+        "rationale",
+        "evidence_refs",
+        "limitations",
+    }:
         raise ValueError("GenAI response did not match the required schema")
     rationale = _clean_text(parsed["rationale"], 500)
     refs = _clean_text(parsed["evidence_refs"], 500)
     limitations = _clean_text(parsed["limitations"], 300)
-    if not rationale or re.search(r"\b(approve|approved|revoke|revoked|detach|execute)\b", rationale, re.I):
+    if not rationale or re.search(
+        r"\b(approve|approved|revoke|revoked|detach|execute)\b",
+        rationale,
+        re.IGNORECASE,
+    ):
         raise ValueError("GenAI response is empty or decision-like")
     allowed = set(context.get("evidence_refs_allowed", []))
-    references = [ref.strip() for ref in refs.split(",") if ref.strip()] if refs and refs.lower() != "none" else []
-    if any(ref not in allowed for ref in references) or len(references) != len(set(references)):
+    references = (
+        [ref.strip() for ref in refs.split(",") if ref.strip()]
+        if refs and refs.lower() != "none"
+        else []
+    )
+    if any(ref not in allowed for ref in references) or len(references) != len(
+        set(references)
+    ):
         raise ValueError("GenAI cited evidence outside the supplied evidence")
-    return json.dumps({"rationale": rationale, "evidence_refs": refs, "limitations": limitations}, ensure_ascii=False)
+    return json.dumps(
+        {"rationale": rationale, "evidence_refs": refs, "limitations": limitations},
+        ensure_ascii=False,
+    )
 
 
 def _build_context(row):
-    (review_id, status, user_id, _role_id, _user_name, role_name, risk_level,
-     policy_document, reason, evidence_json, rule_version) = row
+    (
+        review_id,
+        status,
+        user_id,
+        _role_id,
+        _user_name,
+        role_name,
+        risk_level,
+        policy_document,
+        reason,
+        evidence_json,
+        rule_version,
+    ) = row
     if status != "PENDING" or risk_level != "HIGH":
         return None
     policy = json.loads(policy_document) if policy_document else None
@@ -113,18 +160,44 @@ def _persist(conn, review_id: str, summary: str, source: str, context: dict):
     input_hash = hashlib.sha256(_canonical(context).encode("utf-8")).hexdigest()
     output_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()
     cur = conn.cursor()
-    db.execute(cur, "UPDATE access_reviews SET ai_risk_summary=? WHERE review_id=? AND status='PENDING' AND (ai_risk_summary IS NULL OR ai_risk_summary='')",
-               (summary, review_id))
+    db.execute(
+        cur,
+        "UPDATE access_reviews SET ai_risk_summary=? WHERE review_id=? AND status='PENDING' AND (ai_risk_summary IS NULL OR ai_risk_summary='')",
+        (summary, review_id),
+    )
     if cur.rowcount != 1:
         raise RuntimeError("Review was completed or already received an explanation")
-    repo.record_ai_generation(conn, str(uuid.uuid4()), review_id, source, "SUCCESS",
-                              config.get_genai_model() if source == "MODEL" else None,
-                              PROMPT_VERSION, input_hash, output_hash, summary, created)
-    repo.insert_audit_log(conn, str(uuid.uuid4()), datetime.now(timezone.utc), "INFO", "ai_explanation", "success",
-                          "Review explanation recorded", entity_type="access_review", entity_id=review_id,
-                          details={"source": source, "model": config.get_genai_model() if source == "MODEL" else None,
-                                   "prompt_version": PROMPT_VERSION, "input_sha256": input_hash,
-                                   "output_sha256": output_hash})
+    repo.record_ai_generation(
+        conn,
+        str(uuid.uuid4()),
+        review_id,
+        source,
+        "SUCCESS",
+        config.get_genai_model() if source == "MODEL" else None,
+        PROMPT_VERSION,
+        input_hash,
+        output_hash,
+        summary,
+        created,
+    )
+    repo.insert_audit_log(
+        conn,
+        str(uuid.uuid4()),
+        datetime.now(timezone.utc),
+        "INFO",
+        "ai_explanation",
+        "success",
+        "Review explanation recorded",
+        entity_type="access_review",
+        entity_id=review_id,
+        details={
+            "source": source,
+            "model": config.get_genai_model() if source == "MODEL" else None,
+            "prompt_version": PROMPT_VERSION,
+            "input_sha256": input_hash,
+            "output_sha256": output_hash,
+        },
+    )
 
 
 def _process_single_review(conn, review_id: str):
@@ -133,28 +206,63 @@ def _process_single_review(conn, review_id: str):
         return {"status": "FAILED", "review_id": review_id, "reason": "not_found"}
     context = _build_context(row)
     if context is None:
-        return {"status": "SKIPPED", "review_id": review_id, "reason": "not_pending_high_risk"}
+        return {
+            "status": "SKIPPED",
+            "review_id": review_id,
+            "reason": "not_pending_high_risk",
+        }
     if _has_existing_summary(conn, review_id):
-        return {"status": "SKIPPED", "review_id": review_id, "reason": "already_present"}
+        return {
+            "status": "SKIPPED",
+            "review_id": review_id,
+            "reason": "already_present",
+        }
     try:
         summary, source = generate_ai_summary(context), "MODEL"
     except Exception as exc:
-        logger.log("ai_explanation", "warn", "Model explanation unavailable; storing explicit fallback", level="WARN",
-                   entity_id=review_id, details={"error_type": type(exc).__name__})
-        summary, source = json.dumps({"rationale": context["risk_reason"], "evidence_refs": "none",
-                                      "limitations": "Deterministic fallback; model explanation unavailable."}), "FALLBACK"
+        logger.log(
+            "ai_explanation",
+            "warn",
+            "Model explanation unavailable; storing explicit fallback",
+            level="WARN",
+            entity_id=review_id,
+            details={"error_type": type(exc).__name__},
+        )
+        summary, source = (
+            json.dumps(
+                {
+                    "rationale": context["risk_reason"],
+                    "evidence_refs": "none",
+                    "limitations": "Deterministic fallback; model explanation unavailable.",
+                }
+            ),
+            "FALLBACK",
+        )
     try:
         _persist(conn, review_id, summary, source, context)
     except RuntimeError:
-        return {"status": "SKIPPED", "review_id": review_id, "reason": "review_changed_or_already_processed"}
-    logger.log("ai_explanation", "success", "Review explanation recorded", entity_id=review_id,
-               details={"source": source, "prompt_version": PROMPT_VERSION})
+        return {
+            "status": "SKIPPED",
+            "review_id": review_id,
+            "reason": "review_changed_or_already_processed",
+        }
+    logger.log(
+        "ai_explanation",
+        "success",
+        "Review explanation recorded",
+        entity_id=review_id,
+        details={"source": source, "prompt_version": PROMPT_VERSION},
+    )
     return {"status": "SUCCESS", "source": source, "review_id": review_id}
 
 
 def _has_existing_summary(conn, review_id: str) -> bool:
     cur = conn.cursor()
-    db.execute(cur, "SELECT 1 FROM access_reviews WHERE review_id=? AND ai_risk_summary IS NOT NULL AND ai_risk_summary<>''", (review_id,))
+    db.execute(
+        cur,
+        "SELECT 1 FROM access_reviews WHERE review_id=? AND ai_risk_summary IS NOT NULL AND ai_risk_summary<>''",
+        (review_id,),
+    )
     return cur.fetchone() is not None
 
 
@@ -166,7 +274,10 @@ def handler(event, context):
     with db.get_connection() as conn:
         if review_id:
             return _process_single_review(conn, str(review_id))
-        results = [_process_single_review(conn, row[0]) for row in repo.list_high_risk_reviews_missing_ai(conn)]
+        results = [
+            _process_single_review(conn, row[0])
+            for row in repo.list_high_risk_reviews_missing_ai(conn)
+        ]
         return {"status": "SUCCESS", "processed": results}
 
 

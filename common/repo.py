@@ -1,7 +1,7 @@
 # common/repo.py
-from datetime import datetime, timezone
 import json
-from typing import Any, Iterable, List, Tuple
+from datetime import datetime, timezone
+from typing import Any
 
 from common.db import db
 
@@ -44,37 +44,91 @@ def link_user_role(conn, user_id: str, role_id: str):
 
 
 def update_role_policy(conn, role_id: str, document: dict | None, observed_at: str):
-    db.execute(conn.cursor(), "UPDATE roles SET policy_document = ?, observed_at = ? WHERE role_id = ?",
-               (json.dumps(document, sort_keys=True) if document is not None else None, observed_at, role_id))
+    db.execute(
+        conn.cursor(),
+        "UPDATE roles SET policy_document = ?, observed_at = ? WHERE role_id = ?",
+        (
+            json.dumps(document, sort_keys=True) if document is not None else None,
+            observed_at,
+            role_id,
+        ),
+    )
 
 
 def reconcile_user_roles(conn, pairs: set[tuple[str, str]]):
     """Replace the current entitlement links only after a complete source scan."""
     conn.cursor().execute("DELETE FROM user_roles")
     if pairs:
-        db.executemany(conn.cursor(), "INSERT INTO user_roles (user_id, role_id) VALUES (?, ?) ON CONFLICT(user_id, role_id) DO NOTHING", pairs)
+        db.executemany(
+            conn.cursor(),
+            "INSERT INTO user_roles (user_id, role_id) VALUES (?, ?) ON CONFLICT(user_id, role_id) DO NOTHING",
+            pairs,
+        )
 
 
 def start_discovery_run(conn, run_id: str, started_at: str, source: str):
-    db.execute(conn.cursor(), "INSERT INTO discovery_runs (run_id, started_at, status, source) VALUES (?, ?, 'RUNNING', ?)", (run_id, started_at, source))
+    db.execute(
+        conn.cursor(),
+        "INSERT INTO discovery_runs (run_id, started_at, status, source) VALUES (?, ?, 'RUNNING', ?)",
+        (run_id, started_at, source),
+    )
 
 
-def finish_discovery_run(conn, run_id: str, completed_at: str, status: str, users_seen: int, errors: int, details: dict | None = None):
-    db.execute(conn.cursor(), "UPDATE discovery_runs SET completed_at=?, status=?, users_seen=?, errors=?, details=? WHERE run_id=?",
-               (completed_at, status, users_seen, errors, json.dumps(details, default=str) if details else None, run_id))
+def finish_discovery_run(
+    conn,
+    run_id: str,
+    completed_at: str,
+    status: str,
+    users_seen: int,
+    errors: int,
+    details: dict | None = None,
+):
+    db.execute(
+        conn.cursor(),
+        "UPDATE discovery_runs SET completed_at=?, status=?, users_seen=?, errors=?, details=? WHERE run_id=?",
+        (
+            completed_at,
+            status,
+            users_seen,
+            errors,
+            json.dumps(details, default=str) if details else None,
+            run_id,
+        ),
+    )
 
 
 def latest_discovery_run(conn):
     cur = conn.cursor()
-    db.execute(cur, "SELECT run_id, completed_at, status, source FROM discovery_runs ORDER BY started_at DESC, run_id DESC LIMIT 1")
+    db.execute(
+        cur,
+        "SELECT run_id, completed_at, status, source FROM discovery_runs ORDER BY started_at DESC, run_id DESC LIMIT 1",
+    )
     return cur.fetchone()
 
 
-def store_risk_assessment(conn, role_id: str, risk_level: str, reason: str, evidence: dict, rule_version: str, assessed_at: str):
-    db.execute(conn.cursor(), """INSERT INTO risk_assessments (role_id,risk_level,reason,evidence,rule_version,assessed_at)
+def store_risk_assessment(
+    conn,
+    role_id: str,
+    risk_level: str,
+    reason: str,
+    evidence: dict,
+    rule_version: str,
+    assessed_at: str,
+):
+    db.execute(
+        conn.cursor(),
+        """INSERT INTO risk_assessments (role_id,risk_level,reason,evidence,rule_version,assessed_at)
         VALUES (?,?,?,?,?,?) ON CONFLICT(role_id) DO UPDATE SET risk_level=excluded.risk_level,
         reason=excluded.reason,evidence=excluded.evidence,rule_version=excluded.rule_version,assessed_at=excluded.assessed_at""",
-        (role_id, risk_level, reason, json.dumps(evidence, sort_keys=True), rule_version, assessed_at))
+        (
+            role_id,
+            risk_level,
+            reason,
+            json.dumps(evidence, sort_keys=True),
+            rule_version,
+            assessed_at,
+        ),
+    )
 
 
 # Campaigns / reviews
@@ -89,88 +143,138 @@ def create_campaign(conn, campaign_id: str, name: str, created_at: str):
     )
 
 
-def assign_campaign_reviewer(conn, campaign_id: str, reviewer_sub: str, assigned_by: str):
+def assign_campaign_reviewer(
+    conn, campaign_id: str, reviewer_sub: str, assigned_by: str
+):
     cur = conn.cursor()
-    db.execute(cur, """INSERT INTO campaign_reviewers (campaign_id,reviewer_sub,assigned_by)
+    db.execute(
+        cur,
+        """INSERT INTO campaign_reviewers (campaign_id,reviewer_sub,assigned_by)
         VALUES (?,?,?) ON CONFLICT(campaign_id,reviewer_sub) DO NOTHING""",
-        (campaign_id, reviewer_sub, assigned_by))
+        (campaign_id, reviewer_sub, assigned_by),
+    )
     return cur.rowcount == 1
 
 
 def is_campaign_reviewer(conn, campaign_id: str, reviewer_sub: str) -> bool:
     cur = conn.cursor()
-    db.execute(cur, "SELECT 1 FROM campaign_reviewers WHERE campaign_id=? AND reviewer_sub=?",
-               (campaign_id, reviewer_sub))
+    db.execute(
+        cur,
+        "SELECT 1 FROM campaign_reviewers WHERE campaign_id=? AND reviewer_sub=?",
+        (campaign_id, reviewer_sub),
+    )
     return cur.fetchone() is not None
 
 
 def fetch_review_for_decision(conn, review_id: str):
     cur = conn.cursor()
-    db.execute(cur, """SELECT review_id,campaign_id,status,user_id,role_id,reviewer_sub
-        FROM access_reviews WHERE review_id=?""", (review_id,))
+    db.execute(
+        cur,
+        """SELECT review_id,campaign_id,status,user_id,role_id,reviewer_sub
+        FROM access_reviews WHERE review_id=?""",
+        (review_id,),
+    )
     return cur.fetchone()
 
 
-def record_remediation_approval(conn, approval_id: str, review_id: str, approver_sub: str,
-                               approved_at: str, discovery_run_id: str):
+def record_remediation_approval(
+    conn,
+    approval_id: str,
+    review_id: str,
+    approver_sub: str,
+    approved_at: str,
+    discovery_run_id: str,
+):
     cur = conn.cursor()
-    db.execute(cur, """INSERT INTO remediation_approvals
+    db.execute(
+        cur,
+        """INSERT INTO remediation_approvals
         (approval_id,review_id,approver_sub,approved_at,discovery_run_id)
         VALUES (?,?,?,?,?) ON CONFLICT(review_id) DO UPDATE SET
         approval_id=excluded.approval_id,approver_sub=excluded.approver_sub,
         approved_at=excluded.approved_at,discovery_run_id=excluded.discovery_run_id
         WHERE COALESCE(remediation_approvals.discovery_run_id,'') <> excluded.discovery_run_id""",
-        (approval_id, review_id, approver_sub, approved_at, discovery_run_id))
+        (approval_id, review_id, approver_sub, approved_at, discovery_run_id),
+    )
     return cur.rowcount == 1
 
 
 def get_remediation_approval(conn, review_id: str):
     cur = conn.cursor()
-    db.execute(cur, "SELECT approver_sub,approved_at,discovery_run_id FROM remediation_approvals WHERE review_id=?",
-               (review_id,))
+    db.execute(
+        cur,
+        "SELECT approver_sub,approved_at,discovery_run_id FROM remediation_approvals WHERE review_id=?",
+        (review_id,),
+    )
     return cur.fetchone()
 
 
 def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool:
     cur = conn.cursor()
-    db.execute(cur, """SELECT 1 FROM remediation_approvals a
+    db.execute(
+        cur,
+        """SELECT 1 FROM remediation_approvals a
         JOIN access_reviews r ON r.review_id=a.review_id
         WHERE a.review_id=? AND r.status='REVOKED' AND r.reviewer_sub IS NOT NULL
-          AND a.approver_sub <> r.reviewer_sub AND a.discovery_run_id=?""", (review_id, discovery_run_id))
+          AND a.approver_sub <> r.reviewer_sub AND a.discovery_run_id=?""",
+        (review_id, discovery_run_id),
+    )
     return cur.fetchone() is not None
 
 
-def claim_remediation(conn, review_id: str, claim_token: str, now: str, lease_expires_at: str):
+def claim_remediation(
+    conn, review_id: str, claim_token: str, now: str, lease_expires_at: str
+):
     cur = conn.cursor()
-    db.execute(cur, """INSERT INTO remediation_claims
+    db.execute(
+        cur,
+        """INSERT INTO remediation_claims
         (review_id,claim_token,lease_expires_at,fencing_token)
         VALUES (?,?,?,1) ON CONFLICT(review_id) DO UPDATE SET
         claim_token=excluded.claim_token,lease_expires_at=excluded.lease_expires_at,
         fencing_token=remediation_claims.fencing_token+1
         WHERE remediation_claims.lease_expires_at <= ?""",
-        (review_id, claim_token, lease_expires_at, now))
+        (review_id, claim_token, lease_expires_at, now),
+    )
     if cur.rowcount != 1:
         return None
-    db.execute(cur, "SELECT fencing_token FROM remediation_claims WHERE review_id=? AND claim_token=?",
-               (review_id, claim_token))
+    db.execute(
+        cur,
+        "SELECT fencing_token FROM remediation_claims WHERE review_id=? AND claim_token=?",
+        (review_id, claim_token),
+    )
     row = cur.fetchone()
     return row[0] if row else None
 
 
-def renew_remediation_claim(conn, review_id: str, claim_token: str, fencing_token: int,
-                            now: str, lease_expires_at: str) -> bool:
+def renew_remediation_claim(
+    conn,
+    review_id: str,
+    claim_token: str,
+    fencing_token: int,
+    now: str,
+    lease_expires_at: str,
+) -> bool:
     cur = conn.cursor()
-    db.execute(cur, """UPDATE remediation_claims SET lease_expires_at=?
+    db.execute(
+        cur,
+        """UPDATE remediation_claims SET lease_expires_at=?
         WHERE review_id=? AND claim_token=? AND fencing_token=? AND lease_expires_at>?""",
-        (lease_expires_at, review_id, claim_token, fencing_token, now))
+        (lease_expires_at, review_id, claim_token, fencing_token, now),
+    )
     return cur.rowcount == 1
 
 
-def release_remediation_claim(conn, review_id: str, claim_token: str, fencing_token: int):
+def release_remediation_claim(
+    conn, review_id: str, claim_token: str, fencing_token: int
+):
     released_at = datetime.now(timezone.utc).isoformat()
-    db.execute(conn.cursor(), """UPDATE remediation_claims SET lease_expires_at=?
+    db.execute(
+        conn.cursor(),
+        """UPDATE remediation_claims SET lease_expires_at=?
         WHERE review_id=? AND claim_token=? AND fencing_token=?""",
-        (released_at, review_id, claim_token, fencing_token))
+        (released_at, review_id, claim_token, fencing_token),
+    )
 
 
 def lock_inventory_remediation(conn):
@@ -179,15 +283,22 @@ def lock_inventory_remediation(conn):
     The row update holds a write lock until the surrounding transaction commits
     or rolls back on both SQLite and PostgreSQL.
     """
-    db.execute(conn.cursor(), """UPDATE governance_mutex SET lock_version=lock_version+1
-        WHERE lock_name='inventory_remediation'""")
+    db.execute(
+        conn.cursor(),
+        """UPDATE governance_mutex SET lock_version=lock_version+1
+        WHERE lock_name='inventory_remediation'""",
+    )
 
 
 def is_current_entitlement(conn, review_id: str) -> bool:
     cur = conn.cursor()
-    db.execute(cur, """SELECT 1 FROM access_reviews r JOIN user_roles ur
+    db.execute(
+        cur,
+        """SELECT 1 FROM access_reviews r JOIN user_roles ur
         ON ur.user_id=r.user_id AND ur.role_id=r.role_id
-        WHERE r.review_id=? AND r.status='REVOKED'""", (review_id,))
+        WHERE r.review_id=? AND r.status='REVOKED'""",
+        (review_id,),
+    )
     return cur.fetchone() is not None
 
 
@@ -197,7 +308,7 @@ def campaign_exists(conn, campaign_id: str) -> bool:
     return cur.fetchone() is not None
 
 
-def list_entitlements(conn) -> List[Tuple[str, str, str]]:
+def list_entitlements(conn) -> list[tuple[str, str, str]]:
     cur = conn.cursor()
     db.execute(
         cur,
@@ -223,7 +334,9 @@ def pending_review_exists(conn, user_id: str, role_id: str) -> bool:
     return cur.fetchone() is not None
 
 
-def create_review(conn, review_id: str, campaign_id: str, user_id: str, role_id: str, created_at: str):
+def create_review(
+    conn, review_id: str, campaign_id: str, user_id: str, role_id: str, created_at: str
+):
     db.execute(
         conn.cursor(),
         """
@@ -236,17 +349,22 @@ def create_review(conn, review_id: str, campaign_id: str, user_id: str, role_id:
     )
 
 
-def create_review_if_pending(conn, review_id: str, campaign_id: str, user_id: str, role_id: str, created_at: str) -> bool:
+def create_review_if_pending(
+    conn, review_id: str, campaign_id: str, user_id: str, role_id: str, created_at: str
+) -> bool:
     """Race-safe insert; unique constraints arbitrate concurrent campaign runs."""
     cur = conn.cursor()
-    db.execute(cur, """INSERT INTO access_reviews
+    db.execute(
+        cur,
+        """INSERT INTO access_reviews
         (review_id,campaign_id,user_id,role_id,status,created_at)
         VALUES (?,?,?,?,'PENDING',?) ON CONFLICT DO NOTHING""",
-        (review_id, campaign_id, user_id, role_id, created_at))
+        (review_id, campaign_id, user_id, role_id, created_at),
+    )
     return cur.rowcount == 1
 
 
-def list_roles(conn) -> List[Tuple[str, str, str, str | None]]:
+def list_roles(conn) -> list[tuple[str, str, str, str | None]]:
     cur = conn.cursor()
     db.execute(
         cur,
@@ -270,7 +388,7 @@ def update_role_risk(conn, role_id: str, new_risk: str):
     )
 
 
-def list_revocations(conn) -> List[Tuple[str, str, str, str]]:
+def list_revocations(conn) -> list[tuple[str, str, str, str]]:
     cur = conn.cursor()
     db.execute(
         cur,
@@ -287,7 +405,9 @@ def list_revocations(conn) -> List[Tuple[str, str, str, str]]:
     return cur.fetchall()
 
 
-def list_high_risk_reviews_missing_ai(conn) -> List[Tuple[str, str, str, str, str, str]]:
+def list_high_risk_reviews_missing_ai(
+    conn,
+) -> list[tuple[str, str, str, str, str, str]]:
     cur = conn.cursor()
     db.execute(
         cur,
@@ -303,7 +423,9 @@ def list_high_risk_reviews_missing_ai(conn) -> List[Tuple[str, str, str, str, st
     return cur.fetchall()
 
 
-def fetch_review_context(conn, review_id: str) -> Tuple[str, str, str, str, str, str] | None:
+def fetch_review_context(
+    conn, review_id: str
+) -> tuple[str, str, str, str, str, str] | None:
     cur = conn.cursor()
     db.execute(
         cur,
@@ -321,19 +443,48 @@ def fetch_review_context(conn, review_id: str) -> Tuple[str, str, str, str, str,
 
 def fetch_review_ai_context(conn, review_id: str):
     cur = conn.cursor()
-    db.execute(cur, """SELECT r.review_id,r.status,r.user_id,r.role_id,u.user_name,rol.role_name,rol.risk_level,
+    db.execute(
+        cur,
+        """SELECT r.review_id,r.status,r.user_id,r.role_id,u.user_name,rol.role_name,rol.risk_level,
         rol.policy_document,ra.reason,ra.evidence,ra.rule_version
         FROM access_reviews r JOIN users u ON u.user_id=r.user_id JOIN roles rol ON rol.role_id=r.role_id
-        LEFT JOIN risk_assessments ra ON ra.role_id=rol.role_id WHERE r.review_id=?""", (review_id,))
+        LEFT JOIN risk_assessments ra ON ra.role_id=rol.role_id WHERE r.review_id=?""",
+        (review_id,),
+    )
     return cur.fetchone()
 
 
-def record_ai_generation(conn, generation_id: str, review_id: str, source: str, status: str,
-                         model: str | None, prompt_version: str, input_hash: str,
-                         output_hash: str, summary: str, created_at: str):
-    db.execute(conn.cursor(), """INSERT INTO ai_generations
+def record_ai_generation(
+    conn,
+    generation_id: str,
+    review_id: str,
+    source: str,
+    status: str,
+    model: str | None,
+    prompt_version: str,
+    input_hash: str,
+    output_hash: str,
+    summary: str,
+    created_at: str,
+):
+    db.execute(
+        conn.cursor(),
+        """INSERT INTO ai_generations
         (generation_id,review_id,source,status,model,prompt_version,input_sha256,output_sha256,summary,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)""", (generation_id,review_id,source,status,model,prompt_version,input_hash,output_hash,summary,created_at))
+        VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (
+            generation_id,
+            review_id,
+            source,
+            status,
+            model,
+            prompt_version,
+            input_hash,
+            output_hash,
+            summary,
+            created_at,
+        ),
+    )
 
 
 def mark_remediated(conn, review_id: str, ts: str):
@@ -348,7 +499,7 @@ def mark_remediated(conn, review_id: str, ts: str):
     )
 
 
-def fetch_reviews_for_export(conn) -> List[Tuple[Any, ...]]:
+def fetch_reviews_for_export(conn) -> list[tuple[Any, ...]]:
     """Stable export row with latest append-only AI provenance fields at the end."""
     cur = conn.cursor()
     db.execute(
@@ -410,4 +561,3 @@ def insert_audit_log(
             json.dumps(details, default=str) if details else None,
         ),
     )
-

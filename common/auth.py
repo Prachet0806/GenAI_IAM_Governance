@@ -1,6 +1,7 @@
 """OIDC access-token validation for the reviewer API."""
-from functools import lru_cache
+
 import os
+from functools import lru_cache
 from urllib.parse import urlparse
 
 
@@ -15,6 +16,7 @@ class AuthorizationError(Exception):
 @lru_cache(maxsize=4)
 def _jwks_client(url: str):
     from jwt import PyJWKClient
+
     return PyJWKClient(url, cache_jwk_set=True, lifespan=300, timeout=5)
 
 
@@ -24,11 +26,19 @@ def verify_access_token(token: str) -> dict:
     jwks_url = os.getenv("OIDC_JWKS_URL", "").strip()
     parsed = urlparse(jwks_url)
     issuer_url = urlparse(issuer)
-    if (issuer_url.scheme != "https" or not issuer_url.netloc or not audience
-            or parsed.scheme != "https" or not parsed.netloc):
-        raise AuthenticationError("OIDC issuer, audience, and HTTPS JWKS URL must be configured")
+    if (
+        issuer_url.scheme != "https"
+        or not issuer_url.netloc
+        or not audience
+        or parsed.scheme != "https"
+        or not parsed.netloc
+    ):
+        raise AuthenticationError(
+            "OIDC issuer, audience, and HTTPS JWKS URL must be configured"
+        )
     try:
         import jwt
+
         signing_key = _jwks_client(jwks_url).get_signing_key_from_jwt(token).key
         claims = jwt.decode(
             token,

@@ -1,4 +1,4 @@
-#scripts/review.py
+# scripts/review.py
 """Reviewer CLI (local demo polish). Thin wrapper over common/repo.py.
 
 Maps 1:1 to future API:
@@ -10,6 +10,7 @@ Maps 1:1 to future API:
 No business logic here beyond arg parsing + rich rendering; all DB
 access goes through common.db / common.repo.
 """
+
 import argparse
 import os
 import sys
@@ -36,6 +37,7 @@ console = None  # lazy per-call so pytest capsys captures output
 
 def _console() -> "Console":
     from rich.console import Console as _C
+
     return _C(file=sys.stdout, width=200)
 
 
@@ -52,7 +54,9 @@ def cmd_list(args) -> int:
         rows = repo.fetch_reviews_for_export(conn)
     filtered = []
     for r in rows:
-        review_id, _camp, user, role, risk, status, _comment, ai, _ca, _ra, _rem = r[:11]
+        review_id, _camp, user, role, risk, status, _comment, ai, _ca, _ra, _rem = r[
+            :11
+        ]
         if args.status and status != args.status:
             continue
         if args.risk and risk != args.risk:
@@ -67,8 +71,15 @@ def cmd_list(args) -> int:
         review_id, _c, user, role, risk, status, comment, ai, _ca, _ra, _rem = r[:11]
         style = "red" if risk == "HIGH" else ("yellow" if risk == "MEDIUM" else "green")
         source = r[11] if len(r) > 11 else None
-        table.add_row(review_id[:8], user, role, f"[{style}]{risk}[/{style}]",
-                      status, _ai_marker(ai, source), (comment or "")[:60])
+        table.add_row(
+            review_id[:8],
+            user,
+            role,
+            f"[{style}]{risk}[/{style}]",
+            status,
+            _ai_marker(ai, source),
+            (comment or "")[:60],
+        )
     _console().print(table)
     return 0
 
@@ -76,27 +87,39 @@ def cmd_list(args) -> int:
 def cmd_decide(args) -> int:
     decision = args.decision.upper()
     if decision not in ("APPROVED", "REVOKED"):
-        _console().print(f"[red]decision must be APPROVED or REVOKED[/red]")
+        _console().print("[red]decision must be APPROVED or REVOKED[/red]")
         return 2
     if decision == "REVOKED" and not (args.comment or "").strip():
-        _console().print("[red]REVOKED requires --comment (DB CHECK enforces this)[/red]")
+        _console().print(
+            "[red]REVOKED requires --comment (DB CHECK enforces this)[/red]"
+        )
         return 2
     if os.getenv("APP_ENV", "development").lower() == "production":
-        _console().print("[red]production decisions are disabled until an authenticated review service is integrated[/red]")
+        _console().print(
+            "[red]production decisions are disabled until an authenticated review service is integrated[/red]"
+        )
         return 2
     if not config.is_mock_iam():
-        _console().print("[red]unauthenticated CLI decisions are restricted to MOCK_IAM=true demo data[/red]")
+        _console().print(
+            "[red]unauthenticated CLI decisions are restricted to MOCK_IAM=true demo data[/red]"
+        )
         return 2
     reviewer = args.reviewer or "local-demo"
     with db.get_connection() as conn:
         cur = conn.cursor()
-        db.execute(cur, "SELECT status FROM access_reviews WHERE review_id = ?", (args.review_id,))
+        db.execute(
+            cur,
+            "SELECT status FROM access_reviews WHERE review_id = ?",
+            (args.review_id,),
+        )
         row = cur.fetchone()
         if not row:
             _console().print(f"[red]review not found: {args.review_id}[/red]")
             return 1
         if row[0] != "PENDING":
-            _console().print(f"[red]already decided ({row[0]}); refusing double-decide[/red]")
+            _console().print(
+                f"[red]already decided ({row[0]}); refusing double-decide[/red]"
+            )
             return 1
         now = datetime.now(timezone.utc).isoformat()
         db.execute(
@@ -109,11 +132,21 @@ def cmd_decide(args) -> int:
             _console().print("[red]update raced or already decided[/red]")
             return 1
         repo.insert_audit_log(
-            conn, str(uuid.uuid4()), datetime.now(timezone.utc), "INFO",
-            "review_decision", decision, f"{decision} by {reviewer}",
-            entity_type="access_review", entity_id=args.review_id,
-            details={"review_id": args.review_id, "decision": decision,
-                     "reviewer": reviewer, "comment": args.comment or ""},
+            conn,
+            str(uuid.uuid4()),
+            datetime.now(timezone.utc),
+            "INFO",
+            "review_decision",
+            decision,
+            f"{decision} by {reviewer}",
+            entity_type="access_review",
+            entity_id=args.review_id,
+            details={
+                "review_id": args.review_id,
+                "decision": decision,
+                "reviewer": reviewer,
+                "comment": args.comment or "",
+            },
         )
     _console().print(f"[green]{decision}[/green] {args.review_id[:8]} by {reviewer}")
     return 0
@@ -153,8 +186,14 @@ def cmd_audit(args) -> int:
     for col in ("Timestamp", "Level", "Action", "Status", "Entity", "Message"):
         table.add_column(col, overflow="fold")
     for ts, level, action, status, entity_id, message in rows:
-        table.add_row(str(ts)[:19], level or "", action or "", status or "",
-                      (entity_id or "")[:8], (message or "")[:80])
+        table.add_row(
+            str(ts)[:19],
+            level or "",
+            action or "",
+            status or "",
+            (entity_id or "")[:8],
+            (message or "")[:80],
+        )
     _console().print(table)
     if not rows:
         _console().print("[dim]no audit rows yet — run the demo pipeline first[/dim]")
@@ -189,12 +228,18 @@ def cmd_auto_demo(args) -> int:
         )
         approved = cur.rowcount
         repo.insert_audit_log(
-            conn, str(uuid.uuid4()), datetime.now(timezone.utc), "INFO",
-            "auto_demo_review", "success",
+            conn,
+            str(uuid.uuid4()),
+            datetime.now(timezone.utc),
+            "INFO",
+            "auto_demo_review",
+            "success",
             f"Auto-demo: revoked {revoked}, approved {approved}",
             details={"revoked": revoked, "approved": approved},
         )
-    _console().print(f"[green]auto-demo:[/green] revoked {revoked}, approved {approved} (MEDIUM left PENDING)")
+    _console().print(
+        f"[green]auto-demo:[/green] revoked {revoked}, approved {approved} (MEDIUM left PENDING)"
+    )
     return 0
 
 

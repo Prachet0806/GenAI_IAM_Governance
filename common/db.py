@@ -1,7 +1,8 @@
 # common/db.py
 import contextlib
 import sqlite3
-from typing import Any, Iterable, Tuple
+from collections.abc import Iterable
+from typing import Any
 
 from common import config
 
@@ -32,7 +33,9 @@ class Database:
     def _connect_sqlite(self, path: str | None = None):
         resolved = path or config.get_sqlite_path()
         if resolved == ":memory:":
-            raise ValueError("sqlite :memory: is not supported for file-backed engine; set a file path.")
+            raise ValueError(
+                "sqlite :memory: is not supported for file-backed engine; set a file path."
+            )
         conn = sqlite3.connect(resolved, timeout=15)
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA busy_timeout = 15000;")
@@ -97,9 +100,7 @@ class Database:
                     j = i + 1
                     while j < n and sql[j] in (" ", "\t", "\n", "\r"):
                         j += 1
-                    if j < n and sql[j] in ("'", '"'):
-                        out.append("?")
-                    elif prev_c == "?":
+                    if j < n and sql[j] in ("'", '"') or prev_c == "?":
                         out.append("?")
                     else:
                         out.append("%s")
@@ -116,9 +117,8 @@ class Database:
         else:
             cursor.execute(prepared, params)
 
-    def executemany(self, cursor, sql: str, seq_of_params: Iterable[Tuple[Any, ...]]):
+    def executemany(self, cursor, sql: str, seq_of_params: Iterable[tuple[Any, ...]]):
         cursor.executemany(self.prepare_sql(sql), seq_of_params)
 
 
 db = Database()
-
