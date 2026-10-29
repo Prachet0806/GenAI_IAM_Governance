@@ -131,6 +131,10 @@ def cmd_decide(args) -> int:
         if cur.rowcount == 0:
             _console().print("[red]update raced or already decided[/red]")
             return 1
+        repo.record_review_decision_event(
+            conn, str(uuid.uuid4()), args.review_id, decision,
+            reviewer, args.comment or "", now,
+        )
         repo.insert_audit_log(
             conn,
             str(uuid.uuid4()),
@@ -210,23 +214,46 @@ def cmd_auto_demo(args) -> int:
         return 2
     with db.get_connection() as conn:
         cur = conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
         db.execute(
             cur,
             """UPDATE access_reviews SET status='REVOKED',
-                   reviewer_comment='Violation of Least Privilege', reviewed_at=CURRENT_TIMESTAMP
-               WHERE status='PENDING' AND role_id IN
-                   (SELECT role_id FROM roles WHERE role_name LIKE '%AdministratorAccess%'
-                     OR role_name LIKE '%SuperUser%')""",
+                   reviewer_comment='Violation of Least Privilege', reviewed_at=?
+               WHERE status='PENDING' AND review_id IN
+                   (SELECT ar.review_id FROM access_reviews ar
+                    JOIN roles rol ON rol.role_id=ar.role_id
+                    LEFT JOIN grant_observations go ON go.observation_id=ar.observation_id
+                    WHERE (CASE WHEN ar.grant_id IS NULL THEN rol.role_name
+                                ELSE go.policy_name END) LIKE '%AdministratorAccess%'
+                       OR (CASE WHEN ar.grant_id IS NULL THEN rol.role_name
+                                ELSE go.policy_name END) LIKE '%SuperUser%')""",
+            (now,),
         )
         revoked = cur.rowcount
         db.execute(
             cur,
             """UPDATE access_reviews SET status='APPROVED',
-                   reviewer_comment='Approved: read-only business need', reviewed_at=CURRENT_TIMESTAMP
-               WHERE status='PENDING' AND role_id IN
-                   (SELECT role_id FROM roles WHERE risk_level='LOW')""",
+                   reviewer_comment='Approved: read-only business need', reviewed_at=?
+               WHERE status='PENDING' AND review_id IN
+                   (SELECT ar.review_id FROM access_reviews ar
+                    JOIN roles rol ON rol.role_id=ar.role_id
+                    LEFT JOIN grant_risk_assessments gra
+                      ON gra.assessment_id=ar.risk_assessment_id
+                    WHERE (CASE WHEN ar.grant_id IS NULL THEN rol.risk_level
+                                ELSE gra.risk_level END)='LOW')""",
+            (now,),
         )
         approved = cur.rowcount
+        db.execute(
+            cur,
+            "SELECT review_id,status,reviewer_comment FROM access_reviews WHERE reviewed_at=?",
+            (now,),
+        )
+        for review_id, status, comment in cur.fetchall():
+            repo.record_review_decision_event(
+                conn, str(uuid.uuid4()), review_id, status,
+                "local-demo", comment, now,
+            )
         repo.insert_audit_log(
             conn,
             str(uuid.uuid4()),

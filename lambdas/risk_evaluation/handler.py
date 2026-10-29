@@ -1,13 +1,14 @@
 # lambdas/risk_evaluation/handler.py
 import json
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from common import logger, repo
+from common import evidence, logger, repo
 from common.db import db
 
 
@@ -77,195 +78,111 @@ def risk_reason(role_name: str) -> str:
     return "no privileged pattern matched"
 
 
-def evaluate_risk(event, context):
-    logger.log("evaluate_risk", "start", "Starting Entitlement Risk Evaluation")
-
-    with db.get_connection() as conn:
-        roles = repo.list_roles(conn)
-
-        updated_count = 0
-
-        for role_id, role_name, current_risk, policy_document in roles:
-            try:
-                evidence = {"policy_name": role_name, "source": "name_heuristic"}
-                if policy_document:
-                    document = (
-                        json.loads(policy_document)
-                        if isinstance(policy_document, str)
-                        else policy_document
-                    )
-                    statements = document.get("Statement", [])
-                    if isinstance(statements, dict):
-                        statements = [statements]
-                    actions, resources, uncertain = [], [], False
-                    grants = 0
-                    for statement in statements:
-                        if not isinstance(statement, dict):
-                            uncertain = True
-                            continue
-                        effect = statement.get("Effect")
-                        if effect not in ("Allow", "Deny"):
-                            uncertain = True
-                            continue
-                        # NotAction and unusual AWS policy constructs need a real
-                        # policy evaluator; treating them as a narrow allow is unsafe.
-                        if effect == "Allow" and "NotAction" in statement:
-                            uncertain = True
-                        if effect != "Allow":
-                            continue
-                        grants += 1
-                        action = statement.get("Action", [])
-                        resource = statement.get("Resource", [])
-                        actions.extend(action if isinstance(action, list) else [action])
-                        resources.extend(
-                            resource if isinstance(resource, list) else [resource]
-                        )
-                        if statement.get("Condition") or "NotResource" in statement:
-                            uncertain = True
-                    normalized = [str(a).lower() for a in actions]
-                    wildcard = any(a == "*" or a.endswith(":*") for a in normalized)
-                    write_verbs = (
-                        "put",
-                        "delete",
-                        "create",
-                        "update",
-                        "modify",
-                        "attach",
-                        "detach",
-                        "remove",
-                        "terminate",
-                        "stop",
-                        "start",
-                        "set",
-                        "passrole",
-                        "send",
-                        "publish",
-                    )
-                    write = any(
-                        any(x in a.split(":", 1)[-1] for x in write_verbs)
-                        for a in normalized
-                    )
-                    broad_resource = any(
-                        str(resource).strip() == "*" for resource in resources
-                    )
-                    if wildcard:
-                        new_risk, reason = "HIGH", "policy grants wildcard actions"
-                    elif uncertain:
-                        new_risk, reason = (
-                            "HIGH",
-                            "policy constructs require manual evaluation",
-                        )
-                    elif not grants:
-                        new_risk, reason = (
-                            "HIGH",
-                            "no analyzable allow grants; manual review required",
-                        )
-                    elif write:
-                        new_risk, reason = "MEDIUM", "policy grants mutating actions"
-                    elif broad_resource:
-                        new_risk, reason = (
-                            "MEDIUM",
-                            "read actions apply to broad resources",
-                        )
-                    elif actions:
-                        new_risk, reason = (
-                            "LOW",
-                            "policy contains explicit non-wildcard allow actions",
-                        )
-                    else:
-                        new_risk, reason = (
-                            "HIGH",
-                            "no analyzable allow actions; manual review required",
-                        )
-                    evidence = {
-                        "source": "policy_document",
-                        "actions": actions[:200],
-                        "resources": resources[:200],
-                        "conditions_or_unsupported_constructs": uncertain,
-                        "allow_statement_count": grants,
-                    }
-                else:
-                    # Missing permission evidence must never be silently labelled low risk.
-                    heuristic = classify_risk(role_name)
-                    new_risk = "HIGH" if heuristic == "LOW" else heuristic
-                    reason = "policy document unavailable; name heuristic only; manual review required"
-
-                # Update only if risk level changed
-                if new_risk != current_risk:
-                    repo.update_role_risk(conn, role_id, new_risk)
-
-                    updated_count += 1
-
-                    if new_risk != "LOW":
-                        logger.log(
-                            "evaluate_risk",
-                            "info",
-                            f"{role_name} classified as {new_risk} ({reason})",
-                            details={
-                                "role_id": role_id,
-                                "new_risk": new_risk,
-                                "risk_reason": reason,
-                            },
-                        )
-
-                repo.store_risk_assessment(
-                    conn,
-                    role_id,
-                    new_risk,
-                    reason,
-                    evidence,
-                    "policy-risk-v2",
-                    datetime.now(timezone.utc).isoformat(),
-                )
-
-            except Exception as e:
-                try:
-                    repo.update_role_risk(conn, role_id, "HIGH")
-                    repo.store_risk_assessment(
-                        conn,
-                        role_id,
-                        "HIGH",
-                        "policy analysis failed; manual review required",
-                        {"source": "analysis_error", "error_type": type(e).__name__},
-                        "policy-risk-v2",
-                        datetime.now(timezone.utc).isoformat(),
-                    )
-                    updated_count += 1
-                except Exception:
-                    pass
-                logger.log(
-                    "evaluate_risk",
-                    "error",
-                    f"Error evaluating role {role_name}; classified high for manual review",
-                    level="ERROR",
-                    details={"role_id": role_id, "error_type": type(e).__name__},
-                )
-                continue
-
-        logger.log(
-            "evaluate_risk",
-            "success",
-            f"Risk Evaluation Complete. Updated {updated_count} entitlements.",
-            details={"roles_updated": updated_count},
+def assess_policy(policy_name: str, document: dict | None):
+    """Assess one policy document; this is not principal effective access."""
+    if not isinstance(document, dict):
+        return (
+            "HIGH",
+            "policy document unavailable; manual review required",
+            {"source": "missing_policy_document", "policy_name": policy_name},
         )
-        try:
-            import uuid
+    statements = document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not isinstance(statements, list):
+        statements = []
+    actions, resources, uncertain = [], [], False
+    grants = 0
+    for statement in statements:
+        if not isinstance(statement, dict) or statement.get("Effect") not in ("Allow", "Deny"):
+            uncertain = True
+            continue
+        if statement["Effect"] != "Allow":
+            continue
+        grants += 1
+        if "NotAction" in statement:
+            uncertain = True
+        action = statement.get("Action", [])
+        resource = statement.get("Resource", [])
+        actions.extend(action if isinstance(action, list) else [action])
+        resources.extend(resource if isinstance(resource, list) else [resource])
+        if statement.get("Condition") or "NotResource" in statement:
+            uncertain = True
+    normalized = [str(action).lower() for action in actions]
+    wildcard = any(action == "*" or action.endswith(":*") for action in normalized)
+    write_verbs = (
+        "put", "delete", "create", "update", "modify", "attach", "detach",
+        "remove", "terminate", "stop", "start", "set", "passrole", "send", "publish",
+    )
+    write = any(
+        any(verb in action.split(":", 1)[-1] for verb in write_verbs)
+        for action in normalized
+    )
+    broad_resource = any(str(resource).strip() == "*" for resource in resources)
+    if wildcard:
+        risk, reason = "HIGH", "policy grants wildcard actions"
+    elif uncertain:
+        risk, reason = "HIGH", "policy constructs require manual evaluation"
+    elif not grants:
+        risk, reason = "HIGH", "no analyzable allow grants; manual review required"
+    elif write:
+        risk, reason = "MEDIUM", "policy grants mutating actions"
+    elif broad_resource:
+        risk, reason = "MEDIUM", "read actions apply to broad resources"
+    elif actions:
+        risk, reason = "LOW", "policy contains explicit non-wildcard allow actions"
+    else:
+        risk, reason = "HIGH", "no analyzable allow actions; manual review required"
+    return risk, reason, {
+        "source": "policy_document",
+        "actions": actions[:200],
+        "resources": resources[:200],
+        "conditions_or_unsupported_constructs": uncertain,
+        "allow_statement_count": grants,
+    }
 
-            repo.insert_audit_log(
-                conn,
-                str(uuid.uuid4()),
-                datetime.now(timezone.utc),
-                "INFO",
-                "evaluate_risk",
-                "success",
-                f"Risk Evaluation Complete. Updated {updated_count} entitlements.",
-                details={"roles_updated": updated_count},
+
+def evaluate_risk(event, context):
+    logger.log("evaluate_risk", "start", "Starting snapshot policy risk evaluation")
+    with db.get_connection() as conn:
+        observations = repo.list_current_observations(conn)
+        if not observations:
+            return {"status": "blocked", "reason": "no_published_snapshot", "roles_updated": 0}
+        assessed = 0
+        for observation in observations:
+            observation_id, snapshot_id, grant_id, policy_id, policy_name, document_json = observation[:6]
+            try:
+                risk, reason, risk_evidence = assess_policy(
+                    policy_name, json.loads(document_json)
+                )
+            except (TypeError, ValueError, KeyError) as exc:
+                risk, reason = "HIGH", "policy analysis failed; manual review required"
+                risk_evidence = {"source": "analysis_error", "error_type": type(exc).__name__}
+            assessed_at = datetime.now(timezone.utc).isoformat()
+            repo.store_snapshot_risk(
+                conn, observation, risk, reason, risk_evidence,
+                evidence.POLICY_RULE_VERSION, assessed_at,
             )
-        except Exception as e:
-            logger.log(
-                "evaluate_risk", "warn", f"audit log write failed: {e}", level="WARN"
+            # Mutable role/risk rows remain compatibility projections. Reviews
+            # reference the append-only assessment for their grant observation.
+            repo.update_role_risk(conn, policy_id, risk)
+            repo.store_risk_assessment(
+                conn, policy_id, risk, reason, risk_evidence,
+                evidence.POLICY_RULE_VERSION, assessed_at,
             )
-        return {"status": "success", "roles_updated": updated_count}
+            assessed += 1
+        repo.insert_audit_log(
+            conn, str(uuid.uuid4()), datetime.now(timezone.utc),
+            "INFO", "evaluate_risk", "success",
+            f"Assessed {assessed} grant observations",
+            details={"grant_observations": assessed},
+        )
+    logger.log(
+        "evaluate_risk", "success", f"Assessed {assessed} grant observations",
+        details={"grant_observations": assessed},
+    )
+    return {"status": "success", "grant_observations_assessed": assessed,
+            "roles_updated": assessed}
 
 
 # --- LOCAL TESTING ---

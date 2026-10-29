@@ -191,12 +191,15 @@ def test_remediation_approval_renews_and_fencing_rejects_stale_worker(
         assert repo.record_remediation_approval(
             conn, "A1", "REV1", "approver", "2026-01-01T00:00:00+00:00", "RUN1"
         )
-        assert repo.is_remediation_approved(conn, "REV1", "RUN1")
+        # Legacy reviews retain approval history but lack the grant/snapshot
+        # binding required for live remediation.
+        assert not repo.is_remediation_approved(conn, "REV1", "RUN1")
         assert repo.record_remediation_approval(
             conn, "A2", "REV1", "approver", "2026-01-02T00:00:00+00:00", "RUN2"
         )
         assert not repo.is_remediation_approved(conn, "REV1", "RUN1")
-        assert repo.is_remediation_approved(conn, "REV1", "RUN2")
+        assert not repo.is_remediation_approved(conn, "REV1", "RUN2")
+        assert repo.get_remediation_approval(conn, "REV1")[2] == "RUN2"
         assert not repo.record_remediation_approval(
             conn, "A3", "REV1", "other-approver", "2026-01-02T00:00:00+00:00", "RUN2"
         )

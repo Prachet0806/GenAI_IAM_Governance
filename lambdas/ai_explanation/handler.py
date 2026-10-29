@@ -131,7 +131,7 @@ def _build_context(row):
         reason,
         evidence_json,
         rule_version,
-    ) = row
+    ) = row[:11]
     if status != "PENDING" or risk_level != "HIGH":
         return None
     policy = json.loads(policy_document) if policy_document else None

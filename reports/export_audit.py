@@ -53,9 +53,9 @@ def export_audit_report():
         # Integrity: counts by status (index 5 per fetch_reviews_for_export contract)
         status_counts = {}
         for row in rows:
-            if len(row) != 15:
+            if len(row) != 28:
                 raise RuntimeError(
-                    f"Unexpected export row width {len(row)}; expected 15."
+                    f"Unexpected export row width {len(row)}; expected 28."
                 )
             status = row[5]
             status_counts[status] = status_counts.get(status, 0) + 1
@@ -80,6 +80,19 @@ def export_audit_report():
                     "AI Model",
                     "AI Prompt Version",
                     "AI Generated At",
+                    "Snapshot ID",
+                    "Grant ID",
+                    "Observation ID",
+                    "Risk Assessment ID",
+                    "Grant Type",
+                    "Grant Source",
+                    "Policy Version",
+                    "Policy SHA256",
+                    "Risk Reason",
+                    "Risk Evidence",
+                    "Risk Rule Version",
+                    "Policy Document",
+                    "Evidence State",
                 ]
             )
             writer.writerows(rows)
@@ -102,6 +115,21 @@ def export_audit_report():
                 "ai_model": r[12],
                 "ai_prompt_version": r[13],
                 "ai_generated_at": r[14],
+                "snapshot_id": r[15],
+                "grant_id": r[16],
+                "observation_id": r[17],
+                "risk_assessment_id": r[18],
+                "grant_type": r[19],
+                "grant_source": r[20],
+                "policy_version": r[21],
+                "policy_sha256": r[22],
+                "risk_reason": r[23],
+                "risk_evidence": json.loads(r[24]) if r[24] else None,
+                "risk_rule_version": r[25],
+                "policy_document": json.loads(r[26]) if r[26] else None,
+                "evidence_state": r[27],
+                "review_scope": "GRANT_PATH" if r[16] else "LEGACY_UNKNOWN_PATH",
+                "principal_access_status": "not_evaluated" if r[16] else "unknown",
             }
             for r in rows
         ]
@@ -213,8 +241,6 @@ def export_audit_report():
             },
         )
         try:
-            import uuid
-
             with db.get_connection() as _audit_conn:
                 repo.insert_audit_log(
                     _audit_conn,

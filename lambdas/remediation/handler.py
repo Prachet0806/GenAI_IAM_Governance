@@ -84,44 +84,20 @@ def _is_policy_attached(iam, user_name: str, policy_arn: str) -> bool:
     )
 
 
-def _is_group_policy(iam, user_name: str, policy_arn: str) -> bool:
-    """Group-derived access is never remediated by detaching a user policy."""
-    groups = iam.get_paginator("list_groups_for_user")
-    for page in groups.paginate(UserName=user_name):
-        for group in page.get("Groups", []):
-            policies = iam.get_paginator("list_attached_group_policies")
-            if any(
-                p.get("PolicyArn") == policy_arn
-                for policy_page in policies.paginate(GroupName=group["GroupName"])
-                for p in policy_page.get("AttachedPolicies", [])
-            ):
-                return True
-    return False
-
-
-def _is_supported_fresh_discovery(run, expected_run_id: str | None = None) -> bool:
+def _eligible_direct_grant(conn, review_id: str):
+    binding = repo.review_evidence_binding(conn, review_id)
+    if not binding or binding["grant_type"] != "DIRECT_MANAGED":
+        return None
+    snapshot = repo.eligible_published_snapshot(
+        conn, binding["account_id"], binding["source_scope"], require_aws=True
+    )
     if (
-        not run
-        or run[2] != "COMPLETE"
-        or not str(run[3] or "").startswith(
-            "AWS:iam-users-direct-and-group-managed-and-inline-policies-v2"
-        )
-        or (expected_run_id is not None and run[0] != expected_run_id)
-        or not run[1]
+        not snapshot
+        or snapshot["snapshot_id"] != binding["snapshot_id"]
+        or not repo.is_current_grant_for_review(conn, review_id)
     ):
-        return False
-    try:
-        observed = run[1]
-        if not isinstance(observed, datetime):
-            observed = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
-        if observed.tzinfo is None:
-            observed = observed.replace(tzinfo=timezone.utc)
-        age_hours = (
-            datetime.now(timezone.utc) - observed.astimezone(timezone.utc)
-        ).total_seconds() / 3600
-        return -0.1 <= age_hours <= config.get_max_discovery_age_hours()
-    except (TypeError, ValueError, OverflowError):
-        return False
+        return None
+    return binding
 
 
 def remediate_access(event, context):
@@ -186,24 +162,6 @@ def remediate_access(event, context):
         )
 
     with db.get_connection() as conn:
-        discovery_run_id = None
-        if not dry_run and enabled:
-            latest = repo.latest_discovery_run(conn)
-            if not _is_supported_fresh_discovery(latest):
-                logger.log(
-                    "remediate_access",
-                    "error",
-                    "Live remediation blocked: no latest complete inventory scan",
-                    level="ERROR",
-                )
-                return {
-                    "status": "blocked",
-                    "reason": "inventory_not_complete",
-                    "remediated": 0,
-                    "skipped": 0,
-                    "dry_run": dry_run,
-                }
-            discovery_run_id = latest[0]
         revocations = repo.list_revocations(conn)
 
         if dry_run or not enabled:
@@ -255,8 +213,17 @@ def remediate_access(event, context):
                         entity_id=review_id,
                     )
                     skipped_count += 1
+                elif not (binding := _eligible_direct_grant(conn, review_id)):
+                    logger.log(
+                        "remediate_access",
+                        "skip",
+                        "Grant path has no current eligible source-specific AWS snapshot",
+                        entity_type="access_review",
+                        entity_id=review_id,
+                    )
+                    skipped_count += 1
                 elif not repo.is_remediation_approved(
-                    conn, review_id, discovery_run_id
+                    conn, review_id, binding["snapshot_id"]
                 ):
                     logger.log(
                         "remediate_access",
@@ -291,14 +258,10 @@ def remediate_access(event, context):
                     # cannot pass the same eligibility check concurrently.
                     conn.commit()
                     repo.lock_inventory_remediation(conn)
-                    current_discovery = repo.latest_discovery_run(conn)
                     if (
-                        not _is_supported_fresh_discovery(
-                            current_discovery, discovery_run_id
-                        )
-                        or not repo.is_current_entitlement(conn, review_id)
+                        not _eligible_direct_grant(conn, review_id)
                         or not repo.is_remediation_approved(
-                            conn, review_id, discovery_run_id
+                            conn, review_id, binding["snapshot_id"]
                         )
                     ):
                         repo.release_remediation_claim(
@@ -332,7 +295,11 @@ def remediate_access(event, context):
                         continue
                     if iam is None:
                         iam = _get_iam_client()
-                    if _is_group_policy(iam, user_name, role_arn):
+                    live_user = iam.get_user(UserName=user_name).get("User", {})
+                    if (
+                        live_user.get("UserId") != binding["principal_id"]
+                        or live_user.get("Arn") != binding["principal_arn"]
+                    ):
                         repo.release_remediation_claim(
                             conn, review_id, claim_token, fencing_token
                         )
@@ -340,7 +307,7 @@ def remediate_access(event, context):
                         logger.log(
                             "remediate_access",
                             "skip",
-                            "Policy is also inherited through an IAM group",
+                            "AWS principal identity no longer matches the reviewed grant path",
                             entity_type="access_review",
                             entity_id=review_id,
                         )
@@ -357,7 +324,7 @@ def remediate_access(event, context):
                         logger.log(
                             "remediate_access",
                             "success",
-                            "Revoked entitlement was already absent in AWS",
+                            "Reviewed direct grant path was already absent in AWS; other paths may remain",
                             entity_type="access_review",
                             entity_id=review_id,
                         )
@@ -367,7 +334,6 @@ def remediate_access(event, context):
                     # AWS reads, immediately before the destructive AWS call.
                     final_now = datetime.now(timezone.utc)
                     final_lease = final_now + timedelta(minutes=5)
-                    current_discovery = repo.latest_discovery_run(conn)
                     claim_owned = repo.renew_remediation_claim(
                         conn,
                         review_id,
@@ -378,12 +344,9 @@ def remediate_access(event, context):
                     )
                     if (
                         not claim_owned
-                        or not _is_supported_fresh_discovery(
-                            current_discovery, discovery_run_id
-                        )
-                        or not repo.is_current_entitlement(conn, review_id)
+                        or not _eligible_direct_grant(conn, review_id)
                         or not repo.is_remediation_approved(
-                            conn, review_id, discovery_run_id
+                            conn, review_id, binding["snapshot_id"]
                         )
                     ):
                         repo.release_remediation_claim(
@@ -400,10 +363,12 @@ def remediate_access(event, context):
                         skipped_count += 1
                         continue
                     iam.detach_user_policy(UserName=user_name, PolicyArn=role_arn)
+                    if _is_policy_attached(iam, user_name, role_arn):
+                        raise RuntimeError("Direct policy attachment remained after detach")
                     logger.log(
                         "remediate_access",
                         "success",
-                        "AWS policy detached.",
+                        "Reviewed direct grant path detached and verified; other paths may remain.",
                         entity_type="access_review",
                         entity_id=review_id,
                     )
@@ -453,8 +418,6 @@ def remediate_access(event, context):
             },
         )
         try:
-            import uuid
-
             repo.insert_audit_log(
                 conn,
                 str(uuid.uuid4()),

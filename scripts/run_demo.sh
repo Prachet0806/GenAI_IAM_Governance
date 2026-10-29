@@ -81,7 +81,12 @@ DB_URL="$DB_URL" python3 - <<'PY' || true
 from common.db import db
 with db.get_connection() as conn:
     cur = conn.cursor()
-    db.execute(cur, "SELECT g.source FROM access_reviews r JOIN roles rol ON r.role_id=rol.role_id LEFT JOIN ai_generations g ON g.review_id=r.review_id WHERE rol.risk_level='HIGH' AND r.status='PENDING'")
+    db.execute(cur, "SELECT g.source FROM access_reviews r "
+                    "JOIN roles rol ON r.role_id=rol.role_id "
+                    "LEFT JOIN grant_risk_assessments gra ON gra.assessment_id=r.risk_assessment_id "
+                    "LEFT JOIN ai_generations g ON g.review_id=r.review_id "
+                    "WHERE (CASE WHEN r.grant_id IS NULL THEN rol.risk_level "
+                    "ELSE gra.risk_level END)='HIGH' AND r.status='PENDING'")
     rows = [r[0] for r in cur.fetchall()]
 live = sum(1 for t in rows if t == "MODEL")
 fallback = sum(1 for t in rows if t == "FALLBACK")
@@ -122,8 +127,13 @@ DB_URL="$DB_URL" python3 - <<'PY' || true
 from common.db import db
 with db.get_connection() as conn:
     cur = conn.cursor()
-    db.execute(cur, "SELECT r.status, rol.risk_level, COUNT(*) FROM access_reviews r "
-                    "JOIN roles rol ON r.role_id=rol.role_id GROUP BY r.status, rol.risk_level ORDER BY 1, 2")
+    db.execute(cur, "SELECT r.status, "
+                    "CASE WHEN r.grant_id IS NULL THEN rol.risk_level ELSE gra.risk_level END, "
+                    "COUNT(*) FROM access_reviews r "
+                    "JOIN roles rol ON r.role_id=rol.role_id "
+                    "LEFT JOIN grant_risk_assessments gra ON gra.assessment_id=r.risk_assessment_id "
+                    "GROUP BY r.status, CASE WHEN r.grant_id IS NULL THEN rol.risk_level "
+                    "ELSE gra.risk_level END ORDER BY 1, 2")
     for status, risk, n in cur.fetchall():
         print(f"      {status:8s} {risk:6s} {n}")
     db.execute(cur, "SELECT COUNT(*) FROM audit_logs")

@@ -5,9 +5,11 @@ A Python prototype for IAM inventory, entitlement risk assessment, access review
 ## Current capabilities
 
 - Discovers IAM users, their direct managed and inline policies, and the managed/inline policies inherited through IAM groups. Managed policy default versions are recorded. It does not yet discover IAM roles, Identity Center, permission boundaries, SCPs, or resource policies.
-- Records discovery runs. Only a complete scan replaces current user-policy links; failed/incomplete scans retain the previous links.
-- Evaluates discovered policy documents with a conservative rule set, records evidence and rule version, and escalates missing/invalid or unsupported evidence to HIGH for manual review. This is not a full AWS effective-permissions evaluator.
-- Creates review campaigns with race-safe pending-review insertion.
+- Records attempts by AWS account and declared source scope. A complete scan atomically publishes immutable grant-path observations and advances that source's published snapshot; a failed or superseded attempt retains the prior publication for audit but blocks new campaigns and live remediation for that source.
+- Keeps direct, user-inline, and each group-derived path distinct. Grant identity uses account, principal, grant type, source ID, and attachment ID; policy version, document hash, and observation time belong to the snapshot.
+- Evaluates frozen policy documents with a conservative rule set, stores append-only policy risk and separate grant-path assessments, and escalates unsupported evidence to HIGH. These assessments do not establish a principal's effective permissions.
+- Creates campaigns only against a fresh complete published snapshot with assessments for every observed path. Each review is pinned to its snapshot, grant observation, and risk assessment. Older records are labelled `legacy_unknown_path`.
+- When multiple accounts have published snapshots, campaign generation requires an explicit `account_id` in its event so one account's evidence cannot be selected implicitly.
 - Offers a local prototype reviewer CLI restricted to mock data for decisions, plus an OIDC-protected review API with campaign assignments.
 - Keeps remediation in dry-run mode by default. Live detachment additionally requires `ENABLE_REMEDIATION=true`, `ALLOW_LIVE_REMEDIATION=true`, `DRY_RUN=false`, and a non-empty exact-match allowlist. The current worker only detaches direct managed user policies; group-derived and inline policies are skipped.
 - Exports unique CSV/JSON artifacts and a manifest with SHA-256 hashes. S3 uploads use a per-export run path and surface upload errors.
@@ -63,12 +65,12 @@ Run the API behind a TLS-terminating gateway with restricted network access:
 uvicorn api.review_service:app --host 127.0.0.1 --port 8080
 ```
 
-Campaign administrators assign reviewers using `POST /campaigns/{campaign_id}/reviewers`; assigned reviewers can read and decide reviews in that campaign. A different authenticated principal in the remediation approver group must approve a revoked review through `POST /reviews/{review_id}/remediation-approval` before any non-production live detach. The approval is bound to the latest complete discovery run and must be renewed after a new snapshot. The API validates signed OIDC access tokens and requires exact group membership. Configure token claims and TLS at the identity provider and gateway.
+Campaign administrators assign reviewers using `POST /campaigns/{campaign_id}/reviewers`; assigned reviewers can read and decide reviews in that campaign. The API exposes the frozen path and policy evidence and reports principal access as `not_evaluated`. A different authenticated principal in the remediation approver group must approve a revoked, snapshot-pinned direct managed path through `POST /reviews/{review_id}/remediation-approval` before any non-production live detach. Approval is bound to that review's snapshot. A newer scan requires a new pinned review and approval; a failed newer scan blocks live action while retaining the prior snapshot for audit. The API validates signed OIDC access tokens and requires exact group membership.
 
 ## Configuration
 
 - `DB_URL`: SQLite path or Postgres URL.
-- `AWS_REGION`, `AWS_PROFILE`: AWS account discovery settings. IAM discovery also needs group membership, group policy, and inline policy read permissions (`iam:ListGroupsForUser`, `iam:ListAttachedGroupPolicies`, `iam:ListGroupPolicies`, `iam:GetGroupPolicy`, `iam:ListUserPolicies`, `iam:GetUserPolicy`).
+- `AWS_REGION`, `AWS_PROFILE`: AWS account discovery settings. Discovery resolves the account with STS and needs group membership, group policy, and inline policy read permissions (`iam:ListGroupsForUser`, `iam:ListAttachedGroupPolicies`, `iam:ListGroupPolicies`, `iam:GetGroupPolicy`, `iam:ListUserPolicies`, `iam:GetUserPolicy`). Live direct-path preflight also reads the current user identity.
 - `MOCK_IAM`: use the seeded data instead of AWS.
 - `ENABLE_GENAI`, `GOOGLE_API_KEY`, `GENAI_MODEL`: optional explanation provider controls.
 - `DRY_RUN`, `ENABLE_REMEDIATION`, `ALLOW_LIVE_REMEDIATION`, `REMEDIATION_ALLOWLIST`, `REMEDIATION_DENYLIST`: remediation gates. Mandatory administrator and break-glass deny patterns cannot be removed by configuration.
@@ -83,11 +85,12 @@ Copy `.env.example` for local configuration. Do not commit credentials.
 
 Ordered migrations are in `sql/migrations/`. Each numbered portable SQL file may have a matching `.sqlite.sql` or `.postgres.sql` file. Run `python scripts/migrate.py` before starting workers or the review API. The runner applies pending migrations transactionally, records a SHA-256 checksum in `schema_migrations`, and rejects edited or missing applied migrations. Migration 0001 also upgrades older databases that predate its compatibility columns. Add new numbered files for future schema changes; do not edit an applied migration. Export artifacts are written under `reports/` using date plus unique run ID, with a `.manifest.json` file. Set `LOCAL_ONLY=true` to skip S3.
 
-GitHub Actions runs the SQLite suite and a separate Postgres 17 service job for fresh and legacy migrations and concurrent remediation claims in [.github/workflows/ci.yml](.github/workflows/ci.yml). AWS, S3, and AI provider integrations are not part of these CI jobs.
+GitHub Actions runs the SQLite suite and a separate Postgres 17 service job for fresh and upgrade migrations, source publication, and concurrent remediation claims in [.github/workflows/ci.yml](.github/workflows/ci.yml). AWS, S3, and AI provider integrations are not part of these CI jobs.
 
 ## Known boundaries
 
-- Name heuristics remain as a fallback signal when policy evidence is unavailable; incomplete IAM surface coverage prevents full effective-access conclusions. Group membership changes and policy reads are currently reconciled only for discovered users; stale user/group/policy entities may remain in the descriptive tables after a complete scan.
+- A revoked path is a decision about that path; other grants can still give the principal similar access. The system does not compute aggregate effective access. Descriptive user/policy tables can retain stale entities even though the published grant view is source-scoped.
+- Historical reviews created before snapshot pinning retain unknown path and policy-version provenance; the current mutable policy must not be treated as their historical evidence.
 - The reviewer CLI is not an authentication system.
 - Deployment infrastructure, event sources, secret-manager integration, provider retention approval, and production alerting are not defined here.
-- Local execution does not establish AWS, Postgres, S3, or provider readiness.
+- Local tests and the Postgres service test do not establish AWS, S3, AI-provider, or production deployment readiness.

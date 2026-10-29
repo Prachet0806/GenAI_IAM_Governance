@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import config, logger, repo
+from common import config, evidence, logger, repo
 from common.db import db
 
 
@@ -201,7 +201,9 @@ def _inline_policy(iam_client, operation: str, getter: str, principal: str):
             {
                 "PolicyArn": f"inline:{principal.lower()}:{getter}:{name}",
                 "PolicyName": f"{getter}:{name}",
+                "InlineName": name,
                 "Document": document,
+                "ObservedAt": datetime.now(timezone.utc).isoformat(),
             }
         )
     return items
@@ -210,25 +212,44 @@ def _inline_policy(iam_client, operation: str, getter: str, principal: str):
 def _user_entitlements(iam_client, user):
     """Return direct policies plus policies inherited through IAM groups."""
     user_name = user["UserName"]
+    user_id = user["UserId"]
     policies = []
     for policy in _list_all_attached_policies(iam_client, user_name):
-        policy["Document"] = _get_policy_document(iam_client, policy["PolicyArn"])
-        policies.append(policy)
-    policies.extend(
-        _inline_policy(iam_client, "list_user_policies", "UserName", user_name)
-    )
+        document, version = _get_policy_document(iam_client, policy["PolicyArn"])
+        policies.append({
+            **policy, "Document": document, "PolicyVersion": version,
+            "GrantType": "DIRECT_MANAGED", "SourceId": user_id,
+            "SourceName": user_name, "AttachmentId": policy["PolicyArn"],
+            "ObservedAt": datetime.now(timezone.utc).isoformat(),
+        })
+    for policy in _inline_policy(iam_client, "list_user_policies", "UserName", user_name):
+        policies.append({
+            **policy, "GrantType": "DIRECT_INLINE", "SourceId": user_id,
+            "SourceName": user_name, "AttachmentId": policy["InlineName"],
+        })
     for group in _list_all(
         iam_client, "list_groups_for_user", "Groups", UserName=user_name
     ):
         group_name = group["GroupName"]
+        group_id = group["GroupId"]
         for policy in _list_all_attached_policies(iam_client, group_name, "group"):
-            policy["Document"] = _get_policy_document(iam_client, policy["PolicyArn"])
-            policies.append(policy)
-        policies.extend(
-            _inline_policy(iam_client, "list_group_policies", "GroupName", group_name)
-        )
-    # Deduplicate the same group policy inherited through multiple enumeration paths.
-    unique = {p["PolicyArn"]: p for p in policies}
+            document, version = _get_policy_document(iam_client, policy["PolicyArn"])
+            policies.append({
+                **policy, "Document": document, "PolicyVersion": version,
+                "GrantType": "GROUP_MANAGED", "SourceId": group_id,
+                "SourceName": group_name, "AttachmentId": policy["PolicyArn"],
+                "ObservedAt": datetime.now(timezone.utc).isoformat(),
+            })
+        for policy in _inline_policy(
+            iam_client, "list_group_policies", "GroupName", group_name
+        ):
+            policies.append({
+                **policy, "GrantType": "GROUP_INLINE", "SourceId": group_id,
+                "SourceName": group_name, "AttachmentId": policy["InlineName"],
+            })
+    unique = {
+        (p["GrantType"], p["SourceId"], p["AttachmentId"]): p for p in policies
+    }
     return list(unique.values())
 
 
@@ -247,7 +268,24 @@ def _get_policy_document(iam_client, policy_arn: str):
         document = json.loads(unquote(document))
     if not isinstance(document, dict):
         raise RuntimeError("Managed policy document is missing or invalid")
-    return document
+    return document, version_id
+
+
+def _source_account_id() -> str:
+    if _is_mock():
+        return evidence.account_from_arn(_mock_identities()[0]["Arn"])
+    from botocore.config import Config as BotoConfig
+
+    profile = config.get_aws_profile()
+    session = boto3.Session(profile_name=profile, region_name=config.get_aws_region())
+    sts = session.client(
+        "sts",
+        config=BotoConfig(connect_timeout=5, read_timeout=10, retries={"max_attempts": 3}),
+    )
+    account_id = sts.get_caller_identity()["Account"]
+    if not str(account_id).isdigit() or len(str(account_id)) != 12:
+        raise RuntimeError("STS did not return a valid AWS account ID")
+    return str(account_id)
 
 
 def _iter_identities():
@@ -268,15 +306,16 @@ def discover_identities(event, context):
     run_id = str(uuid.uuid4())
     started = datetime.now(timezone.utc).isoformat()
     mode = "MOCK" if _is_mock() else "AWS"
-    scope = "iam-users-direct-and-group-managed-and-inline-policies-v2"
+    scope = evidence.IAM_USER_POLICY_SCOPE
+    account_id = _source_account_id()
     with db.get_connection() as conn:
         # Register the RUNNING snapshot under the shared lock. If remediation is
         # already in its final AWS section, discovery waits until it commits.
         repo.lock_inventory_remediation(conn)
-        repo.start_discovery_run(conn, run_id, started, f"{mode}:{scope}")
+        repo.start_discovery_attempt(conn, run_id, started, mode, account_id, scope)
     user_count, errors = 0, 0
-    pairs = set()
     discovered_users = []
+    observations = []
     try:
         # Do network pagination and policy retrieval without holding a database
         # transaction or the global inventory/remediation mutex.
@@ -287,9 +326,11 @@ def discover_identities(event, context):
                 u_arn = user["Arn"]
                 created_at = user["CreateDate"].isoformat()
                 policies = list(user.get("Policies", []))
-                discovered_users.append((u_id, u_name, u_arn, created_at, policies))
+                discovered_users.append(user)
                 for policy in policies:
-                    pairs.add((u_id, policy["PolicyArn"]))
+                    observations.append(
+                        evidence.grant_observation(account_id, user, policy, run_id)
+                    )
                 user_count += 1
             except Exception as e:
                 errors += 1
@@ -311,59 +352,21 @@ def discover_identities(event, context):
         with db.get_connection() as conn:
             # Serialize only the database publication phase against remediation.
             repo.lock_inventory_remediation(conn)
-            latest = repo.latest_discovery_run(conn)
-            if not latest or latest[0] != run_id:
-                # Multiple discovery invocations may scan concurrently. Do not
-                # let an older scan that finishes late overwrite a newer run.
-                status = "INCOMPLETE"
-                repo.finish_discovery_run(
-                    conn,
-                    run_id,
-                    datetime.now(timezone.utc).isoformat(),
-                    status,
-                    user_count,
-                    errors,
-                    {
-                        "scope_version": scope,
-                        "snapshot_published": False,
-                        "superseded_by": latest[0] if latest else None,
-                    },
-                )
-            else:
-                for u_id, u_name, u_arn, created_at, policies in discovered_users:
-                    repo.insert_user(conn, u_id, u_name, u_arn, created_at)
-                    for policy in policies:
-                        p_arn, p_name = policy["PolicyArn"], policy["PolicyName"]
-                        repo.insert_role(conn, p_arn, p_name, "LOW")
-                        repo.update_role_policy(
-                            conn,
-                            p_arn,
-                            policy.get("Document"),
-                            datetime.now(timezone.utc).isoformat(),
-                        )
-                        repo.link_user_role(conn, u_id, p_arn)
-                repo.reconcile_user_roles(conn, pairs)
-                status = "COMPLETE"
-                repo.finish_discovery_run(
-                    conn,
-                    run_id,
-                    datetime.now(timezone.utc).isoformat(),
-                    status,
-                    user_count,
-                    errors,
-                    {
-                        "scope_version": scope,
-                        "complete_for_declared_scope": True,
-                        "coverage": [
-                            "iam_users",
-                            "user_attached_managed_policies",
-                            "user_inline_policies",
-                            "group_membership",
-                            "group_attached_managed_policies",
-                            "group_inline_policies",
-                        ],
-                    },
-                )
+            coverage = {
+                "scope_version": scope,
+                "complete_for_declared_scope": True,
+                "coverage": [
+                    "iam_users", "user_attached_managed_policies",
+                    "user_inline_policies", "group_membership",
+                    "group_attached_managed_policies", "group_inline_policies",
+                ],
+            }
+            published = repo.publish_discovery_snapshot(
+                conn, run_id, account_id, scope,
+                datetime.now(timezone.utc).isoformat(),
+                discovered_users, observations, coverage,
+            )
+            status = "COMPLETE" if published else "INCOMPLETE"
     except Exception as e:
         with db.get_connection() as conn:
             repo.finish_discovery_run(
@@ -373,7 +376,7 @@ def discover_identities(event, context):
                 "FAILED",
                 user_count,
                 errors + 1,
-                {"error_type": type(e).__name__},
+                {"error_type": type(e).__name__, "account_id": account_id, "source_scope": scope},
             )
         logger.log(
             "discover_identities",
@@ -388,7 +391,8 @@ def discover_identities(event, context):
         "discover_identities",
         "success" if errors == 0 else "warn",
         f"Discovery {status.lower()} ({mode})",
-        details={"run_id": run_id, "users_processed": user_count, "errors": errors},
+        details={"run_id": run_id, "account_id": account_id, "source_scope": scope,
+                 "users_processed": user_count, "errors": errors},
     )
     try:
         with db.get_connection() as conn:

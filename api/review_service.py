@@ -93,6 +93,17 @@ def get_review(review_id: str, claims: dict = Depends(current_reviewer)):
             "risk_reason": row[8],
             "risk_evidence": json.loads(row[9]) if row[9] else None,
             "risk_rule_version": row[10],
+            "snapshot_id": row[11],
+            "grant_id": row[12],
+            "observation_id": row[13],
+            "risk_assessment_id": row[14],
+            "grant_type": row[15],
+            "grant_source": row[16],
+            "policy_version": row[17],
+            "policy_sha256": row[18],
+            "evidence_state": row[19],
+            "review_scope": "GRANT_PATH" if row[12] else "LEGACY_UNKNOWN_PATH",
+            "principal_access_status": "not_evaluated",
         }
 
 
@@ -137,6 +148,10 @@ def decide_review(
             raise HTTPException(
                 status_code=409, detail="Review decision raced with another update"
             )
+        repo.record_review_decision_event(
+            conn, str(uuid.uuid4()), review_id, request.decision,
+            claims["sub"], request.comment.strip(), now.isoformat(),
+        )
         repo.insert_audit_log(
             conn,
             str(uuid.uuid4()),
@@ -227,17 +242,24 @@ def approve_remediation(
                 status_code=403,
                 detail="The reviewer cannot approve their own remediation",
             )
-        discovery = repo.latest_discovery_run(conn)
-        if (
-            not discovery
-            or discovery[2] != "COMPLETE"
-            or not str(discovery[3] or "").startswith(
-                "AWS:iam-users-direct-and-group-managed-and-inline-policies-v2"
+        repo.lock_inventory_remediation(conn)
+        binding = repo.review_evidence_binding(conn, review_id)
+        if not binding or binding["grant_type"] != "DIRECT_MANAGED":
+            raise HTTPException(
+                status_code=409,
+                detail="Only snapshot-pinned direct managed grant paths support live remediation",
             )
+        snapshot = repo.eligible_published_snapshot(
+            conn, binding["account_id"], binding["source_scope"], require_aws=True
+        )
+        if (
+            not snapshot
+            or snapshot["snapshot_id"] != binding["snapshot_id"]
+            or not repo.is_current_grant_for_review(conn, review_id)
         ):
             raise HTTPException(
                 status_code=409,
-                detail="A complete supported AWS discovery run is required",
+                detail="Review grant path requires a current eligible AWS snapshot",
             )
         previous = repo.get_remediation_approval(conn, review_id)
         now = datetime.now(timezone.utc)
@@ -247,7 +269,7 @@ def approve_remediation(
             review_id,
             claims["sub"],
             now.isoformat(),
-            discovery[0],
+            binding["snapshot_id"],
         )
         if not created:
             raise HTTPException(
@@ -270,8 +292,11 @@ def approve_remediation(
             details={
                 "approver_sub": claims["sub"],
                 "reviewer_sub": review[5],
-                "discovery_run_id": discovery[0],
+                "snapshot_id": binding["snapshot_id"],
+                "grant_id": binding["grant_id"],
                 "renewed": renewed,
             },
         )
-    return {"review_id": review_id, "status": status, "discovery_run_id": discovery[0]}
+    return {"review_id": review_id, "status": status,
+            "snapshot_id": binding["snapshot_id"],
+            "discovery_run_id": binding["snapshot_id"]}

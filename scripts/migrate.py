@@ -113,6 +113,13 @@ def _split_statements(sql_blob: str):
             continue
         if ch == ";" and not in_single and not in_double and not in_dollar:
             stmt = "".join(buf).strip()
+            # SQLite triggers contain a semicolon inside BEGIN ... END.
+            if re.match(r"(?is)^CREATE\s+TRIGGER\b", stmt) and not re.search(
+                r"(?is)\bEND\s*$", stmt
+            ):
+                buf.append(";")
+                i += 1
+                continue
             if stmt:
                 stmts.append(stmt)
             buf = []

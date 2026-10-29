@@ -40,7 +40,7 @@ def test_sqlite_fresh_install_and_rerun(tmp_path, monkeypatch):
     migrate.apply_sqlite()
     migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM governance_mutex").fetchone()[0] == 1
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -64,7 +64,25 @@ def test_sqlite_legacy_upgrade_preserves_data(tmp_path, monkeypatch):
             assert column in {
                 row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')
             }
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 3
+
+
+def test_sqlite_upgrade_from_committed_pr1_ledger(tmp_path, monkeypatch):
+    source = migrate.MIGRATIONS_DIR
+    pr1_files = tmp_path / "pr1-migrations"
+    pr1_files.mkdir()
+    shutil.copy(source / "0001_baseline.sql", pr1_files)
+    path = tmp_path / "pr1.db"
+    _set_sqlite(monkeypatch, path)
+    monkeypatch.setattr(migrate, "MIGRATIONS_DIR", pr1_files)
+    migrate.apply_sqlite()
+    with sqlite3.connect(path) as conn:
+        conn.execute("INSERT INTO roles(role_id,role_name) VALUES ('R1','Reader')")
+    monkeypatch.setattr(migrate, "MIGRATIONS_DIR", source)
+    migrate.apply_sqlite()
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (3,)
+        assert conn.execute("SELECT role_name FROM roles WHERE role_id='R1'").fetchone() == ("Reader",)
 
 
 def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeypatch):
@@ -73,7 +91,7 @@ def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeyp
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", files)
     path = tmp_path / "rollback.db"
     _set_sqlite(monkeypatch, path)
-    (files / "0002_bad.sql").write_text(
+    (files / "0004_bad.sql").write_text(
         "CREATE TABLE should_rollback (id INTEGER); INSERT INTO absent VALUES (1);",
         encoding="utf-8",
     )
@@ -81,7 +99,7 @@ def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeyp
         migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
-    (files / "0002_bad.sql").unlink()
+    (files / "0004_bad.sql").unlink()
     migrate.apply_sqlite()
     baseline = files / "0001_baseline.sql"
     baseline.write_text(
@@ -126,7 +144,11 @@ def test_postgres_fresh_install_and_concurrent_migration(postgres_schema):
     assert results == [None, None]
     with psycopg2.connect(postgres_schema) as conn, conn.cursor() as cur:
         cur.execute("SELECT version, length(checksum) FROM schema_migrations")
-        assert cur.fetchall() == [("0001_baseline", 64)]
+        assert cur.fetchall() == [
+            ("0001_baseline", 64),
+            ("0002_grant_evidence", 64),
+            ("0003_pinned_reviews", 64),
+        ]
         cur.execute("SELECT COUNT(*) FROM governance_mutex")
         assert cur.fetchone() == (1,)
 
@@ -163,3 +185,62 @@ def test_postgres_legacy_upgrade_and_claim_contention(postgres_schema):
         results = list(pool.map(claim, ("worker-1", "worker-2")))
     assert results.count(1) == 1
     assert results.count(None) == 1
+
+
+def test_postgres_upgrade_from_committed_pr1_ledger(postgres_schema, tmp_path, monkeypatch):
+    import psycopg2
+
+    source = migrate.MIGRATIONS_DIR
+    pr1_files = tmp_path / "pr1-migrations"
+    pr1_files.mkdir()
+    shutil.copy(source / "0001_baseline.sql", pr1_files)
+    shutil.copy(source / "0001_baseline.postgres.sql", pr1_files)
+    monkeypatch.setattr(migrate, "MIGRATIONS_DIR", pr1_files)
+    migrate.apply_postgres()
+    with psycopg2.connect(postgres_schema) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO roles(role_id,role_name) VALUES ('R1','Reader')")
+    monkeypatch.setattr(migrate, "MIGRATIONS_DIR", source)
+    migrate.apply_postgres()
+    with psycopg2.connect(postgres_schema) as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM schema_migrations")
+        assert cur.fetchone() == (3,)
+        cur.execute("SELECT role_name FROM roles WHERE role_id='R1'")
+        assert cur.fetchone() == ("Reader",)
+
+
+def test_postgres_source_publication_and_pinned_reviews(postgres_schema):
+    import psycopg2
+
+    from common import evidence, repo
+    from common.db import db
+    from lambdas.generate_reviews.handler import generate_campaign
+    from lambdas.risk_evaluation.handler import evaluate_risk
+    from tests.test_evidence_workflow import ACCOUNT_A, _attempt, _publish
+
+    migrate.apply_postgres()
+    snapshot_id, observations = _publish()
+    assert len({item["grant_id"] for item in observations}) == 3
+    assert evaluate_risk(None, None)["grant_observations_assessed"] == 3
+    campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
+    assert campaign["reviews_created"] == 3
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(DISTINCT grant_id) FROM access_reviews WHERE snapshot_id=%s",
+            (snapshot_id,),
+        )
+        assert cur.fetchone() == (3,)
+    _attempt(ACCOUNT_A, "FAILED")
+    with db.get_connection() as conn:
+        assert repo.published_snapshot(
+            conn, ACCOUNT_A, evidence.IAM_USER_POLICY_SCOPE
+        )[0] == snapshot_id
+        assert repo.eligible_published_snapshot(
+            conn, ACCOUNT_A, evidence.IAM_USER_POLICY_SCOPE
+        ) is None
+    with pytest.raises(psycopg2.errors.RaiseException):
+        with psycopg2.connect(postgres_schema) as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE grant_observations SET policy_document='{}' WHERE observation_id=%s",
+                (observations[0]["observation_id"],),
+            )
