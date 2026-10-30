@@ -77,12 +77,13 @@ def health():
 def get_review(review_id: str, claims: dict = Depends(current_reviewer)):
     require_reviewer_group(claims)
     with db.get_connection() as conn:
+        review = repo.fetch_review_for_decision(conn, review_id)
+        if not review:
+            raise HTTPException(status_code=404, detail="Review not found")
+        require_campaign_assignment(conn, review[1], claims["sub"])
         row = repo.fetch_review_ai_context(conn, review_id)
         if not row:
             raise HTTPException(status_code=404, detail="Review not found")
-        require_campaign_assignment(
-            conn, _review_campaign_id(conn, review_id), claims["sub"]
-        )
         return {
             "review_id": row[0],
             "status": row[1],
@@ -104,14 +105,8 @@ def get_review(review_id: str, claims: dict = Depends(current_reviewer)):
             "evidence_state": row[19],
             "review_scope": "GRANT_PATH" if row[12] else "LEGACY_UNKNOWN_PATH",
             "principal_access_status": "not_evaluated",
+            "ai_explanation": repo.fetch_legacy_ai_explanation(conn, review_id),
         }
-
-
-def _review_campaign_id(conn, review_id: str) -> str:
-    review = repo.fetch_review_for_decision(conn, review_id)
-    if not review:
-        raise HTTPException(status_code=404, detail="Review not found")
-    return review[1]
 
 
 @app.post("/reviews/{review_id}/decision")

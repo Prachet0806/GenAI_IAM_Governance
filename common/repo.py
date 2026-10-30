@@ -1,4 +1,5 @@
 # common/repo.py
+import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -821,6 +822,82 @@ def fetch_review_ai_context(conn, review_id: str):
         (review_id,),
     )
     return cur.fetchone()
+
+
+def fetch_legacy_ai_explanation(conn, review_id: str) -> dict:
+    """Expose the stored summary with honest, non-authoritative provenance.
+
+    PR 7 will replace this compatibility projection with validated artifacts.
+    """
+    cur = conn.cursor()
+    db.execute(
+        cur,
+        "SELECT ai_risk_summary FROM access_reviews WHERE review_id=?",
+        (review_id,),
+    )
+    row = cur.fetchone()
+    summary = row[0] if row else None
+    result = {
+        "status": "missing" if not summary else "available",
+        "authority": "legacy_compatibility",
+        "summary": summary or None,
+        "provenance_state": "missing" if not summary else "column_only",
+        "generation_id": None,
+        "source": None,
+        "model": None,
+        "prompt_version": None,
+        "generated_at": None,
+        "validated_artifact": False,
+    }
+    if not summary:
+        return result
+
+    db.execute(
+        cur,
+        """SELECT generation_id,source,status,model,prompt_version,
+                  output_sha256,created_at
+        FROM ai_generations
+        WHERE review_id=? AND summary=?
+        ORDER BY created_at DESC,generation_id DESC LIMIT 1""",
+        (review_id, summary),
+    )
+    generation = cur.fetchone()
+    if not generation:
+        db.execute(
+            cur,
+            "SELECT 1 FROM ai_generations WHERE review_id=? LIMIT 1",
+            (review_id,),
+        )
+        if cur.fetchone():
+            result["provenance_state"] = "no_matching_generation"
+        return result
+
+    generation_id, source, status, model, prompt_version, output_hash, created_at = (
+        generation
+    )
+    result.update(
+        generation_id=generation_id,
+        source=source,
+        model=model,
+        prompt_version=prompt_version,
+        generated_at=str(created_at),
+    )
+    actual_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()
+    if status != "SUCCESS" or output_hash != actual_hash:
+        result["provenance_state"] = "generation_unverified"
+        return result
+    db.execute(
+        cur,
+        """SELECT 1 FROM ai_generations
+        WHERE review_id=? AND
+          (created_at>? OR (created_at=? AND generation_id>?))
+        LIMIT 1""",
+        (review_id, created_at, created_at, generation_id),
+    )
+    result["provenance_state"] = (
+        "older_matching_generation" if cur.fetchone() else "matched_generation"
+    )
+    return result
 
 
 def record_ai_generation(

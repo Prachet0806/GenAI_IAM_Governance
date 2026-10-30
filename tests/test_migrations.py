@@ -244,3 +244,33 @@ def test_postgres_source_publication_and_pinned_reviews(postgres_schema):
                 "UPDATE grant_observations SET policy_document='{}' WHERE observation_id=%s",
                 (observations[0]["observation_id"],),
             )
+
+
+def test_postgres_legacy_ai_explanation_projection(postgres_schema):
+    """Exercise the compatibility lookup and timestamp ordering on Postgres."""
+    import hashlib
+
+    from common import repo
+    from common.db import db
+
+    migrate.apply_postgres()
+    with db.get_connection() as conn:
+        repo.insert_user(conn, "U1", "alice", "arn:aws:iam::123:user/alice", "2026-01-01T00:00:00+00:00")
+        repo.insert_role(conn, "R1", "Reader", "LOW")
+        repo.create_campaign(conn, "C1", "test", "2026-01-01T00:00:00+00:00")
+        repo.create_review(conn, "REV1", "C1", "U1", "R1", "2026-01-01T00:00:00+00:00")
+        db.execute(conn.cursor(), "UPDATE access_reviews SET ai_risk_summary=? WHERE review_id=?", ("First", "REV1"))
+        for generation_id, summary, when in (
+            ("GEN1", "First", "2026-01-02T00:00:00+00:00"),
+            ("GEN2", "Second", "2026-01-03T00:00:00+00:00"),
+        ):
+            repo.record_ai_generation(
+                conn, generation_id, "REV1", "MODEL", "SUCCESS", "model", "v1",
+                "input-hash", hashlib.sha256(summary.encode("utf-8")).hexdigest(),
+                summary, when,
+            )
+    with db.get_connection() as conn:
+        explanation = repo.fetch_legacy_ai_explanation(conn, "REV1")
+    assert explanation["summary"] == "First"
+    assert explanation["generation_id"] == "GEN1"
+    assert explanation["provenance_state"] == "older_matching_generation"

@@ -19,6 +19,8 @@ A Python prototype for IAM inventory, entitlement risk assessment, access review
 
 GenAI is advisory and disabled by default. For eligible pending HIGH-risk reviews, the handler loads trusted database context, pseudonymizes the user identifier, sends policy/risk evidence to the configured provider, validates structured output, and records an append-only generation. It does not approve, revoke, or execute access changes. A deterministic fallback is recorded with `source=FALLBACK` when a provider call fails.
 
+The assigned reviewer's `GET /reviews/{review_id}` response includes an `ai_explanation` compatibility view of the existing `ai_risk_summary` column. It labels missing summaries and whether a stored generation matches the displayed text. `authority=legacy_compatibility` and `validated_artifact=false` mean this view is not yet the validated artifact projection; the reviewer API, exports, and CLI will move together to that projection in the later AI artifact migration.
+
 Enable it only after reviewing provider and data-handling requirements:
 
 ```bash
