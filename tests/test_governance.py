@@ -113,8 +113,10 @@ def test_export_query_order_matches_header():
     from common import repo
 
     src = inspect.getsource(repo.fetch_reviews_for_export)
-    # ai_risk_summary must come before created_at to match CSV header order
-    assert src.index("ai_risk_summary") < src.index("r.created_at")
+    # The export keeps the AI slot in order and fills it from the artifact projection.
+    assert src.index("NULL AS ai_summary") < src.index("r.created_at")
+    assert "r.ai_risk_summary" not in src
+    assert "ai_artifacts.projection" in src
 
 
 def test_migrate_splitter_handles_semicolon_in_string():

@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import config, repo
+from common import ai_artifacts, config, repo
 from common.db import db
 
 try:
@@ -41,12 +41,14 @@ def _console() -> "Console":
     return _C(file=sys.stdout, width=200)
 
 
-def _ai_marker(ai_summary, source=None) -> str:
-    if not ai_summary or not source:
+def _ai_marker(ai_summary, source=None, authority=None) -> str:
+    if not ai_summary:
         return "-"
+    if authority != "validated_artifact":
+        return "legacy"
     if source == "FALLBACK":
-        return "· fallback"
-    return "✦ live"
+        return "· validated fallback"
+    return "✦ validated model"
 
 
 def cmd_list(args) -> int:
@@ -77,7 +79,7 @@ def cmd_list(args) -> int:
             role,
             f"[{style}]{risk}[/{style}]",
             status,
-            _ai_marker(ai, source),
+            _ai_marker(ai, source, r[31]),
             (comment or "")[:60],
         )
     _console().print(table)
@@ -109,7 +111,9 @@ def cmd_decide(args) -> int:
         cur = conn.cursor()
         db.execute(
             cur,
-            "SELECT status FROM access_reviews WHERE review_id = ?",
+            """SELECT r.status,c.state,r.exception_state
+               FROM access_reviews r JOIN campaigns c ON c.campaign_id=r.campaign_id
+               WHERE r.review_id = ?""",
             (args.review_id,),
         )
         row = cur.fetchone()
@@ -121,19 +125,29 @@ def cmd_decide(args) -> int:
                 f"[red]already decided ({row[0]}); refusing double-decide[/red]"
             )
             return 1
+        if row[1] != "OPEN" or row[2] == "OPEN":
+            _console().print("[red]campaign paused/closed or review exception open[/red]")
+            return 1
+        if not repo.is_mock_review(conn, args.review_id):
+            _console().print("[red]CLI decisions require a pinned MOCK snapshot[/red]")
+            return 2
         now = datetime.now(timezone.utc).isoformat()
         db.execute(
             cur,
-            """UPDATE access_reviews SET status = ?, reviewer_comment = ?, reviewed_at = ?
-               WHERE review_id = ? AND status = 'PENDING'""",
-            (decision, args.comment or "", now, args.review_id),
+            """UPDATE access_reviews SET status = ?, reviewer_comment = ?,
+                   reviewed_at = ?,reviewer_sub=?
+               WHERE review_id = ? AND status = 'PENDING' AND exception_state<>'OPEN'""",
+            (decision, args.comment or "", now, reviewer, args.review_id),
         )
         if cur.rowcount == 0:
             _console().print("[red]update raced or already decided[/red]")
             return 1
+        ai = ai_artifacts.projection(conn, args.review_id)
         repo.record_review_decision_event(
             conn, str(uuid.uuid4()), args.review_id, decision,
             reviewer, args.comment or "", now,
+            ai.get("artifact_id") if ai.get("validated_artifact") else None,
+            decision_origin="LOCAL_DEMO",
         )
         repo.insert_audit_log(
             conn,
@@ -219,7 +233,13 @@ def cmd_auto_demo(args) -> int:
             cur,
             """UPDATE access_reviews SET status='REVOKED',
                    reviewer_comment='Violation of Least Privilege', reviewed_at=?
-               WHERE status='PENDING' AND review_id IN
+               WHERE status='PENDING' AND exception_state<>'OPEN'
+                 AND review_id IN (SELECT r.review_id FROM access_reviews r
+                   JOIN published_snapshots ps ON ps.snapshot_id=r.snapshot_id
+                   JOIN discovery_runs d ON d.run_id=ps.snapshot_id
+                   WHERE d.source='MOCK:' || ps.source_scope)
+                 AND campaign_id IN (SELECT campaign_id FROM campaigns WHERE state='OPEN')
+                 AND review_id IN
                    (SELECT ar.review_id FROM access_reviews ar
                     JOIN roles rol ON rol.role_id=ar.role_id
                     LEFT JOIN grant_observations go ON go.observation_id=ar.observation_id
@@ -234,7 +254,13 @@ def cmd_auto_demo(args) -> int:
             cur,
             """UPDATE access_reviews SET status='APPROVED',
                    reviewer_comment='Approved: read-only business need', reviewed_at=?
-               WHERE status='PENDING' AND review_id IN
+               WHERE status='PENDING' AND exception_state<>'OPEN'
+                 AND review_id IN (SELECT r.review_id FROM access_reviews r
+                   JOIN published_snapshots ps ON ps.snapshot_id=r.snapshot_id
+                   JOIN discovery_runs d ON d.run_id=ps.snapshot_id
+                   WHERE d.source='MOCK:' || ps.source_scope)
+                 AND campaign_id IN (SELECT campaign_id FROM campaigns WHERE state='OPEN')
+                 AND review_id IN
                    (SELECT ar.review_id FROM access_reviews ar
                     JOIN roles rol ON rol.role_id=ar.role_id
                     LEFT JOIN grant_risk_assessments gra
@@ -250,9 +276,12 @@ def cmd_auto_demo(args) -> int:
             (now,),
         )
         for review_id, status, comment in cur.fetchall():
+            ai = ai_artifacts.projection(conn, review_id)
             repo.record_review_decision_event(
                 conn, str(uuid.uuid4()), review_id, status,
                 "local-demo", comment, now,
+                ai.get("artifact_id") if ai.get("validated_artifact") else None,
+                decision_origin="LOCAL_DEMO",
             )
         repo.insert_audit_log(
             conn,

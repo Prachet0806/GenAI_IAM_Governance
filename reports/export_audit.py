@@ -53,9 +53,9 @@ def export_audit_report():
         # Integrity: counts by status (index 5 per fetch_reviews_for_export contract)
         status_counts = {}
         for row in rows:
-            if len(row) != 28:
+            if len(row) != 38:
                 raise RuntimeError(
-                    f"Unexpected export row width {len(row)}; expected 28."
+                    f"Unexpected export row width {len(row)}; expected 38."
                 )
             status = row[5]
             status_counts[status] = status_counts.get(status, 0) + 1
@@ -72,7 +72,7 @@ def export_audit_report():
                     "Risk Level",
                     "Decision Status",
                     "Reviewer Comment",
-                    "AI Risk Summary",
+                    "AI Summary",
                     "Created At",
                     "Reviewed At",
                     "Remediated At",
@@ -93,6 +93,16 @@ def export_audit_report():
                     "Risk Rule Version",
                     "Policy Document",
                     "Evidence State",
+                    "Policy Evidence Status",
+                    "Missing Policy Reason",
+                    "Source Coverage",
+                    "AI Authority",
+                    "AI Artifact ID",
+                    "AI Output SHA256",
+                    "AI Citations",
+                    "AI Validated Artifact",
+                    "Decision Events",
+                    "Workflow Events",
                 ]
             )
             writer.writerows(rows)
@@ -107,14 +117,14 @@ def export_audit_report():
                 "risk_level": r[4],
                 "status": r[5],
                 "reviewer_comment": r[6],
-                "ai_risk_summary": r[7],
-                "created_at": r[8],
-                "reviewed_at": r[9],
-                "remediated_at": r[10],
+                "ai_summary": r[7],
+                "created_at": str(r[8]) if r[8] else None,
+                "reviewed_at": str(r[9]) if r[9] else None,
+                "remediated_at": str(r[10]) if r[10] else None,
                 "ai_source": r[11],
                 "ai_model": r[12],
                 "ai_prompt_version": r[13],
-                "ai_generated_at": r[14],
+                "ai_generated_at": str(r[14]) if r[14] else None,
                 "snapshot_id": r[15],
                 "grant_id": r[16],
                 "observation_id": r[17],
@@ -130,6 +140,16 @@ def export_audit_report():
                 "evidence_state": r[27],
                 "review_scope": "GRANT_PATH" if r[16] else "LEGACY_UNKNOWN_PATH",
                 "principal_access_status": "not_evaluated" if r[16] else "unknown",
+                "policy_evidence_status": r[28],
+                "missing_policy_reason": r[29],
+                "source_coverage": json.loads(r[30]) if r[30] else None,
+                "ai_authority": r[31],
+                "ai_artifact_id": r[32],
+                "ai_output_sha256": r[33],
+                "ai_citations": json.loads(r[34]) if r[34] else None,
+                "ai_validated_artifact": r[35],
+                "decision_events": json.loads(r[36]),
+                "workflow_events": json.loads(r[37]),
             }
             for r in rows
         ]

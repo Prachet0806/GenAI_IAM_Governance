@@ -6,7 +6,9 @@ import re
 from datetime import datetime, timezone
 
 IAM_USER_POLICY_SCOPE = "iam-users-direct-and-group-managed-and-inline-policies-v2"
-POLICY_RULE_VERSION = "policy-risk-v2"
+IAM_ROLE_POLICY_SCOPE = "iam-role-policies-and-trust-v1"
+IDENTITY_CENTER_SCOPE = "identity-center-account-assignments-v1"
+POLICY_RULE_VERSION = "policy-risk-v4"
 
 
 def canonical_json(value) -> str:
@@ -28,14 +30,18 @@ def grant_observation(account_id: str, user: dict, policy: dict, snapshot_id: st
     """Produce a path identity and observation without using policy content as a key."""
     principal_id = user["UserId"]
     principal_arn = user["Arn"]
-    if account_from_arn(principal_arn) != account_id:
-        raise ValueError("Discovered principal belongs to a different AWS account")
     grant_type = policy.get("GrantType", "DIRECT_MANAGED")
+    if grant_type != "IDENTITY_CENTER_ASSIGNMENT" and account_from_arn(principal_arn) != account_id:
+        raise ValueError("Discovered principal belongs to a different AWS account")
     if grant_type not in {
         "DIRECT_MANAGED",
         "DIRECT_INLINE",
         "GROUP_MANAGED",
         "GROUP_INLINE",
+        "ROLE_MANAGED",
+        "ROLE_INLINE",
+        "ROLE_TRUST",
+        "IDENTITY_CENTER_ASSIGNMENT",
     }:
         raise ValueError("Unsupported IAM grant type")
     source_id = policy.get("SourceId") or principal_id
@@ -44,11 +50,21 @@ def grant_observation(account_id: str, user: dict, policy: dict, snapshot_id: st
     if not attachment_id or (grant_type.startswith("GROUP_") and source_id == principal_id):
         raise ValueError("Grant path is missing its source attachment identity")
     document = policy.get("Document")
-    if not isinstance(document, dict):
+    evidence_status = policy.get("EvidenceStatus", "COMPLETE")
+    missing_reason = policy.get("MissingReason")
+    if evidence_status not in {"COMPLETE", "MISSING"}:
+        raise ValueError("Unknown policy evidence status")
+    if evidence_status == "MISSING" and not missing_reason:
+        raise ValueError("Missing policy evidence needs a reason")
+    if evidence_status == "COMPLETE" and not isinstance(document, dict):
         raise ValueError("Grant path has no readable policy document")
+    if evidence_status == "MISSING" and not isinstance(document, dict):
+        document = {}
     policy_id = (
         policy["PolicyArn"]
         if grant_type.endswith("MANAGED")
+        else f"identity-center:{account_id}:{source_id}"
+        if grant_type == "IDENTITY_CENTER_ASSIGNMENT"
         else f"inline:{account_id}:{grant_type}:{source_id}:{attachment_id}"
     )
     grant_id = stable_id(account_id, principal_id, grant_type, source_id, attachment_id)
@@ -72,4 +88,6 @@ def grant_observation(account_id: str, user: dict, policy: dict, snapshot_id: st
         "policy_document": document_json,
         "observed_at": policy.get("ObservedAt")
         or datetime.now(timezone.utc).isoformat(),
+        "evidence_status": evidence_status,
+        "missing_reason": missing_reason,
     }

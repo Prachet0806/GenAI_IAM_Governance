@@ -40,7 +40,7 @@ def test_sqlite_fresh_install_and_rerun(tmp_path, monkeypatch):
     migrate.apply_sqlite()
     migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
         assert conn.execute("SELECT COUNT(*) FROM governance_mutex").fetchone()[0] == 1
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -64,7 +64,7 @@ def test_sqlite_legacy_upgrade_preserves_data(tmp_path, monkeypatch):
             assert column in {
                 row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')
             }
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
 
 
 def test_sqlite_upgrade_from_committed_pr1_ledger(tmp_path, monkeypatch):
@@ -81,8 +81,37 @@ def test_sqlite_upgrade_from_committed_pr1_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", source)
     migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (3,)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (8,)
         assert conn.execute("SELECT role_name FROM roles WHERE role_id='R1'").fetchone() == ("Reader",)
+
+
+def test_sqlite_upgrade_from_pr3_with_existing_grant_evidence(tmp_path, monkeypatch):
+    source = migrate.MIGRATIONS_DIR
+    pr3_files = tmp_path / "pr3-migrations"
+    pr3_files.mkdir()
+    for number in ("0001", "0002", "0003"):
+        for path in source.glob(f"{number}_*"):
+            shutil.copy(path, pr3_files)
+    path = tmp_path / "pr3.db"
+    _set_sqlite(monkeypatch, path)
+    monkeypatch.setattr(migrate, "MIGRATIONS_DIR", pr3_files)
+    migrate.apply_sqlite()
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("INSERT INTO discovery_runs(run_id,started_at,status,source,account_id,source_scope) VALUES ('SNAP1','2026-01-01','COMPLETE','AWS:scope','123456789012','scope')")
+        conn.execute("INSERT INTO published_snapshots(snapshot_id,account_id,source_scope,published_at,users_seen,coverage) VALUES ('SNAP1','123456789012','scope','2026-01-01',1,'{}')")
+        conn.execute("INSERT INTO users(user_id,user_name) VALUES ('U1','alice')")
+        conn.execute("INSERT INTO roles(role_id,role_name) VALUES ('P1','Reader')")
+        conn.execute("INSERT INTO grant_paths(grant_id,account_id,principal_id,principal_arn,grant_type,source_id,attachment_id,policy_id) VALUES ('G1','123456789012','U1','arn:aws:iam::123456789012:user/alice','DIRECT_MANAGED','U1','policy','P1')")
+        conn.execute("INSERT INTO grant_observations(observation_id,snapshot_id,grant_id,principal_name,source_name,policy_name,policy_sha256,policy_document,observed_at) VALUES ('O1','SNAP1','G1','alice','alice','Reader','hash','{}','2026-01-01')")
+    monkeypatch.setattr(migrate, "MIGRATIONS_DIR", source)
+    migrate.apply_sqlite()
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("SELECT grant_type FROM grant_paths WHERE grant_id='G1'").fetchone() == ("DIRECT_MANAGED",)
+        assert conn.execute("SELECT evidence_status FROM grant_observations WHERE observation_id='O1'").fetchone() == ("COMPLETE",)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (8,)
 
 
 def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeypatch):
@@ -91,7 +120,7 @@ def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeyp
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", files)
     path = tmp_path / "rollback.db"
     _set_sqlite(monkeypatch, path)
-    (files / "0004_bad.sql").write_text(
+    (files / "0009_bad.sql").write_text(
         "CREATE TABLE should_rollback (id INTEGER); INSERT INTO absent VALUES (1);",
         encoding="utf-8",
     )
@@ -99,7 +128,7 @@ def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeyp
         migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
-    (files / "0004_bad.sql").unlink()
+    (files / "0009_bad.sql").unlink()
     migrate.apply_sqlite()
     baseline = files / "0001_baseline.sql"
     baseline.write_text(
@@ -148,6 +177,11 @@ def test_postgres_fresh_install_and_concurrent_migration(postgres_schema):
             ("0001_baseline", 64),
             ("0002_grant_evidence", 64),
             ("0003_pinned_reviews", 64),
+            ("0004_campaign_workflow", 64),
+            ("0005_source_coverage", 64),
+            ("0006_ai_artifacts", 64),
+            ("0007_decision_origin", 64),
+            ("0008_ai_job_recovery", 64),
         ]
         cur.execute("SELECT COUNT(*) FROM governance_mutex")
         assert cur.fetchone() == (1,)
@@ -203,7 +237,7 @@ def test_postgres_upgrade_from_committed_pr1_ledger(postgres_schema, tmp_path, m
     migrate.apply_postgres()
     with psycopg2.connect(postgres_schema) as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM schema_migrations")
-        assert cur.fetchone() == (3,)
+        assert cur.fetchone() == (8,)
         cur.execute("SELECT role_name FROM roles WHERE role_id='R1'")
         assert cur.fetchone() == ("Reader",)
 
@@ -274,3 +308,112 @@ def test_postgres_legacy_ai_explanation_projection(postgres_schema):
     assert explanation["summary"] == "First"
     assert explanation["generation_id"] == "GEN1"
     assert explanation["provenance_state"] == "older_matching_generation"
+
+
+def test_postgres_ai_claim_contention(postgres_schema):
+    """A duplicate worker delivery may acquire only one lease."""
+    import psycopg2
+
+    from common import ai_artifacts, evidence, repo
+    from common.db import db
+    from lambdas.generate_reviews.handler import generate_campaign
+    from lambdas.risk_evaluation.handler import evaluate_risk
+    from tests.test_evidence_workflow import ACCOUNT_A, _user
+
+    migrate.apply_postgres()
+    user = _user()
+    run_id = "ai-postgres-snapshot"
+    policy = {
+        "PolicyArn": f"arn:aws:iam::{ACCOUNT_A}:policy/Wildcard",
+        "PolicyName": "Wildcard",
+        "Document": {"Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]},
+        "GrantType": "DIRECT_MANAGED", "SourceId": user["UserId"],
+        "SourceName": user["UserName"],
+        "AttachmentId": f"arn:aws:iam::{ACCOUNT_A}:policy/Wildcard",
+    }
+    observation = evidence.grant_observation(ACCOUNT_A, user, policy, run_id)
+    now = user["CreateDate"].isoformat()
+    with db.get_connection() as conn:
+        repo.start_discovery_attempt(conn, run_id, now, "MOCK", ACCOUNT_A, evidence.IAM_USER_POLICY_SCOPE)
+        repo.publish_discovery_snapshot(conn, run_id, ACCOUNT_A, evidence.IAM_USER_POLICY_SCOPE,
+                                        now, [user], [observation], {"complete_for_declared_scope": True})
+    evaluate_risk(None, None)
+    campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
+    assert campaign["reviews_created"] == 1
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        db.execute(cur, "SELECT review_id FROM access_reviews WHERE campaign_id=?", (campaign["campaign_id"],))
+        ai_artifacts.enqueue_review(conn, cur.fetchone()[0], pseudonym_key="test-key")
+
+    def claim(_):
+        with psycopg2.connect(postgres_schema) as conn:
+            return ai_artifacts.claim_job(conn)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(claim, (1, 2)))
+    assert sum(item is not None for item in claims) == 1
+
+
+def test_postgres_role_identity_center_and_campaign_workflow(postgres_schema):
+    """The new grant types and lifecycle SQL run against a real Postgres schema."""
+    from datetime import datetime, timezone
+
+    from common import evidence, repo, workflow
+    from common.db import db
+    from common.source_scanner import publish_source
+    from lambdas.generate_reviews.handler import generate_campaign
+    from lambdas.risk_evaluation.handler import evaluate_risk
+
+    migrate.apply_postgres()
+    account = "123456789012"
+    role = {
+        "UserId": "ROLE1", "UserName": "role-1",
+        "Arn": f"arn:aws:iam::{account}:role/role-1",
+        "CreateDate": datetime.now(timezone.utc), "PrincipalKind": "IAM_ROLE",
+        "Policies": [{
+            "PolicyArn": "trust:role-1", "PolicyName": "role-1:trust",
+            "Document": {"Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                       "Principal": "*"}]},
+            "GrantType": "ROLE_TRUST", "SourceId": "ROLE1",
+            "SourceName": "role-1", "AttachmentId": "trust",
+        }],
+    }
+    assert publish_source(
+        account, evidence.IAM_ROLE_POLICY_SCOPE, [role],
+        covered=["role_trust"], unassessed=["effective_permissions"],
+    )["status"] == "COMPLETE"
+    identity = {
+        "UserId": "IC1", "UserName": "ic-user",
+        "Arn": "identity-center://instance/user/IC1",
+        "CreateDate": datetime.now(timezone.utc),
+        "PrincipalKind": "IDENTITY_CENTER_USER",
+        "Policies": [{
+            "PolicyArn": "permission-set-1", "PolicyName": "PermissionSet1",
+            "Document": {}, "EvidenceStatus": "MISSING",
+            "MissingReason": "customer_managed_policy_reference_unresolved",
+            "GrantType": "IDENTITY_CENTER_ASSIGNMENT",
+            "SourceId": "permission-set-1", "SourceName": "PermissionSet1",
+            "AttachmentId": f"{account}:USER:IC1",
+        }],
+    }
+    assert publish_source(
+        account, evidence.IDENTITY_CENTER_SCOPE, [identity],
+        covered=["account_assignments"], unassessed=["group_membership"],
+    )["missing_policy_evidence"] == 1
+    assert evaluate_risk(None, None)["grant_observations_assessed"] == 2
+    campaign = generate_campaign({
+        "account_id": account, "source_scope": evidence.IDENTITY_CENTER_SCOPE,
+    }, None)
+    assert campaign["reviews_created"] == 1
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        db.execute(cur, "SELECT review_id FROM access_reviews WHERE campaign_id=?", (campaign["campaign_id"],))
+        review_id = cur.fetchone()[0]
+        repo.assign_campaign_reviewer(conn, campaign["campaign_id"], "reviewer", "admin")
+        assert workflow.assign_review(conn, review_id, "reviewer", "admin") == "assigned"
+        assert workflow.queue(conn, "reviewer")[0]["review_id"] == review_id
+        assert workflow.set_exception(conn, review_id, "OPEN", "reviewer", "Need owner") == "updated"
+        assert workflow.change_campaign_state(conn, campaign["campaign_id"], "CLOSED", "admin") == "incomplete"
+        assert workflow.set_exception(conn, review_id, "RESOLVED", "admin", "Done") == "updated"
+        assert workflow.change_campaign_state(conn, campaign["campaign_id"], "PAUSED", "admin") == "updated"
+        assert workflow.queue(conn, "reviewer") == []

@@ -269,6 +269,7 @@ def test_failed_and_superseded_attempts_preserve_publication_but_block_eligibili
 def test_direct_path_remediation_does_not_claim_group_access_removed(
     sqlite_evidence_db, monkeypatch
 ):
+    from api import review_service
     from lambdas.remediation import handler as remediation
 
     snapshot_id, _ = _publish(policies=_policies()[:2])
@@ -282,12 +283,14 @@ def test_direct_path_remediation_does_not_claim_group_access_removed(
             WHERE gp.grant_type='DIRECT_MANAGED'"""
         )
         direct_review = cur.fetchone()[0]
-        cur.execute(
-            """UPDATE access_reviews SET status='REVOKED',
-            reviewer_comment='remove direct grant',reviewer_sub='reviewer'
-            WHERE review_id=?""",
-            (direct_review,),
-        )
+        repo.assign_campaign_reviewer(conn, campaign["campaign_id"], "reviewer", "admin")
+    monkeypatch.setenv("REVIEWER_GROUP", "reviewers")
+    review_service.decide_review(
+        direct_review,
+        review_service.DecisionRequest(decision="REVOKED", comment="remove direct grant"),
+        {"sub": "reviewer", "groups": ["reviewers"]},
+    )
+    with db.get_connection() as conn:
         repo.record_remediation_approval(
             conn, str(uuid.uuid4()), direct_review, "approver",
             datetime.now(timezone.utc).isoformat(), snapshot_id,
@@ -412,3 +415,37 @@ def test_approval_and_live_gate_are_source_specific(sqlite_evidence_db, monkeypa
     result = remediation.remediate_access(None, None)
     assert result["remediated"] == 0
     assert result["skipped"] == 1
+
+
+def test_demo_origin_cannot_satisfy_live_approval(sqlite_evidence_db, monkeypatch):
+    from fastapi import HTTPException, Response
+
+    from api import review_service
+
+    snapshot_id, _ = _publish(policies=_policies()[:1])
+    evaluate_risk(None, None)
+    campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
+    with db.get_connection() as conn:
+        review_id = conn.execute(
+            "SELECT review_id FROM access_reviews WHERE campaign_id=?",
+            (campaign["campaign_id"],),
+        ).fetchone()[0]
+        conn.execute("""UPDATE access_reviews SET status='REVOKED',
+                     reviewer_comment='demo',reviewer_sub='forged-sub'
+                     WHERE review_id=?""", (review_id,))
+        repo.record_review_decision_event(
+            conn, str(uuid.uuid4()), review_id, "REVOKED", "forged-sub",
+            "demo", datetime.now(timezone.utc).isoformat(),
+            decision_origin="LOCAL_DEMO",
+        )
+        repo.record_remediation_approval(
+            conn, str(uuid.uuid4()), review_id, "approver",
+            datetime.now(timezone.utc).isoformat(), snapshot_id,
+        )
+        assert not repo.is_remediation_approved(conn, review_id, snapshot_id)
+    monkeypatch.setenv("REMEDIATION_APPROVER_GROUP", "approvers")
+    with pytest.raises(HTTPException) as exc:
+        review_service.approve_remediation(
+            review_id, Response(), {"sub": "approver", "groups": ["approvers"]}
+        )
+    assert exc.value.status_code == 409

@@ -9,15 +9,19 @@ from common.db import db
 
 
 # Users / roles / user_roles
-def insert_user(conn, user_id: str, user_name: str, arn: str, created_at: str):
+def insert_user(
+    conn, user_id: str, user_name: str, arn: str, created_at: str,
+    principal_kind: str = "IAM_USER",
+):
     db.execute(
         conn.cursor(),
         """
-        INSERT INTO users (user_id, user_name, arn, created_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET user_name=excluded.user_name, arn=excluded.arn
+        INSERT INTO users (user_id, user_name, arn, created_at, principal_kind)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET user_name=excluded.user_name,
+          arn=excluded.arn,principal_kind=excluded.principal_kind
         """,
-        (user_id, user_name, arn, created_at),
+        (user_id, user_name, arn, created_at, principal_kind),
     )
 
 
@@ -208,12 +212,14 @@ def publish_discovery_snapshot(
         (run_id, account_id, source_scope, completed_at, len(users), json.dumps(coverage, sort_keys=True)),
     )
     for user in users:
+        created_at = user["CreateDate"]
         insert_user(
             conn,
             user["UserId"],
             user["UserName"],
             user["Arn"],
-            user["CreateDate"].isoformat(),
+            created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+            user.get("PrincipalKind", "IAM_USER"),
         )
     for item in observations:
         insert_role(conn, item["policy_id"], item["policy_name"], "LOW")
@@ -234,12 +240,14 @@ def publish_discovery_snapshot(
             conn.cursor(),
             """INSERT INTO grant_observations
             (observation_id,snapshot_id,grant_id,principal_name,source_name,
-             policy_name,policy_version,policy_sha256,policy_document,observed_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+             policy_name,policy_version,policy_sha256,policy_document,observed_at,
+             evidence_status,missing_reason)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 item["observation_id"], run_id, item["grant_id"], item["principal_name"],
                 item["source_name"], item["policy_name"], item["policy_version"],
                 item["policy_sha256"], item["policy_document"], item["observed_at"],
+                item.get("evidence_status", "COMPLETE"), item.get("missing_reason"),
             ),
         )
     db.execute(
@@ -296,7 +304,8 @@ def list_current_observations(conn, snapshot_id: str | None = None):
         cur,
         f"""SELECT go.observation_id,go.snapshot_id,go.grant_id,gp.policy_id,
         go.policy_name,go.policy_document,go.policy_sha256,gp.account_id,
-        gp.principal_id,gp.grant_type,go.source_name
+        gp.principal_id,gp.grant_type,go.source_name,
+        go.evidence_status,go.missing_reason
         FROM source_publications sp
         JOIN grant_observations go ON go.snapshot_id=sp.snapshot_id
         JOIN grant_paths gp ON gp.grant_id=go.grant_id
@@ -406,11 +415,34 @@ def list_assessed_grants(conn, snapshot_id: str, rule_version: str):
     return cur.fetchall()
 
 
-def create_pinned_campaign(conn, campaign_id: str, name: str, created_at: str, snapshot_id: str):
+def active_campaign_for_snapshot(conn, snapshot_id: str) -> str | None:
+    cur = conn.cursor()
+    db.execute(cur, """SELECT campaign_id FROM campaigns
+        WHERE snapshot_id=? AND state IN ('OPEN','PAUSED')
+        ORDER BY created_at,campaign_id LIMIT 1""", (snapshot_id,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def create_pinned_campaign(
+    conn, campaign_id: str, name: str, created_at: str, snapshot_id: str,
+    owner_sub: str = "system", due_at: str | None = None,
+):
+    cur = conn.cursor()
     db.execute(
-        conn.cursor(),
-        "INSERT INTO campaigns(campaign_id,name,created_at,snapshot_id) VALUES (?,?,?,?)",
-        (campaign_id, name, created_at, snapshot_id),
+        cur,
+        "SELECT account_id,source_scope FROM published_snapshots WHERE snapshot_id=?",
+        (snapshot_id,),
+    )
+    scope = cur.fetchone()
+    if not scope:
+        raise ValueError("Campaign snapshot does not exist")
+    db.execute(
+        cur,
+        """INSERT INTO campaigns
+           (campaign_id,name,created_at,snapshot_id,account_id,source_scope,owner_sub,due_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (campaign_id, name, created_at, snapshot_id, scope[0], scope[1], owner_sub, due_at),
     )
 
 
@@ -424,11 +456,13 @@ def create_pinned_review(
         cur,
         """INSERT INTO access_reviews
         (review_id,campaign_id,user_id,role_id,status,snapshot_id,grant_id,
-         observation_id,risk_assessment_id,created_at)
-        VALUES (?,?,?,?,'PENDING',?,?,?,?,?) ON CONFLICT DO NOTHING""",
+         observation_id,risk_assessment_id,created_at,due_at)
+        VALUES (?,?,?,?,'PENDING',?,?,?,?,?,
+                (SELECT due_at FROM campaigns WHERE campaign_id=?))
+        ON CONFLICT DO NOTHING""",
         (
             review_id, campaign_id, user_id, role_id, snapshot_id, grant_id,
-            observation_id, risk_assessment_id, created_at,
+            observation_id, risk_assessment_id, created_at, campaign_id,
         ),
     )
     return cur.rowcount == 1
@@ -492,16 +526,20 @@ def is_current_grant_for_review(conn, review_id: str) -> bool:
 def record_review_decision_event(
     conn, event_id: str, review_id: str, decision: str,
     reviewer_sub: str | None, comment: str, decided_at: str,
+    ai_artifact_id: str | None = None,
+    decision_origin: str = "LEGACY_UNVERIFIED",
 ):
     cur = conn.cursor()
     db.execute(
         cur,
         """INSERT INTO review_decision_events
         (event_id,review_id,snapshot_id,grant_id,observation_id,risk_assessment_id,
-         decision,reviewer_sub,reviewer_comment,decided_at)
+         decision,reviewer_sub,reviewer_comment,decided_at,ai_artifact_id,
+         decision_origin)
         SELECT ?,review_id,snapshot_id,grant_id,observation_id,risk_assessment_id,
-               ?,?,?,? FROM access_reviews WHERE review_id=?""",
-        (event_id, decision, reviewer_sub, comment, decided_at, review_id),
+               ?,?,?,?,?,? FROM access_reviews WHERE review_id=?""",
+        (event_id, decision, reviewer_sub, comment, decided_at, ai_artifact_id,
+         decision_origin, review_id),
     )
     if cur.rowcount != 1:
         raise RuntimeError("Review decision event could not be recorded")
@@ -539,6 +577,16 @@ def is_campaign_reviewer(conn, campaign_id: str, reviewer_sub: str) -> bool:
         "SELECT 1 FROM campaign_reviewers WHERE campaign_id=? AND reviewer_sub=?",
         (campaign_id, reviewer_sub),
     )
+    return cur.fetchone() is not None
+
+
+def is_mock_review(conn, review_id: str) -> bool:
+    """A runtime mock flag alone cannot establish a review's provenance."""
+    cur = conn.cursor()
+    db.execute(cur, """SELECT 1 FROM access_reviews r
+        JOIN published_snapshots ps ON ps.snapshot_id=r.snapshot_id
+        JOIN discovery_runs d ON d.run_id=ps.snapshot_id
+        WHERE r.review_id=? AND d.source='MOCK:' || ps.source_scope""", (review_id,))
     return cur.fetchone() is not None
 
 
@@ -585,6 +633,19 @@ def get_remediation_approval(conn, review_id: str):
     return cur.fetchone()
 
 
+def has_authenticated_revocation(conn, review_id: str) -> bool:
+    cur = conn.cursor()
+    db.execute(cur, """SELECT 1 FROM access_reviews r
+        JOIN review_decision_events e ON e.review_id=r.review_id
+        WHERE r.review_id=? AND r.status='REVOKED'
+          AND e.decision='REVOKED' AND e.decision_origin='OIDC_API'
+          AND e.reviewer_sub=r.reviewer_sub
+          AND e.snapshot_id=r.snapshot_id AND e.grant_id=r.grant_id
+          AND e.observation_id=r.observation_id
+          AND e.risk_assessment_id=r.risk_assessment_id""", (review_id,))
+    return cur.fetchone() is not None
+
+
 def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool:
     cur = conn.cursor()
     db.execute(
@@ -594,7 +655,15 @@ def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool
         WHERE a.review_id=? AND r.status='REVOKED' AND r.reviewer_sub IS NOT NULL
           AND r.snapshot_id=? AND r.grant_id IS NOT NULL
           AND r.observation_id IS NOT NULL AND r.risk_assessment_id IS NOT NULL
-          AND a.approver_sub <> r.reviewer_sub AND a.discovery_run_id=?""",
+          AND a.approver_sub <> r.reviewer_sub AND a.discovery_run_id=?
+          AND EXISTS (
+              SELECT 1 FROM review_decision_events e
+              WHERE e.review_id=r.review_id AND e.decision='REVOKED'
+                AND e.reviewer_sub=r.reviewer_sub AND e.decision_origin='OIDC_API'
+                AND e.snapshot_id=r.snapshot_id AND e.grant_id=r.grant_id
+                AND e.observation_id=r.observation_id
+                AND e.risk_assessment_id=r.risk_assessment_id
+          )""",
         (review_id, discovery_run_id, discovery_run_id),
     )
     return cur.fetchone() is not None
@@ -752,6 +821,7 @@ def list_revocations(conn) -> list[tuple[str, str, str, str]]:
 def list_high_risk_reviews_missing_ai(
     conn,
 ) -> list[tuple[str, str, str, str, str, str]]:
+    """Compatibility list using validated artifacts, never the legacy summary slot."""
     cur = conn.cursor()
     db.execute(
         cur,
@@ -765,9 +835,12 @@ def list_high_risk_reviews_missing_ai(
         JOIN roles rol ON r.role_id = rol.role_id
         LEFT JOIN grant_observations go ON go.observation_id=r.observation_id
         LEFT JOIN grant_risk_assessments gra ON gra.assessment_id=r.risk_assessment_id
-        WHERE (CASE WHEN r.grant_id IS NULL THEN rol.risk_level
-                    ELSE gra.risk_level END) = 'HIGH' AND r.status = 'PENDING'
-          AND (r.ai_risk_summary IS NULL OR r.ai_risk_summary = '')
+        WHERE gra.risk_level='HIGH' AND r.status='PENDING'
+          AND r.snapshot_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM ai_artifacts a WHERE a.review_id=r.review_id
+                AND a.validation_status='VALIDATED'
+          )
         """,
     )
     return cur.fetchall()
@@ -811,10 +884,15 @@ def fetch_review_ai_context(conn, review_id: str):
         r.snapshot_id,r.grant_id,r.observation_id,r.risk_assessment_id,
         gp.grant_type,go.source_name,go.policy_version,go.policy_sha256,
         CASE WHEN r.observation_id IS NULL THEN 'legacy_unknown_path'
-             ELSE 'snapshot_pinned' END
+             ELSE 'snapshot_pinned' END,
+        CASE WHEN r.observation_id IS NULL THEN 'UNKNOWN'
+             ELSE go.evidence_status END,
+        go.missing_reason,ps.coverage,ps.account_id,ps.source_scope,
+        ps.published_at
         FROM access_reviews r JOIN users u ON u.user_id=r.user_id JOIN roles rol ON rol.role_id=r.role_id
         LEFT JOIN risk_assessments ra ON ra.role_id=rol.role_id
         LEFT JOIN grant_observations go ON go.observation_id=r.observation_id
+        LEFT JOIN published_snapshots ps ON ps.snapshot_id=r.snapshot_id
         LEFT JOIN grant_paths gp ON gp.grant_id=r.grant_id
         LEFT JOIN grant_risk_assessments gra ON gra.assessment_id=r.risk_assessment_id
         LEFT JOIN policy_risk_assessments pra ON pra.assessment_id=gra.policy_assessment_id
@@ -824,10 +902,38 @@ def fetch_review_ai_context(conn, review_id: str):
     return cur.fetchone()
 
 
+def list_source_coverage(conn, account_id: str):
+    cur = conn.cursor()
+    db.execute(
+        cur,
+        """SELECT h.source_scope,h.attempt_id,d.status,p.snapshot_id,
+                  s.published_at,s.coverage
+           FROM source_attempt_heads h
+           JOIN discovery_runs d ON d.run_id=h.attempt_id
+           LEFT JOIN source_publications p
+             ON p.account_id=h.account_id AND p.source_scope=h.source_scope
+           LEFT JOIN published_snapshots s ON s.snapshot_id=p.snapshot_id
+           WHERE h.account_id=? ORDER BY h.source_scope""",
+        (account_id,),
+    )
+    result = []
+    for scope, attempt_id, attempt_status, snapshot_id, published_at, coverage in cur.fetchall():
+        result.append({
+            "account_id": account_id, "source_scope": scope,
+            "latest_attempt_id": attempt_id,
+            "latest_attempt_status": attempt_status,
+            "published_snapshot_id": snapshot_id,
+            "published_at": str(published_at) if published_at else None,
+            "coverage": json.loads(coverage) if coverage else None,
+            "eligible_for_campaign": eligible_published_snapshot(conn, account_id, scope) is not None,
+        })
+    return result
+
+
 def fetch_legacy_ai_explanation(conn, review_id: str) -> dict:
     """Expose the stored summary with honest, non-authoritative provenance.
 
-    PR 7 will replace this compatibility projection with validated artifacts.
+    The validated-artifact projection calls this only when no artifact exists.
     """
     cur = conn.cursor()
     db.execute(
@@ -946,7 +1052,9 @@ def mark_remediated(conn, review_id: str, ts: str):
 
 
 def fetch_reviews_for_export(conn) -> list[tuple[Any, ...]]:
-    """Export frozen grant/risk evidence; legacy rows are explicitly labelled."""
+    """Export frozen evidence with the single validated-artifact projection."""
+    from common import ai_artifacts
+
     cur = conn.cursor()
     db.execute(
         cur,
@@ -959,14 +1067,14 @@ def fetch_reviews_for_export(conn) -> list[tuple[Any, ...]]:
             CASE WHEN r.observation_id IS NULL THEN rol.risk_level ELSE gra.risk_level END,
             r.status,
             r.reviewer_comment,
-            r.ai_risk_summary,
+            NULL AS ai_summary,
             r.created_at,
             r.reviewed_at,
             r.remediated_at,
-            (SELECT source FROM ai_generations g WHERE g.review_id=r.review_id ORDER BY created_at DESC LIMIT 1),
-            (SELECT model FROM ai_generations g WHERE g.review_id=r.review_id ORDER BY created_at DESC LIMIT 1),
-            (SELECT prompt_version FROM ai_generations g WHERE g.review_id=r.review_id ORDER BY created_at DESC LIMIT 1),
-            (SELECT created_at FROM ai_generations g WHERE g.review_id=r.review_id ORDER BY created_at DESC LIMIT 1),
+            NULL AS ai_source,
+            NULL AS ai_model,
+            NULL AS ai_prompt_version,
+            NULL AS ai_generated_at,
             r.snapshot_id,r.grant_id,r.observation_id,r.risk_assessment_id,
             gp.grant_type,go.source_name,go.policy_version,go.policy_sha256,
             CASE WHEN r.observation_id IS NULL THEN ra.reason ELSE pra.reason END,
@@ -974,19 +1082,80 @@ def fetch_reviews_for_export(conn) -> list[tuple[Any, ...]]:
             CASE WHEN r.observation_id IS NULL THEN ra.rule_version ELSE pra.rule_version END,
             CASE WHEN r.observation_id IS NULL THEN rol.policy_document ELSE go.policy_document END,
             CASE WHEN r.observation_id IS NULL THEN 'legacy_unknown_path'
-                 ELSE 'snapshot_pinned' END
+                 ELSE 'snapshot_pinned' END,
+            CASE WHEN r.observation_id IS NULL THEN 'UNKNOWN'
+                 ELSE go.evidence_status END,
+            go.missing_reason,ps.coverage
         FROM access_reviews r
         JOIN users u ON r.user_id = u.user_id
         JOIN roles rol ON r.role_id = rol.role_id
         LEFT JOIN risk_assessments ra ON ra.role_id=rol.role_id
         LEFT JOIN grant_observations go ON go.observation_id=r.observation_id
+        LEFT JOIN published_snapshots ps ON ps.snapshot_id=r.snapshot_id
         LEFT JOIN grant_paths gp ON gp.grant_id=r.grant_id
         LEFT JOIN grant_risk_assessments gra ON gra.assessment_id=r.risk_assessment_id
         LEFT JOIN policy_risk_assessments pra ON pra.assessment_id=gra.policy_assessment_id
         ORDER BY r.created_at DESC
         """,
     )
-    return cur.fetchall()
+    results = []
+    for raw in cur.fetchall():
+        row = list(raw)
+        ai = ai_artifacts.projection(conn, row[0])
+        row[7] = ai.get("summary")
+        row[11] = ai.get("source")
+        row[12] = ai.get("model")
+        row[13] = ai.get("prompt_version")
+        row[14] = ai.get("generated_at")
+        event_cur = conn.cursor()
+        db.execute(
+            event_cur,
+            """SELECT event_id,decision,reviewer_sub,reviewer_comment,
+                      decided_at,ai_artifact_id,snapshot_id,grant_id,
+                      observation_id,risk_assessment_id,decision_origin
+               FROM review_decision_events WHERE review_id=?
+               ORDER BY decided_at,event_id""",
+            (row[0],),
+        )
+        decision_events = [
+            {"event_id": event_id, "decision": decision,
+             "reviewer_sub": reviewer_sub, "reviewer_comment": comment,
+             "decided_at": str(decided_at), "ai_artifact_id": artifact_id,
+             "snapshot_id": snapshot_id, "grant_id": grant_id,
+             "observation_id": observation_id,
+             "risk_assessment_id": assessment_id,
+             "decision_origin": origin}
+            for event_id, decision, reviewer_sub, comment, decided_at,
+                artifact_id, snapshot_id, grant_id, observation_id,
+                assessment_id, origin
+            in event_cur.fetchall()
+        ]
+        db.execute(
+            event_cur,
+            """SELECT event_id,event_type,actor_sub,created_at,
+                      previous_value,new_value,details
+               FROM review_workflow_events WHERE campaign_id=?
+                 AND (review_id IS NULL OR review_id=?)
+               ORDER BY created_at,event_id""",
+            (row[1], row[0]),
+        )
+        workflow_events = [
+            {"event_id": event_id, "event_type": kind,
+             "actor_sub": actor, "created_at": str(created_at),
+             "previous_value": previous, "new_value": new,
+             "details": json.loads(details)}
+            for event_id, kind, actor, created_at, previous, new, details
+            in event_cur.fetchall()
+        ]
+        row.extend((
+            ai.get("authority"), ai.get("artifact_id"), ai.get("output_sha256"),
+            json.dumps(ai.get("citations"), sort_keys=True),
+            ai.get("validated_artifact", False),
+            json.dumps(decision_events, sort_keys=True),
+            json.dumps(workflow_events, sort_keys=True),
+        ))
+        results.append(tuple(row))
+    return results
 
 
 def insert_audit_log(

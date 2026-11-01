@@ -191,7 +191,9 @@ def apply_sqlite():
     db_path = config.require_sqlite_path()
     conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
     try:
-        conn.execute("PRAGMA foreign_keys = ON")
+        # Table rebuilds in ordered migrations must run with FK enforcement off;
+        # verify every relationship before committing, then restore enforcement.
+        conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("BEGIN IMMEDIATE")
         try:
             cur = conn.cursor()
@@ -209,6 +211,9 @@ def apply_sqlite():
                     "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
                     (config.SCHEMA_VERSION,),
                 )
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(f"Migration left {len(violations)} foreign key violations")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -220,6 +225,7 @@ def apply_sqlite():
             details={"db_path": db_path},
         )
     finally:
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.close()
 
 

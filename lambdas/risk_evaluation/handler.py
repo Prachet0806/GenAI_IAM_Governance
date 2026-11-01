@@ -109,7 +109,9 @@ def assess_policy(policy_name: str, document: dict | None):
         if statement.get("Condition") or "NotResource" in statement:
             uncertain = True
     normalized = [str(action).lower() for action in actions]
-    wildcard = any(action == "*" or action.endswith(":*") for action in normalized)
+    # IAM accepts wildcards anywhere in an action name. A partial wildcard
+    # cannot safely be called read-only without expanding the service catalog.
+    wildcard = any("*" in action or "?" in action for action in normalized)
     write_verbs = (
         "put", "delete", "create", "update", "modify", "attach", "detach",
         "remove", "terminate", "stop", "start", "set", "passrole", "send", "publish",
@@ -120,7 +122,7 @@ def assess_policy(policy_name: str, document: dict | None):
     )
     broad_resource = any(str(resource).strip() == "*" for resource in resources)
     if wildcard:
-        risk, reason = "HIGH", "policy grants wildcard actions"
+        risk, reason = "HIGH", "policy grants or may grant wildcard actions"
     elif uncertain:
         risk, reason = "HIGH", "policy constructs require manual evaluation"
     elif not grants:
@@ -142,6 +144,54 @@ def assess_policy(policy_name: str, document: dict | None):
     }
 
 
+def assess_trust_policy(document: dict | None, account_id: str):
+    """Assess who may assume a role; this is not effective permission evaluation."""
+    if not isinstance(document, dict):
+        return "HIGH", "role trust policy unavailable", {"source": "missing_trust_policy"}
+    statements = document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not isinstance(statements, list) or not statements:
+        return "HIGH", "role trust policy cannot be analyzed", {"source": "trust_policy"}
+    principals = []
+    uncertain = False
+    for statement in statements:
+        if not isinstance(statement, dict) or statement.get("Effect") not in {"Allow", "Deny"}:
+            uncertain = True
+            continue
+        if statement["Effect"] == "Deny":
+            continue
+        if "NotPrincipal" in statement or "NotAction" in statement or statement.get("Condition"):
+            uncertain = True
+        action = statement.get("Action", [])
+        actions = action if isinstance(action, list) else [action]
+        if not any(str(value).lower() in {"sts:assumerole", "sts:*", "*"} for value in actions):
+            uncertain = True
+        principal = statement.get("Principal")
+        if isinstance(principal, dict):
+            for value in principal.values():
+                principals.extend(value if isinstance(value, list) else [value])
+        else:
+            principals.append(principal)
+    values = [str(value) for value in principals if value is not None]
+    broad = not values or any(value == "*" for value in values)
+    external = any(
+        value.isdigit() and len(value) == 12 and value != account_id
+        or value.startswith("arn:") and f"::{account_id}:" not in value
+        for value in values
+    )
+    risk = "HIGH" if broad or external or uncertain else "MEDIUM"
+    reason = (
+        "role trust has broad, external, or uncertain principals"
+        if risk == "HIGH" else "role trust names specific principals"
+    )
+    return risk, reason, {
+        "source": "trust_policy", "principals": values[:100],
+        "conditions_or_unsupported_constructs": uncertain,
+        "effective_access_evaluated": False,
+    }
+
+
 def evaluate_risk(event, context):
     logger.log("evaluate_risk", "start", "Starting snapshot policy risk evaluation")
     with db.get_connection() as conn:
@@ -152,9 +202,20 @@ def evaluate_risk(event, context):
         for observation in observations:
             observation_id, snapshot_id, grant_id, policy_id, policy_name, document_json = observation[:6]
             try:
-                risk, reason, risk_evidence = assess_policy(
-                    policy_name, json.loads(document_json)
-                )
+                if observation[11] == "MISSING":
+                    risk, reason = "HIGH", "policy evidence missing; manual review required"
+                    risk_evidence = {
+                        "source": "missing_policy_evidence",
+                        "missing_reason": observation[12],
+                    }
+                elif observation[9] == "ROLE_TRUST":
+                    risk, reason, risk_evidence = assess_trust_policy(
+                        json.loads(document_json), observation[7]
+                    )
+                else:
+                    risk, reason, risk_evidence = assess_policy(
+                        policy_name, json.loads(document_json)
+                    )
             except (TypeError, ValueError, KeyError) as exc:
                 risk, reason = "HIGH", "policy analysis failed; manual review required"
                 risk_evidence = {"source": "analysis_error", "error_type": type(exc).__name__}

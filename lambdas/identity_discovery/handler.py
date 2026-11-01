@@ -307,7 +307,10 @@ def discover_identities(event, context):
     started = datetime.now(timezone.utc).isoformat()
     mode = "MOCK" if _is_mock() else "AWS"
     scope = evidence.IAM_USER_POLICY_SCOPE
-    account_id = _source_account_id()
+    account_id = (
+        evidence.account_from_arn(_mock_identities()[0]["Arn"])
+        if _is_mock() else config.get_aws_account_id()
+    )
     with db.get_connection() as conn:
         # Register the RUNNING snapshot under the shared lock. If remediation is
         # already in its final AWS section, discovery waits until it commits.
@@ -317,6 +320,8 @@ def discover_identities(event, context):
     discovered_users = []
     observations = []
     try:
+        if not _is_mock() and _source_account_id() != account_id:
+            raise RuntimeError("AWS credentials do not match AWS_ACCOUNT_ID")
         # Do network pagination and policy retrieval without holding a database
         # transaction or the global inventory/remediation mutex.
         for user in _iter_identities():

@@ -45,7 +45,7 @@ GENAI_MODEL = os.getenv("GENAI_MODEL", "gemini-3.8-flash")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Schema/versioning
-SCHEMA_VERSION = "2026-10-p1-3"
+SCHEMA_VERSION = "2026-10-p1-7-review-fixes"
 
 
 # --- Runtime getters (avoid import-time freezing for Lambda) ---
@@ -90,6 +90,14 @@ def get_aws_region() -> str:
 
 def get_aws_profile() -> str | None:
     return os.getenv("AWS_PROFILE")
+
+
+def get_aws_account_id() -> str:
+    """Real IAM scans need a source key before their first AWS call."""
+    account_id = os.getenv("AWS_ACCOUNT_ID", "").strip()
+    if not re.fullmatch(r"\d{12}", account_id):
+        raise ValueError("AWS_ACCOUNT_ID must be a configured 12-digit account ID")
+    return account_id
 
 
 def get_genai_model() -> str:
