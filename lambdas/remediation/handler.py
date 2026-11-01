@@ -151,6 +151,7 @@ def _check_live_observation(binding: dict, observed: dict):
 def _eligible_path(conn, review_id: str, binding: dict, account_id: str) -> bool:
     if (binding["grant_type"] not in repo.REMEDIATION_ACTIONS
             or binding["evidence_status"] != "COMPLETE"
+            or not binding["principal_arn"]
             or binding["account_id"] != account_id):
         return False
     snapshot = repo.eligible_published_snapshot(
@@ -217,6 +218,32 @@ def _reconcile(conn, iam, review_id, binding, pending, claim_token,
     return "reconciliation_required"
 
 
+def _resolve_requested_reconciliation(conn, iam, review_id, binding, request,
+                                      claim_token, fencing_token, actor_id):
+    """Recheck a held action only after an operator request; never mutate IAM."""
+    request_id, hold_event_id = request
+    repo.lock_inventory_remediation(conn)
+    if not _renew(conn, review_id, claim_token, fencing_token):
+        _finish(conn, review_id, claim_token, fencing_token)
+        return "skipped"
+    try:
+        observed = _read_live_path(iam, binding)
+        outcome = "STILL_PRESENT" if observed["attachment_present"] else "VERIFIED_ABSENT"
+    except Exception as exc:
+        observed = {"read_error_type": type(exc).__name__}
+        if isinstance(exc, PreflightRejected):
+            observed["reason"] = str(exc)
+        outcome = "UNREADABLE"
+    repo.record_reconciliation_result(
+        conn, review_id, request_id, hold_event_id, outcome, actor_id,
+        binding, claim_token, fencing_token,
+        {"observation": observed, "principal_access_status": "not_evaluated"},
+    )
+    _finish(conn, review_id, claim_token, fencing_token,
+            remediated=outcome == "VERIFIED_ABSENT")
+    return "remediated" if outcome == "VERIFIED_ABSENT" else "reconciliation_required"
+
+
 def _process_review(review_id: str, account_id: str, actor_id: str,
                     allowlist: set) -> str:
     claim_token = None
@@ -225,12 +252,23 @@ def _process_review(review_id: str, account_id: str, actor_id: str,
     with db.get_connection() as conn:
         try:
             binding = repo.review_evidence_binding(conn, review_id)
-            if not binding or binding["grant_type"] not in repo.REMEDIATION_ACTIONS:
+            if (not binding or binding["grant_type"] not in repo.REMEDIATION_ACTIONS
+                    or binding["account_id"] != account_id):
                 return "skipped"
             pending = repo.pending_remediation_intent(conn, review_id)
-            if repo.remediation_reconciliation_required(conn, review_id):
+            held = repo.remediation_reconciliation_required(conn, review_id)
+            reconciliation_request = (
+                repo.pending_reconciliation_request(conn, review_id) if held else None
+            )
+            if held and not reconciliation_request:
                 return "reconciliation_required"
-            if not pending:
+            if reconciliation_request:
+                binding = repo.reconciliation_binding(
+                    conn, review_id, reconciliation_request[1]
+                )
+                if not binding:
+                    return "reconciliation_required"
+            if not pending and not held:
                 allowed, _ = _should_detach(
                     binding["policy_name"], binding["policy_id"], allowlist=allowlist
                 )
@@ -245,6 +283,12 @@ def _process_review(review_id: str, account_id: str, actor_id: str,
             if fencing_token is None:
                 return "skipped"
             conn.commit()
+            iam = _get_iam_client()
+            if reconciliation_request:
+                return _resolve_requested_reconciliation(
+                    conn, iam, review_id, binding, reconciliation_request,
+                    claim_token, fencing_token, actor_id,
+                )
             approval_event_id = (
                 pending[1] if pending else
                 repo.current_remediation_approval_event(conn, review_id)
@@ -252,7 +296,6 @@ def _process_review(review_id: str, account_id: str, actor_id: str,
             if not approval_event_id:
                 _finish(conn, review_id, claim_token, fencing_token)
                 return "skipped"
-            iam = _get_iam_client()
             if pending:
                 return _reconcile(
                     conn, iam, review_id, binding, pending, claim_token,
@@ -352,7 +395,7 @@ def _process_review(review_id: str, account_id: str, actor_id: str,
             conn.rollback()
             if claim_token and fencing_token is not None:
                 try:
-                    if not intent_recorded and not pending and binding:
+                    if not intent_recorded and not pending and not held and binding:
                         _event(conn, locals().get("attempt_id", str(uuid.uuid4())),
                                review_id, locals().get("approval_event_id"),
                                "PREFLIGHT_REJECTED", binding, claim_token, fencing_token,

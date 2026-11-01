@@ -259,6 +259,143 @@ def test_unverified_postflight_holds_action_for_reconciliation(
         ).fetchone() == (None,)
 
 
+def test_operator_recheck_resolves_hold_without_repeating_action(
+    prepared_review, monkeypatch, tmp_path
+):
+    from fastapi import HTTPException
+    import json
+
+    review_id = prepared_review()
+    fake = FakeIam(remains=True)
+    monkeypatch.setattr(remediation, "_get_iam_client", lambda: fake)
+    monkeypatch.setenv("REMEDIATION_OPERATOR_GROUP", "operators")
+    assert remediation.remediate_access(None, None)["reconciliation_required"] == 1
+    assert fake.actions == 1
+    with db.get_connection() as conn:
+        hold = repo.remediation_history(conn, review_id)["action_events"][-1]
+        with pytest.raises(sqlite3.IntegrityError, match="binding does not match"):
+            conn.execute(
+                """INSERT INTO remediation_reconciliation_events
+                (event_id,request_id,review_id,hold_event_id,event_type,event_sequence,
+                 actor_id,snapshot_id,grant_id,fencing_token,evidence_json,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (str(uuid.uuid4()), str(uuid.uuid4()), review_id, hold["event_id"],
+                 "VERIFIED_ABSENT", 2, "forged", hold["snapshot_id"],
+                 hold["grant_id"], 1, "{}", "2026-01-01"),
+            )
+    request = review_service.ExceptionRequest(reason="Investigated the uncertain result")
+    with pytest.raises(HTTPException) as denied:
+        review_service.request_remediation_reconciliation(
+            review_id, request, {"sub": "approver", "groups": ["approvers"]}
+        )
+    assert denied.value.status_code == 403
+    requested = review_service.request_remediation_reconciliation(
+        review_id, request, {"sub": "operator", "groups": ["operators"]}
+    )
+    with pytest.raises(HTTPException) as duplicate:
+        review_service.request_remediation_reconciliation(
+            review_id, request, {"sub": "operator", "groups": ["operators"]}
+        )
+    assert duplicate.value.status_code == 409
+    assert remediation.remediate_access(None, None)["reconciliation_required"] == 1
+    assert fake.actions == 1
+    with db.get_connection() as conn:
+        history = repo.remediation_history(conn, review_id)
+        assert [event["event_type"] for event in history["reconciliation_events"]] == [
+            "REQUESTED", "STILL_PRESENT"
+        ]
+        assert history["reconciliation_required"] is True
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("DELETE FROM remediation_reconciliation_events")
+    review_service.request_remediation_reconciliation(
+        review_id, request, {"sub": "operator", "groups": ["operators"]}
+    )
+    fake.present = False  # External investigation removed the exact attachment.
+    assert remediation.remediate_access(None, None)["remediated"] == 1
+    assert fake.actions == 1
+    with db.get_connection() as conn:
+        history = repo.remediation_history(conn, review_id)
+        assert history["reconciliation_required"] is False
+        assert history["reconciliation_events"][-1]["event_type"] == "VERIFIED_ABSENT"
+        assert history["reconciliation_events"][0]["request_id"] == requested["request_id"]
+        assert conn.execute(
+            "SELECT remediated_at FROM access_reviews WHERE review_id=?", (review_id,)
+        ).fetchone()[0]
+    monkeypatch.chdir(tmp_path)
+    result = export_audit_report()
+    record = json.loads((tmp_path / result["json"]).read_text(encoding="utf-8"))[0]
+    assert record["remediation_reconciliation_events"][-1]["event_type"] == "VERIFIED_ABSENT"
+    assert record["observed_principal_arn"] == _user()["Arn"]
+
+
+def test_operator_recheck_unreadable_keeps_hold(prepared_review, monkeypatch):
+    review_id = prepared_review("DIRECT_INLINE")
+    fake = FakeIam(inline=True, remains=True)
+    monkeypatch.setattr(remediation, "_get_iam_client", lambda: fake)
+    monkeypatch.setenv("REMEDIATION_OPERATOR_GROUP", "operators")
+    assert remediation.remediate_access(None, None)["reconciliation_required"] == 1
+    def unreadable(**kwargs):
+        raise RuntimeError("AWS read unavailable")
+    fake.get_user = unreadable
+    review_service.request_remediation_reconciliation(
+        review_id, review_service.ExceptionRequest(reason="Check uncertain inline deletion"),
+        {"sub": "operator", "groups": ["operators"]},
+    )
+    assert remediation.remediate_access(None, None)["reconciliation_required"] == 1
+    assert fake.actions == 1
+    with db.get_connection() as conn:
+        history = repo.remediation_history(conn, review_id)
+        assert history["reconciliation_events"][-1]["event_type"] == "UNREADABLE"
+        assert history["reconciliation_required"] is True
+        assert conn.execute(
+            "SELECT remediated_at FROM access_reviews WHERE review_id=?", (review_id,)
+        ).fetchone() == (None,)
+    fake.get_user = lambda **kwargs: {"User": {
+        "UserId": _user()["UserId"],
+        "Arn": "arn:aws:iam::210987654321:user/alice",
+    }}
+    review_service.request_remediation_reconciliation(
+        review_id, review_service.ExceptionRequest(reason="Check principal identity"),
+        {"sub": "operator", "groups": ["operators"]},
+    )
+    assert remediation.remediate_access(None, None)["reconciliation_required"] == 1
+    assert fake.actions == 1
+    with db.get_connection() as conn:
+        event = repo.remediation_history(conn, review_id)["reconciliation_events"][-1]
+        assert event["event_type"] == "UNREADABLE"
+        assert event["evidence"]["observation"]["reason"] == "principal_identity_changed"
+
+
+def test_pre_migration_hold_uses_immutable_preflight_identity(
+    prepared_review, monkeypatch
+):
+    review_id = prepared_review()
+    fake = FakeIam(remains=True)
+    monkeypatch.setattr(remediation, "_get_iam_client", lambda: fake)
+    monkeypatch.setenv("REMEDIATION_OPERATOR_GROUP", "operators")
+    assert remediation.remediate_access(None, None)["reconciliation_required"] == 1
+    # Simulate a row created before migration 0010, when the observation had no ARN.
+    with db.get_connection() as conn:
+        conn.execute("DROP TRIGGER immutable_grant_observations_update")
+        conn.execute(
+            """UPDATE grant_observations SET principal_arn=NULL
+            WHERE observation_id=(SELECT observation_id FROM access_reviews WHERE review_id=?)""",
+            (review_id,),
+        )
+    review_service.request_remediation_reconciliation(
+        review_id, review_service.ExceptionRequest(reason="Verify historical hold"),
+        {"sub": "operator", "groups": ["operators"]},
+    )
+    fake.present = False
+    assert remediation.remediate_access(None, None)["remediated"] == 1
+    assert fake.actions == 1
+    with db.get_connection() as conn:
+        assert repo.review_evidence_binding(conn, review_id)["principal_arn"] is None
+        assert repo.remediation_history(conn, review_id)["reconciliation_events"][-1][
+            "event_type"
+        ] == "VERIFIED_ABSENT"
+
+
 def test_live_action_requires_staging_acceptance_and_production_stays_closed(
     prepared_review, monkeypatch
 ):

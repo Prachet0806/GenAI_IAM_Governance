@@ -53,9 +53,9 @@ def export_audit_report():
         # Integrity: counts by status (index 5 per fetch_reviews_for_export contract)
         status_counts = {}
         for row in rows:
-            if len(row) != 40:
+            if len(row) != 42:
                 raise RuntimeError(
-                    f"Unexpected export row width {len(row)}; expected 40."
+                    f"Unexpected export row width {len(row)}; expected 42."
                 )
             status = row[5]
             status_counts[status] = status_counts.get(status, 0) + 1
@@ -105,6 +105,8 @@ def export_audit_report():
                     "Workflow Events",
                     "Remediation Approval Events",
                     "Remediation Action Events",
+                    "Observed Principal ARN",
+                    "Remediation Reconciliation Events",
                 ]
             )
             writer.writerows(rows)
@@ -154,6 +156,8 @@ def export_audit_report():
                 "workflow_events": json.loads(r[37]),
                 "remediation_approval_events": json.loads(r[38]),
                 "remediation_action_events": json.loads(r[39]),
+                "observed_principal_arn": r[40],
+                "remediation_reconciliation_events": json.loads(r[41]),
             }
             for r in rows
         ]

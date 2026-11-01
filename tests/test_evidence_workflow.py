@@ -57,10 +57,10 @@ def _policies(document=READ_POLICY):
     ]
 
 
-def _publish(account=ACCOUNT_A, policies=None, mode="AWS"):
+def _publish(account=ACCOUNT_A, policies=None, mode="AWS", user=None):
     run_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    user = _user(account)
+    user = user or _user(account)
     observations = [
         evidence.grant_observation(account, user, policy, run_id)
         for policy in (policies if policies is not None else _policies())
@@ -91,6 +91,72 @@ def _attempt(account, status=None):
         if status:
             repo.finish_discovery_run(conn, run_id, now, status, 0, 1, {"test": True})
     return run_id
+
+
+def test_observation_arn_tracks_rename_without_changing_grant_identity(sqlite_evidence_db):
+    first_snapshot, first = _publish(policies=_policies()[:1])
+    evaluate_risk(None, None)
+    first_campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
+    with db.get_connection() as conn:
+        first_review = conn.execute(
+            "SELECT review_id FROM access_reviews WHERE campaign_id=?",
+            (first_campaign["campaign_id"],),
+        ).fetchone()[0]
+        old_binding = repo.review_evidence_binding(conn, first_review)
+        conn.execute("UPDATE access_reviews SET status='APPROVED' WHERE review_id=?", (first_review,))
+    renamed = {**_user(), "UserName": "alice-renamed",
+               "Arn": f"arn:aws:iam::{ACCOUNT_A}:user/alice-renamed"}
+    second_snapshot, second = _publish(policies=_policies()[:1], user=renamed)
+    assert first_snapshot != second_snapshot
+    assert first[0]["grant_id"] == second[0]["grant_id"]
+    evaluate_risk(None, None)
+    second_campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
+    with db.get_connection() as conn:
+        second_review = conn.execute(
+            "SELECT review_id FROM access_reviews WHERE campaign_id=?",
+            (second_campaign["campaign_id"],),
+        ).fetchone()[0]
+        new_binding = repo.review_evidence_binding(conn, second_review)
+        assert repo.review_evidence_binding(conn, first_review)["principal_arn"] == old_binding["principal_arn"]
+        assert new_binding["principal_arn"] == renamed["Arn"]
+        assert new_binding["principal_name"] == renamed["UserName"]
+        assert conn.execute(
+            "SELECT principal_arn FROM grant_paths WHERE grant_id=?",
+            (first[0]["grant_id"],),
+        ).fetchone() == (old_binding["principal_arn"],)
+
+
+def test_pinned_review_identity_is_checked_and_frozen(sqlite_evidence_db):
+    snapshot, _ = _publish(policies=_policies()[:1])
+    evaluate_risk(None, None)
+    campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        review_id, grant_id, observation_id, risk_id = conn.execute(
+            "SELECT review_id,grant_id,observation_id,risk_assessment_id "
+            "FROM access_reviews WHERE campaign_id=?",
+            (campaign["campaign_id"],),
+        ).fetchone()
+        repo.insert_user(conn, "wrong-user", "wrong", f"arn:aws:iam::{ACCOUNT_A}:user/wrong", now)
+        repo.insert_role(conn, "wrong-policy", "wrong")
+        repo.create_pinned_campaign(conn, "identity-campaign", "identity", now, snapshot)
+        for user_id, role_id in (("wrong-user", POLICY_ARN),
+                                 (f"U-{ACCOUNT_A}", "wrong-policy")):
+            with pytest.raises(sqlite3.IntegrityError, match="does not match"):
+                conn.execute(
+                    """INSERT INTO access_reviews
+                    (review_id,campaign_id,user_id,role_id,status,snapshot_id,
+                     grant_id,observation_id,risk_assessment_id)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (str(uuid.uuid4()), "identity-campaign", user_id, role_id,
+                     "PENDING", snapshot, grant_id, observation_id, risk_id),
+                )
+        for column, value in (("user_id", "wrong-user"), ("role_id", "wrong-policy")):
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                conn.execute(
+                    f"UPDATE access_reviews SET {column}=? WHERE review_id=?",
+                    (value, review_id),
+                )
 
 
 def test_iam_enumeration_keeps_direct_and_two_group_paths():

@@ -250,13 +250,13 @@ def publish_discovery_snapshot(
         db.execute(
             conn.cursor(),
             """INSERT INTO grant_observations
-            (observation_id,snapshot_id,grant_id,principal_name,source_name,
+            (observation_id,snapshot_id,grant_id,principal_name,principal_arn,source_name,
              policy_name,policy_version,policy_sha256,policy_document,observed_at,
              evidence_status,missing_reason)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 item["observation_id"], run_id, item["grant_id"], item["principal_name"],
-                item["source_name"], item["policy_name"], item["policy_version"],
+                item["principal_arn"], item["source_name"], item["policy_name"], item["policy_version"],
                 item["policy_sha256"], item["policy_document"], item["observed_at"],
                 item.get("evidence_status", "COMPLETE"), item.get("missing_reason"),
             ),
@@ -485,7 +485,7 @@ def review_evidence_binding(conn, review_id: str):
         cur,
         """SELECT r.snapshot_id,r.grant_id,r.observation_id,r.risk_assessment_id,
         gp.account_id,ps.source_scope,gp.grant_type,gp.policy_id,
-        gp.principal_id,gp.principal_arn,gp.attachment_id,
+        gp.principal_id,go.principal_arn,gp.attachment_id,
         go.policy_sha256,go.policy_version,go.evidence_status,
         go.principal_name,go.policy_name
         FROM access_reviews r
@@ -501,7 +501,8 @@ def review_evidence_binding(conn, review_id: str):
             AND pra.policy_sha256=go.policy_sha256
         JOIN campaigns c ON c.campaign_id=r.campaign_id
             AND c.snapshot_id=r.snapshot_id
-        WHERE r.review_id=?""",
+        WHERE r.review_id=? AND r.user_id=gp.principal_id
+          AND r.role_id=gp.policy_id""",
         (review_id,),
     )
     row = cur.fetchone()
@@ -776,10 +777,134 @@ def pending_remediation_intent(conn, review_id: str):
 
 def remediation_reconciliation_required(conn, review_id: str) -> bool:
     cur = conn.cursor()
-    db.execute(cur, """SELECT 1 FROM remediation_action_events
-        WHERE review_id=? AND event_type='RECONCILIATION_REQUIRED' LIMIT 1""",
-        (review_id,))
+    db.execute(cur, """SELECT 1 FROM remediation_action_events hold
+        WHERE hold.review_id=? AND hold.event_type='RECONCILIATION_REQUIRED'
+          AND NOT EXISTS (
+              SELECT 1 FROM remediation_reconciliation_events result
+              WHERE result.hold_event_id=hold.event_id
+                AND result.event_type='VERIFIED_ABSENT'
+          ) LIMIT 1""", (review_id,))
     return cur.fetchone() is not None
+
+
+def pending_reconciliation_request(conn, review_id: str):
+    cur = conn.cursor()
+    db.execute(cur, """SELECT request.request_id,request.hold_event_id
+        FROM remediation_reconciliation_events request
+        JOIN remediation_action_events hold
+          ON hold.event_id=request.hold_event_id
+         AND hold.review_id=request.review_id
+         AND hold.event_type='RECONCILIATION_REQUIRED'
+        JOIN access_reviews r ON r.review_id=request.review_id
+        WHERE request.review_id=? AND request.event_type='REQUESTED'
+          AND r.status='REVOKED' AND r.remediated_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM remediation_reconciliation_events result
+              WHERE result.request_id=request.request_id
+                AND result.event_sequence=2
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM remediation_reconciliation_events done
+              WHERE done.hold_event_id=hold.event_id
+                AND done.event_type='VERIFIED_ABSENT'
+          )
+        ORDER BY request.created_at,request.event_id LIMIT 1""", (review_id,))
+    return cur.fetchone()
+
+
+def reconciliation_binding(conn, review_id: str, hold_event_id: str) -> dict | None:
+    """Use the frozen observation, or a verified preflight for pre-0010 holds."""
+    binding = review_evidence_binding(conn, review_id)
+    if not binding:
+        return None
+    cur = conn.cursor()
+    db.execute(cur, """SELECT passed.evidence_json FROM remediation_action_events hold
+        JOIN remediation_action_events passed
+          ON passed.attempt_id=hold.attempt_id
+         AND passed.event_type='PREFLIGHT_PASSED'
+        WHERE hold.event_id=? AND hold.review_id=?
+          AND hold.event_type='RECONCILIATION_REQUIRED'
+          AND hold.snapshot_id=? AND hold.grant_id=?""",
+        (hold_event_id, review_id, binding["snapshot_id"], binding["grant_id"]))
+    row = cur.fetchone()
+    if not row:
+        return None
+    preflight = json.loads(row[0]).get("preflight", {})
+    verified_arn = preflight.get("principal_arn")
+    if (preflight.get("principal_id") != binding["principal_id"]
+            or not verified_arn
+            or f"::{binding['account_id']}:" not in verified_arn
+            or (binding["principal_arn"] and verified_arn != binding["principal_arn"])):
+        return None
+    return {**binding, "principal_arn": verified_arn}
+
+
+def request_remediation_reconciliation(conn, review_id: str, actor_sub: str,
+                                       reason: str) -> str | None:
+    """Request an exact-path read-only AWS recheck; caller holds publication lock."""
+    if pending_reconciliation_request(conn, review_id):
+        return None
+    binding = review_evidence_binding(conn, review_id)
+    if not binding:
+        return None
+    cur = conn.cursor()
+    db.execute(cur, """SELECT hold.event_id FROM remediation_action_events hold
+        JOIN access_reviews r ON r.review_id=hold.review_id
+        WHERE hold.review_id=? AND hold.event_type='RECONCILIATION_REQUIRED'
+          AND r.status='REVOKED' AND r.remediated_at IS NULL
+          AND hold.snapshot_id=? AND hold.grant_id=?
+          AND NOT EXISTS (
+              SELECT 1 FROM remediation_reconciliation_events done
+              WHERE done.hold_event_id=hold.event_id
+                AND done.event_type='VERIFIED_ABSENT'
+          ) ORDER BY hold.created_at DESC,hold.event_id DESC LIMIT 1""",
+        (review_id, binding["snapshot_id"], binding["grant_id"]))
+    hold = cur.fetchone()
+    if not hold:
+        return None
+    binding = reconciliation_binding(conn, review_id, hold[0])
+    if not binding:
+        return None
+    request_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    db.execute(conn.cursor(), """INSERT INTO remediation_reconciliation_events
+        (event_id,request_id,review_id,hold_event_id,event_type,event_sequence,
+         actor_id,snapshot_id,grant_id,fencing_token,evidence_json,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (str(uuid.uuid4()), request_id, review_id, hold[0], "REQUESTED", 1,
+         actor_sub, binding["snapshot_id"], binding["grant_id"], None,
+         evidence.canonical_json({"reason": reason}), now))
+    return request_id
+
+
+def record_reconciliation_result(conn, review_id: str, request_id: str,
+                                 hold_event_id: str, event_type: str,
+                                 actor_id: str, binding: dict,
+                                 claim_token: str, fencing_token: int,
+                                 evidence_data: dict) -> str:
+    if event_type not in {"VERIFIED_ABSENT", "STILL_PRESENT", "UNREADABLE"}:
+        raise ValueError("Invalid reconciliation result")
+    event_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.cursor()
+    db.execute(cur, """INSERT INTO remediation_reconciliation_events
+        (event_id,request_id,review_id,hold_event_id,event_type,event_sequence,
+         actor_id,snapshot_id,grant_id,fencing_token,evidence_json,created_at)
+        SELECT ?,?,?,?,?,2,?,?,?,?,?,? FROM remediation_claims c
+        JOIN remediation_reconciliation_events request
+          ON request.request_id=? AND request.event_sequence=1
+         AND request.review_id=c.review_id AND request.hold_event_id=?
+        WHERE c.review_id=? AND c.claim_token=? AND c.fencing_token=?
+          AND c.lease_expires_at>?
+          AND NOT EXISTS (SELECT 1 FROM remediation_reconciliation_events result
+              WHERE result.request_id=request.request_id AND result.event_sequence=2)""",
+        (event_id, request_id, review_id, hold_event_id, event_type,
+         actor_id, binding["snapshot_id"], binding["grant_id"], fencing_token,
+         evidence.canonical_json(evidence_data), now,
+         request_id, hold_event_id, review_id, claim_token, fencing_token, now))
+    if cur.rowcount != 1:
+        raise RuntimeError("Reconciliation result requires pending request and current worker lease")
+    return event_id
 
 
 def remediation_history(conn, review_id: str) -> dict:
@@ -810,7 +935,23 @@ def remediation_history(conn, review_id: str) -> dict:
         item["evidence"] = json.loads(item["evidence"])
         item["created_at"] = str(item["created_at"])
         actions.append(item)
+    db.execute(cur, """SELECT event_id,request_id,hold_event_id,event_type,
+               event_sequence,actor_id,snapshot_id,grant_id,fencing_token,
+               evidence_json,created_at
+        FROM remediation_reconciliation_events WHERE review_id=?
+        ORDER BY created_at,event_sequence,event_id""", (review_id,))
+    reconciliations = []
+    for row in cur.fetchall():
+        item = dict(zip((
+            "event_id", "request_id", "hold_event_id", "event_type",
+            "event_sequence", "actor_id", "snapshot_id", "grant_id",
+            "fencing_token", "evidence", "created_at",
+        ), row))
+        item["evidence"] = json.loads(item["evidence"])
+        item["created_at"] = str(item["created_at"])
+        reconciliations.append(item)
     return {"approval_events": approvals, "action_events": actions,
+            "reconciliation_events": reconciliations,
             "reconciliation_required": remediation_reconciliation_required(conn, review_id)}
 
 
@@ -1315,6 +1456,8 @@ def fetch_reviews_for_export(conn) -> list[tuple[Any, ...]]:
             json.dumps(workflow_events, sort_keys=True),
             json.dumps(remediation["approval_events"], sort_keys=True),
             json.dumps(remediation["action_events"], sort_keys=True),
+            (review_evidence_binding(conn, row[0]) or {}).get("principal_arn"),
+            json.dumps(remediation["reconciliation_events"], sort_keys=True),
         ))
         results.append(tuple(row))
     return results

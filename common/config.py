@@ -45,7 +45,7 @@ GENAI_MODEL = os.getenv("GENAI_MODEL", "gemini-3.8-flash")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Schema/versioning
-SCHEMA_VERSION = "2026-11-p8-remediation-evidence"
+SCHEMA_VERSION = "2026-11-observation-identity-reconciliation"
 
 
 # --- Runtime getters (avoid import-time freezing for Lambda) ---

@@ -93,6 +93,15 @@ def require_campaign_admin(claims: dict):
         )
 
 
+def require_remediation_operator(claims: dict):
+    try:
+        auth.require_group(claims, os.getenv("REMEDIATION_OPERATOR_GROUP", ""))
+    except auth.AuthorizationError:
+        raise HTTPException(
+            status_code=403, detail="Remediation operator group membership required"
+        )
+
+
 def require_review_assignment(conn, review_id: str, campaign_id: str, reviewer_sub: str):
     require_campaign_assignment(conn, campaign_id, reviewer_sub)
     item = workflow.review_workflow(conn, review_id)
@@ -548,7 +557,8 @@ def approve_remediation(
         repo.lock_inventory_remediation(conn)
         binding = repo.review_evidence_binding(conn, review_id)
         if (not binding or binding["grant_type"] not in repo.REMEDIATION_ACTIONS
-                or binding["evidence_status"] != "COMPLETE"):
+                or binding["evidence_status"] != "COMPLETE"
+                or not binding["principal_arn"]):
             raise HTTPException(
                 status_code=409,
                 detail="Only complete, snapshot-pinned direct user policy paths support remediation",
@@ -626,8 +636,39 @@ def get_remediation_history(review_id: str, claims: dict = Depends(current_revie
             try:
                 auth.require_group(claims, os.getenv("REMEDIATION_APPROVER_GROUP", ""))
             except auth.AuthorizationError:
-                require_reviewer_group(claims)
-                require_review_assignment(conn, review_id, review[1], claims["sub"])
+                try:
+                    require_remediation_operator(claims)
+                except HTTPException:
+                    require_reviewer_group(claims)
+                    require_review_assignment(conn, review_id, review[1], claims["sub"])
         history = repo.remediation_history(conn, review_id)
         return {"review_id": review_id, "principal_access_status": "not_evaluated",
                 **history}
+
+
+@app.post("/reviews/{review_id}/remediation/reconciliation", status_code=202)
+def request_remediation_reconciliation(
+    review_id: str, request: ExceptionRequest,
+    claims: dict = Depends(current_reviewer),
+):
+    require_remediation_operator(claims)
+    reason = _nonblank(request.reason, "reason")
+    with db.get_connection() as conn:
+        if not repo.fetch_review_for_decision(conn, review_id):
+            raise HTTPException(status_code=404, detail="Review not found")
+        repo.lock_inventory_remediation(conn)
+        request_id = repo.request_remediation_reconciliation(
+            conn, review_id, claims["sub"], reason,
+        )
+        if not request_id:
+            raise HTTPException(
+                status_code=409, detail="No eligible unresolved hold or a recheck is pending"
+            )
+        repo.insert_audit_log(
+            conn, str(uuid.uuid4()), datetime.now(timezone.utc), "INFO",
+            "remediation_reconciliation_request", "requested",
+            "Operator requested a read-only exact-path AWS recheck",
+            entity_type="access_review", entity_id=review_id,
+            details={"operator_sub": claims["sub"], "request_id": request_id},
+        )
+    return {"review_id": review_id, "request_id": request_id, "status": "requested"}
