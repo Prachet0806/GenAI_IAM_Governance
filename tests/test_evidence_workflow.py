@@ -269,6 +269,7 @@ def test_failed_and_superseded_attempts_preserve_publication_but_block_eligibili
 def test_direct_path_remediation_does_not_claim_group_access_removed(
     sqlite_evidence_db, monkeypatch
 ):
+    from fastapi import Response
     from api import review_service
     from lambdas.remediation import handler as remediation
 
@@ -290,11 +291,11 @@ def test_direct_path_remediation_does_not_claim_group_access_removed(
         review_service.DecisionRequest(decision="REVOKED", comment="remove direct grant"),
         {"sub": "reviewer", "groups": ["reviewers"]},
     )
+    monkeypatch.setenv("REMEDIATION_APPROVER_GROUP", "approvers")
+    review_service.approve_remediation(
+        direct_review, Response(), {"sub": "approver", "groups": ["approvers"]}
+    )
     with db.get_connection() as conn:
-        repo.record_remediation_approval(
-            conn, str(uuid.uuid4()), direct_review, "approver",
-            datetime.now(timezone.utc).isoformat(), snapshot_id,
-        )
         assert repo.is_remediation_approved(conn, direct_review, snapshot_id)
 
     class FakeIam:
@@ -316,6 +317,12 @@ def test_direct_path_remediation_does_not_claim_group_access_removed(
             self.detaches += 1
             self.attached = False
 
+        def get_policy(self, **kwargs):
+            return {"Policy": {"DefaultVersionId": "v1"}}
+
+        def get_policy_version(self, **kwargs):
+            return {"PolicyVersion": {"Document": READ_POLICY}}
+
     fake = FakeIam()
     monkeypatch.setattr(remediation, "_get_iam_client", lambda: fake)
     monkeypatch.setenv("MOCK_IAM", "false")
@@ -323,7 +330,9 @@ def test_direct_path_remediation_does_not_claim_group_access_removed(
     monkeypatch.setenv("ENABLE_REMEDIATION", "true")
     monkeypatch.setenv("ALLOW_LIVE_REMEDIATION", "true")
     monkeypatch.setenv("REMEDIATION_ALLOWLIST", "Reader")
-    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("APP_ENV", "staging")
+    monkeypatch.setenv("AWS_ACCOUNT_ID", ACCOUNT_A)
+    monkeypatch.setenv("STAGING_REMEDIATION_ACCEPTANCE_ID", "test-acceptance")
     outcome = remediation.remediate_access(None, None)
     assert outcome["remediated"] == 1
     assert fake.detaches == 1
@@ -407,7 +416,9 @@ def test_approval_and_live_gate_are_source_specific(sqlite_evidence_db, monkeypa
     monkeypatch.setenv("ENABLE_REMEDIATION", "true")
     monkeypatch.setenv("ALLOW_LIVE_REMEDIATION", "true")
     monkeypatch.setenv("REMEDIATION_ALLOWLIST", "Reader")
-    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("APP_ENV", "staging")
+    monkeypatch.setenv("AWS_ACCOUNT_ID", ACCOUNT_A)
+    monkeypatch.setenv("STAGING_REMEDIATION_ACCEPTANCE_ID", "test-acceptance")
     monkeypatch.setattr(
         remediation, "_get_iam_client",
         lambda: pytest.fail("AWS must not be called after a failed source scan"),

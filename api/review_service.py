@@ -539,17 +539,19 @@ def approve_remediation(
                 status_code=403,
                 detail="The reviewer cannot approve their own remediation",
             )
-        if not repo.has_authenticated_revocation(conn, review_id):
+        decision_event_id = repo.authenticated_revocation_event(conn, review_id)
+        if not decision_event_id:
             raise HTTPException(
                 status_code=409,
                 detail="An authenticated, snapshot-bound revocation decision is required",
             )
         repo.lock_inventory_remediation(conn)
         binding = repo.review_evidence_binding(conn, review_id)
-        if not binding or binding["grant_type"] != "DIRECT_MANAGED":
+        if (not binding or binding["grant_type"] not in repo.REMEDIATION_ACTIONS
+                or binding["evidence_status"] != "COMPLETE"):
             raise HTTPException(
                 status_code=409,
-                detail="Only snapshot-pinned direct managed grant paths support live remediation",
+                detail="Only complete, snapshot-pinned direct user policy paths support remediation",
             )
         snapshot = repo.eligible_published_snapshot(
             conn, binding["account_id"], binding["source_scope"], require_aws=True
@@ -565,9 +567,10 @@ def approve_remediation(
             )
         previous = repo.get_remediation_approval(conn, review_id)
         now = datetime.now(timezone.utc)
+        approval_id = str(uuid.uuid4())
         created = repo.record_remediation_approval(
             conn,
-            str(uuid.uuid4()),
+            approval_id,
             review_id,
             claims["sub"],
             now.isoformat(),
@@ -581,6 +584,10 @@ def approve_remediation(
         renewed = previous is not None
         response.status_code = 200 if renewed else 201
         status = "renewed" if renewed else "approved"
+        approval_event_id = repo.record_remediation_approval_event(
+            conn, approval_id, review_id, decision_event_id, claims["sub"],
+            now.isoformat(), "RENEWED" if renewed else "APPROVED", binding,
+        )
         repo.insert_audit_log(
             conn,
             str(uuid.uuid4()),
@@ -596,9 +603,31 @@ def approve_remediation(
                 "reviewer_sub": review[5],
                 "snapshot_id": binding["snapshot_id"],
                 "grant_id": binding["grant_id"],
+                "approval_event_id": approval_event_id,
                 "renewed": renewed,
             },
         )
     return {"review_id": review_id, "status": status,
             "snapshot_id": binding["snapshot_id"],
-            "discovery_run_id": binding["snapshot_id"]}
+            "discovery_run_id": binding["snapshot_id"],
+            "approval_event_id": approval_event_id,
+            "action_type": repo.REMEDIATION_ACTIONS[binding["grant_type"]]}
+
+
+@app.get("/reviews/{review_id}/remediation")
+def get_remediation_history(review_id: str, claims: dict = Depends(current_reviewer)):
+    with db.get_connection() as conn:
+        review = repo.fetch_review_for_decision(conn, review_id)
+        if not review:
+            raise HTTPException(status_code=404, detail="Review not found")
+        try:
+            require_campaign_admin(claims)
+        except HTTPException:
+            try:
+                auth.require_group(claims, os.getenv("REMEDIATION_APPROVER_GROUP", ""))
+            except auth.AuthorizationError:
+                require_reviewer_group(claims)
+                require_review_assignment(conn, review_id, review[1], claims["sub"])
+        history = repo.remediation_history(conn, review_id)
+        return {"review_id": review_id, "principal_access_status": "not_evaluated",
+                **history}

@@ -40,7 +40,7 @@ def test_sqlite_fresh_install_and_rerun(tmp_path, monkeypatch):
     migrate.apply_sqlite()
     migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
         assert conn.execute("SELECT COUNT(*) FROM governance_mutex").fetchone()[0] == 1
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -64,7 +64,7 @@ def test_sqlite_legacy_upgrade_preserves_data(tmp_path, monkeypatch):
             assert column in {
                 row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')
             }
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
 
 
 def test_sqlite_upgrade_from_committed_pr1_ledger(tmp_path, monkeypatch):
@@ -81,7 +81,7 @@ def test_sqlite_upgrade_from_committed_pr1_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", source)
     migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (8,)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (9,)
         assert conn.execute("SELECT role_name FROM roles WHERE role_id='R1'").fetchone() == ("Reader",)
 
 
@@ -111,7 +111,7 @@ def test_sqlite_upgrade_from_pr3_with_existing_grant_evidence(tmp_path, monkeypa
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert conn.execute("SELECT grant_type FROM grant_paths WHERE grant_id='G1'").fetchone() == ("DIRECT_MANAGED",)
         assert conn.execute("SELECT evidence_status FROM grant_observations WHERE observation_id='O1'").fetchone() == ("COMPLETE",)
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (8,)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (9,)
 
 
 def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeypatch):
@@ -120,7 +120,7 @@ def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeyp
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", files)
     path = tmp_path / "rollback.db"
     _set_sqlite(monkeypatch, path)
-    (files / "0009_bad.sql").write_text(
+    (files / "0010_bad.sql").write_text(
         "CREATE TABLE should_rollback (id INTEGER); INSERT INTO absent VALUES (1);",
         encoding="utf-8",
     )
@@ -128,7 +128,7 @@ def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeyp
         migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
-    (files / "0009_bad.sql").unlink()
+    (files / "0010_bad.sql").unlink()
     migrate.apply_sqlite()
     baseline = files / "0001_baseline.sql"
     baseline.write_text(
@@ -182,6 +182,7 @@ def test_postgres_fresh_install_and_concurrent_migration(postgres_schema):
             ("0006_ai_artifacts", 64),
             ("0007_decision_origin", 64),
             ("0008_ai_job_recovery", 64),
+            ("0009_remediation_evidence", 64),
         ]
         cur.execute("SELECT COUNT(*) FROM governance_mutex")
         assert cur.fetchone() == (1,)
@@ -237,7 +238,7 @@ def test_postgres_upgrade_from_committed_pr1_ledger(postgres_schema, tmp_path, m
     migrate.apply_postgres()
     with psycopg2.connect(postgres_schema) as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM schema_migrations")
-        assert cur.fetchone() == (8,)
+        assert cur.fetchone() == (9,)
         cur.execute("SELECT role_name FROM roles WHERE role_id='R1'")
         assert cur.fetchone() == ("Reader",)
 
@@ -417,3 +418,64 @@ def test_postgres_role_identity_center_and_campaign_workflow(postgres_schema):
         assert workflow.set_exception(conn, review_id, "RESOLVED", "admin", "Done") == "updated"
         assert workflow.change_campaign_state(conn, campaign["campaign_id"], "PAUSED", "admin") == "updated"
         assert workflow.queue(conn, "reviewer") == []
+
+
+def test_postgres_remediation_approval_events_and_worker_contention(
+    postgres_schema, monkeypatch
+):
+    """Only one concurrent worker acts; evidence is immutable on Postgres."""
+    import psycopg2
+    from fastapi import Response
+
+    from api import review_service
+    from common import repo
+    from common.db import db
+    from lambdas.generate_reviews.handler import generate_campaign
+    from lambdas.remediation import handler as remediation
+    from lambdas.risk_evaluation.handler import evaluate_risk
+    from tests.test_evidence_workflow import ACCOUNT_A, _policies, _publish
+    from tests.test_remediation_workflow import FakeIam
+
+    migrate.apply_postgres()
+    _publish(policies=_policies()[:1])
+    evaluate_risk(None, None)
+    campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT review_id FROM access_reviews WHERE campaign_id=%s",
+                    (campaign["campaign_id"],))
+        review_id = cur.fetchone()[0]
+        repo.assign_campaign_reviewer(conn, campaign["campaign_id"], "reviewer", "admin")
+    monkeypatch.setenv("REVIEWER_GROUP", "reviewers")
+    monkeypatch.setenv("REMEDIATION_APPROVER_GROUP", "approvers")
+    review_service.decide_review(
+        review_id,
+        review_service.DecisionRequest(decision="REVOKED", comment="remove path"),
+        {"sub": "reviewer", "groups": ["reviewers"]},
+    )
+    review_service.approve_remediation(
+        review_id, Response(), {"sub": "approver", "groups": ["approvers"]}
+    )
+    monkeypatch.setenv("MOCK_IAM", "false")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("ENABLE_REMEDIATION", "true")
+    monkeypatch.setenv("ALLOW_LIVE_REMEDIATION", "true")
+    monkeypatch.setenv("REMEDIATION_ALLOWLIST", "Reader")
+    monkeypatch.setenv("AWS_ACCOUNT_ID", ACCOUNT_A)
+    monkeypatch.setenv("STAGING_REMEDIATION_ACCEPTANCE_ID", "pg-test-acceptance")
+    monkeypatch.setenv("APP_ENV", "staging")
+    fake = FakeIam()
+    monkeypatch.setattr(remediation, "_get_iam_client", lambda: fake)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda _: remediation.remediate_access(None, None), (1, 2)
+        ))
+    assert fake.actions == 1
+    assert sum(item["remediated"] for item in results) == 1
+    with db.get_connection() as conn:
+        history = repo.remediation_history(conn, review_id)
+        assert [item["event_type"] for item in history["action_events"]] == [
+            "PREFLIGHT_PASSED", "ACTION_REQUESTED", "ACTION_VERIFIED"
+        ]
+        with pytest.raises(psycopg2.errors.RaiseException):
+            db.execute(conn.cursor(), "DELETE FROM remediation_approval_events")

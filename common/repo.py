@@ -1,11 +1,22 @@
 # common/repo.py
 import hashlib
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from common import config, evidence
 from common.db import db
+
+REMEDIATION_ACTIONS = {
+    "DIRECT_MANAGED": "DETACH_USER_MANAGED_POLICY",
+    "DIRECT_INLINE": "DELETE_USER_INLINE_POLICY",
+}
+REMEDIATION_EVENT_SEQUENCE = {
+    "PREFLIGHT_PASSED": 1, "PREFLIGHT_REJECTED": 1,
+    "ALREADY_ABSENT": 2, "ACTION_REQUESTED": 2,
+    "ACTION_VERIFIED": 3, "RECONCILIATION_REQUIRED": 3, "ABORTED": 3,
+}
 
 
 # Users / roles / user_roles
@@ -474,7 +485,9 @@ def review_evidence_binding(conn, review_id: str):
         cur,
         """SELECT r.snapshot_id,r.grant_id,r.observation_id,r.risk_assessment_id,
         gp.account_id,ps.source_scope,gp.grant_type,gp.policy_id,
-        gp.principal_id,gp.principal_arn
+        gp.principal_id,gp.principal_arn,gp.attachment_id,
+        go.policy_sha256,go.policy_version,go.evidence_status,
+        go.principal_name,go.policy_name
         FROM access_reviews r
         JOIN grant_paths gp ON gp.grant_id=r.grant_id
         JOIN published_snapshots ps ON ps.snapshot_id=r.snapshot_id
@@ -499,6 +512,9 @@ def review_evidence_binding(conn, review_id: str):
         "risk_assessment_id": row[3], "account_id": row[4],
         "source_scope": row[5], "grant_type": row[6], "policy_id": row[7],
         "principal_id": row[8], "principal_arn": row[9],
+        "attachment_id": row[10], "policy_sha256": row[11],
+        "policy_version": row[12], "evidence_status": row[13],
+        "principal_name": row[14], "policy_name": row[15],
     }
 
 
@@ -633,17 +649,23 @@ def get_remediation_approval(conn, review_id: str):
     return cur.fetchone()
 
 
-def has_authenticated_revocation(conn, review_id: str) -> bool:
+def authenticated_revocation_event(conn, review_id: str) -> str | None:
     cur = conn.cursor()
-    db.execute(cur, """SELECT 1 FROM access_reviews r
+    db.execute(cur, """SELECT e.event_id FROM access_reviews r
         JOIN review_decision_events e ON e.review_id=r.review_id
         WHERE r.review_id=? AND r.status='REVOKED'
           AND e.decision='REVOKED' AND e.decision_origin='OIDC_API'
           AND e.reviewer_sub=r.reviewer_sub
           AND e.snapshot_id=r.snapshot_id AND e.grant_id=r.grant_id
           AND e.observation_id=r.observation_id
-          AND e.risk_assessment_id=r.risk_assessment_id""", (review_id,))
-    return cur.fetchone() is not None
+          AND e.risk_assessment_id=r.risk_assessment_id
+        ORDER BY e.decided_at DESC,e.event_id DESC LIMIT 1""", (review_id,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def has_authenticated_revocation(conn, review_id: str) -> bool:
+    return authenticated_revocation_event(conn, review_id) is not None
 
 
 def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool:
@@ -657,8 +679,21 @@ def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool
           AND r.observation_id IS NOT NULL AND r.risk_assessment_id IS NOT NULL
           AND a.approver_sub <> r.reviewer_sub AND a.discovery_run_id=?
           AND EXISTS (
-              SELECT 1 FROM review_decision_events e
-              WHERE e.review_id=r.review_id AND e.decision='REVOKED'
+              SELECT 1 FROM remediation_approval_events ae
+              JOIN review_decision_events e ON e.event_id=ae.decision_event_id
+              JOIN grant_paths gp ON gp.grant_id=r.grant_id
+              WHERE ae.approval_id=a.approval_id AND ae.review_id=r.review_id
+                AND ae.approver_sub=a.approver_sub
+                AND ae.approved_at=a.approved_at
+                AND ae.snapshot_id=r.snapshot_id AND ae.grant_id=r.grant_id
+                AND ae.observation_id=r.observation_id
+                AND ae.risk_assessment_id=r.risk_assessment_id
+                AND ae.grant_type=gp.grant_type
+                AND ae.action_type=CASE gp.grant_type
+                    WHEN 'DIRECT_MANAGED' THEN 'DETACH_USER_MANAGED_POLICY'
+                    WHEN 'DIRECT_INLINE' THEN 'DELETE_USER_INLINE_POLICY'
+                    ELSE '' END
+                AND e.review_id=r.review_id AND e.decision='REVOKED'
                 AND e.reviewer_sub=r.reviewer_sub AND e.decision_origin='OIDC_API'
                 AND e.snapshot_id=r.snapshot_id AND e.grant_id=r.grant_id
                 AND e.observation_id=r.observation_id
@@ -667,6 +702,116 @@ def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool
         (review_id, discovery_run_id, discovery_run_id),
     )
     return cur.fetchone() is not None
+
+
+def record_remediation_approval_event(
+    conn, approval_id: str, review_id: str, decision_event_id: str,
+    approver_sub: str, approved_at: str, event_type: str, binding: dict,
+) -> str:
+    action_type = REMEDIATION_ACTIONS[binding["grant_type"]]
+    event_id = str(uuid.uuid4())
+    db.execute(conn.cursor(), """INSERT INTO remediation_approval_events
+        (event_id,approval_id,review_id,decision_event_id,event_type,
+         approver_sub,approved_at,snapshot_id,grant_id,observation_id,
+         risk_assessment_id,grant_type,action_type)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (event_id, approval_id, review_id, decision_event_id, event_type,
+         approver_sub, approved_at, binding["snapshot_id"], binding["grant_id"],
+         binding["observation_id"], binding["risk_assessment_id"],
+         binding["grant_type"], action_type))
+    return event_id
+
+
+def current_remediation_approval_event(conn, review_id: str) -> str | None:
+    cur = conn.cursor()
+    db.execute(cur, """SELECT ae.event_id FROM remediation_approval_events ae
+        JOIN remediation_approvals a ON a.approval_id=ae.approval_id
+        WHERE a.review_id=? AND ae.review_id=a.review_id
+          AND ae.approver_sub=a.approver_sub AND ae.approved_at=a.approved_at""",
+        (review_id,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def record_remediation_action_event(
+    conn, *, attempt_id: str, review_id: str, approval_event_id: str | None,
+    event_type: str, action_type: str, actor_id: str, binding: dict,
+    claim_token: str, fencing_token: int, evidence_data: dict,
+) -> str:
+    event_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.cursor()
+    db.execute(cur, """INSERT INTO remediation_action_events
+        (event_id,attempt_id,review_id,approval_event_id,event_type,event_sequence,
+         action_type,actor_id,snapshot_id,grant_id,fencing_token,
+         evidence_json,created_at)
+        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? FROM remediation_claims c
+        WHERE c.review_id=? AND c.claim_token=? AND c.fencing_token=?
+          AND c.lease_expires_at>?""",
+        (event_id, attempt_id, review_id, approval_event_id, event_type,
+         REMEDIATION_EVENT_SEQUENCE[event_type],
+         action_type, actor_id, binding["snapshot_id"], binding["grant_id"],
+         fencing_token, evidence.canonical_json(evidence_data), now,
+         review_id, claim_token, fencing_token, now))
+    if cur.rowcount != 1:
+        raise RuntimeError("Remediation action event requires the current worker lease")
+    return event_id
+
+
+def pending_remediation_intent(conn, review_id: str):
+    cur = conn.cursor()
+    db.execute(cur, """SELECT request.attempt_id,request.approval_event_id,
+                  request.action_type,request.fencing_token
+        FROM remediation_action_events request
+        WHERE request.review_id=? AND request.event_type='ACTION_REQUESTED'
+          AND NOT EXISTS (
+              SELECT 1 FROM remediation_action_events terminal
+              WHERE terminal.attempt_id=request.attempt_id
+                AND terminal.event_type IN (
+                    'ACTION_VERIFIED','RECONCILIATION_REQUIRED','ABORTED'
+                )
+          ) ORDER BY request.created_at,request.event_id LIMIT 1""", (review_id,))
+    return cur.fetchone()
+
+
+def remediation_reconciliation_required(conn, review_id: str) -> bool:
+    cur = conn.cursor()
+    db.execute(cur, """SELECT 1 FROM remediation_action_events
+        WHERE review_id=? AND event_type='RECONCILIATION_REQUIRED' LIMIT 1""",
+        (review_id,))
+    return cur.fetchone() is not None
+
+
+def remediation_history(conn, review_id: str) -> dict:
+    cur = conn.cursor()
+    db.execute(cur, """SELECT event_id,approval_id,decision_event_id,event_type,
+               approver_sub,approved_at,snapshot_id,grant_id,observation_id,
+               risk_assessment_id,grant_type,action_type
+        FROM remediation_approval_events WHERE review_id=?
+        ORDER BY approved_at,event_id""", (review_id,))
+    approvals = [dict(zip((
+        "event_id", "approval_id", "decision_event_id", "event_type",
+        "approver_sub", "approved_at", "snapshot_id", "grant_id",
+        "observation_id", "risk_assessment_id", "grant_type", "action_type",
+    ), (str(x) if isinstance(x, datetime) else x for x in row)))
+        for row in cur.fetchall()]
+    db.execute(cur, """SELECT event_id,attempt_id,approval_event_id,event_type,
+               event_sequence,action_type,actor_id,snapshot_id,grant_id,fencing_token,
+               evidence_json,created_at
+        FROM remediation_action_events WHERE review_id=?
+        ORDER BY created_at,event_sequence,event_id""", (review_id,))
+    actions = []
+    for row in cur.fetchall():
+        item = dict(zip((
+            "event_id", "attempt_id", "approval_event_id", "event_type",
+            "event_sequence", "action_type", "actor_id", "snapshot_id", "grant_id",
+            "fencing_token", "evidence", "created_at",
+        ), row))
+        item["evidence"] = json.loads(item["evidence"])
+        item["created_at"] = str(item["created_at"])
+        actions.append(item)
+    return {"approval_events": approvals, "action_events": actions,
+            "reconciliation_required": remediation_reconciliation_required(conn, review_id)}
 
 
 def claim_remediation(
@@ -722,6 +867,20 @@ def release_remediation_claim(
         WHERE review_id=? AND claim_token=? AND fencing_token=?""",
         (released_at, review_id, claim_token, fencing_token),
     )
+
+
+def mark_remediated_if_claim_owned(
+    conn, review_id: str, claim_token: str, fencing_token: int, now: str,
+) -> bool:
+    cur = conn.cursor()
+    db.execute(cur, """UPDATE access_reviews SET remediated_at=?
+        WHERE review_id=? AND status='REVOKED' AND remediated_at IS NULL
+          AND EXISTS (SELECT 1 FROM remediation_claims c
+              WHERE c.review_id=access_reviews.review_id
+                AND c.claim_token=? AND c.fencing_token=?
+                AND c.lease_expires_at>?)""",
+        (now, review_id, claim_token, fencing_token, now))
+    return cur.rowcount == 1
 
 
 def lock_inventory_remediation(conn):
@@ -1147,12 +1306,15 @@ def fetch_reviews_for_export(conn) -> list[tuple[Any, ...]]:
             for event_id, kind, actor, created_at, previous, new, details
             in event_cur.fetchall()
         ]
+        remediation = remediation_history(conn, row[0])
         row.extend((
             ai.get("authority"), ai.get("artifact_id"), ai.get("output_sha256"),
             json.dumps(ai.get("citations"), sort_keys=True),
             ai.get("validated_artifact", False),
             json.dumps(decision_events, sort_keys=True),
             json.dumps(workflow_events, sort_keys=True),
+            json.dumps(remediation["approval_events"], sort_keys=True),
+            json.dumps(remediation["action_events"], sort_keys=True),
         ))
         results.append(tuple(row))
     return results

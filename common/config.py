@@ -45,7 +45,7 @@ GENAI_MODEL = os.getenv("GENAI_MODEL", "gemini-3.8-flash")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Schema/versioning
-SCHEMA_VERSION = "2026-10-p1-7-review-fixes"
+SCHEMA_VERSION = "2026-11-p8-remediation-evidence"
 
 
 # --- Runtime getters (avoid import-time freezing for Lambda) ---
@@ -63,6 +63,10 @@ def is_remediation_enabled() -> bool:
 
 def is_live_remediation_explicitly_allowed() -> bool:
     return _get_bool("ALLOW_LIVE_REMEDIATION", False)
+
+
+def get_staging_remediation_acceptance_id() -> str:
+    return os.getenv("STAGING_REMEDIATION_ACCEPTANCE_ID", "").strip()
 
 
 def get_max_discovery_age_hours() -> int:
