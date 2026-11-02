@@ -185,6 +185,7 @@ def test_postgres_fresh_install_and_concurrent_migration(postgres_schema):
             ("0008_ai_job_recovery", 64),
             ("0009_remediation_evidence", 64),
             ("0010_observation_identity_reconciliation", 64),
+            ("0011_remediation_approval_declines", 64),
         ]
         cur.execute("SELECT COUNT(*) FROM governance_mutex")
         assert cur.fetchone() == (1,)
@@ -448,7 +449,9 @@ def test_postgres_role_identity_center_and_campaign_workflow(postgres_schema):
         assert workflow.change_campaign_state(conn, campaign["campaign_id"], "CLOSED", "admin") == "incomplete"
         assert workflow.set_exception(conn, review_id, "RESOLVED", "admin", "Done") == "updated"
         assert workflow.change_campaign_state(conn, campaign["campaign_id"], "PAUSED", "admin") == "updated"
-        assert workflow.queue(conn, "reviewer") == []
+        paused_queue = workflow.queue(conn, "reviewer")
+        assert len(paused_queue) == 1
+        assert paused_queue[0]["state"] == "PAUSED"
 
 
 def test_postgres_remediation_approval_events_and_worker_contention(

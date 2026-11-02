@@ -2,6 +2,8 @@
 *.csv
 *.log
 *.json
+!frontend/package.json
+!frontend/tsconfig.json
 !frontend/openapi.json
 *.yaml
 !frontend/pnpm-lock.yaml
