@@ -78,6 +78,37 @@ def test_queue_assignment_and_cross_campaign_isolation(tmp_path, monkeypatch):
     assert assigned_event["new_value"] == "bob"
 
 
+def test_frontend_identity_queue_filters_summary_and_account_scope(tmp_path, monkeypatch):
+    client, _ = _setup(tmp_path, monkeypatch)
+
+    identity = _request(client, "GET", "/me", "alice").json()
+    assert identity["subject"] == "alice"
+    assert identity["roles"] == ["reviewer"]
+    assert identity["scope_mode"] == "global_admin"
+
+    summary = _request(client, "GET", "/reviews/summary", "alice").json()
+    assert summary["assigned"] == 1
+    assert summary["pending"] == 1
+    filtered = _request(
+        client, "GET", "/reviews/queue?status=ALL&principal=missing", "alice"
+    ).json()
+    assert filtered["reviews"] == []
+    assert filtered["total"] == 0
+    assert filtered["has_more"] is False
+
+    monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "aws_account_scopes")
+    monkeypatch.setattr(
+        auth, "verify_access_token",
+        lambda token: {"sub": token, "groups": ["reviewers"], "aws_account_scopes": ["123456789012"]},
+    )
+    scoped_identity = _request(client, "GET", "/me", "alice").json()
+    assert scoped_identity["scope_mode"] == "claim"
+    assert scoped_identity["account_scopes"] == ["123456789012"]
+    scoped_queue = _request(client, "GET", "/reviews/queue", "alice").json()
+    assert scoped_queue["reviews"] == []
+    assert scoped_queue["total"] == 0
+
+
 def test_exception_blocks_decision_and_campaign_close_until_resolved(tmp_path, monkeypatch):
     client, path = _setup(tmp_path, monkeypatch)
     opened = _request(client, "POST", "/reviews/REV1/exception", "alice", {"reason": "Manager review needed"})
@@ -88,10 +119,12 @@ def test_exception_blocks_decision_and_campaign_close_until_resolved(tmp_path, m
     assert _request(client, "POST", "/reviews/REV1/exception/resolve", "admin", {"reason": "Verified"}).status_code == 200
     assert _request(client, "POST", "/campaigns/C1/state", "admin", {"state": "PAUSED"}).status_code == 200
     assert _request(client, "POST", "/reviews/REV1/decision", "alice", {"decision": "APPROVED"}).status_code == 409
+    assert [row["review_id"] for row in _request(client, "GET", "/reviews/queue", "alice").json()["reviews"]] == ["REV1"]
     assert _request(client, "POST", "/campaigns/C1/state", "admin", {"state": "OPEN"}).status_code == 200
     assert _request(client, "POST", "/reviews/REV1/decision", "alice", {"decision": "APPROVED"}).status_code == 200
     assert _request(client, "POST", "/campaigns/C1/state", "admin", {"state": "CLOSED"}).status_code == 200
     assert _request(client, "POST", "/campaigns/C1/state", "admin", {"state": "OPEN"}).status_code == 409
+    assert [row["review_id"] for row in _request(client, "GET", "/reviews/queue?status=ALL", "alice").json()["reviews"]] == ["REV1"]
     with sqlite3.connect(path) as conn:
         event_id = conn.execute("SELECT event_id FROM review_workflow_events LIMIT 1").fetchone()[0]
         try:

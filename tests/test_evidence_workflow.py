@@ -332,6 +332,32 @@ def test_failed_and_superseded_attempts_preserve_publication_but_block_eligibili
         assert repo.eligible_published_snapshot(conn, ACCOUNT_A, scope) is not None
 
 
+def test_reviewer_decision_rejects_stale_bound_snapshot(sqlite_evidence_db, monkeypatch):
+    from fastapi import HTTPException
+    from api import review_service
+
+    _publish()
+    evaluate_risk(None, None)
+    campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT review_id FROM access_reviews WHERE campaign_id=? LIMIT 1",
+                    (campaign["campaign_id"],))
+        review_id = cur.fetchone()[0]
+        repo.assign_campaign_reviewer(conn, campaign["campaign_id"], "reviewer", "admin")
+    _attempt(ACCOUNT_A, "FAILED")
+    monkeypatch.setenv("REVIEWER_GROUP", "reviewers")
+
+    with pytest.raises(HTTPException) as exc:
+        review_service.decide_review(
+            review_id,
+            review_service.DecisionRequest(decision="APPROVED"),
+            {"sub": "reviewer", "groups": ["reviewers"]},
+        )
+    assert exc.value.status_code == 409
+    assert "snapshot" in exc.value.detail.lower()
+
+
 def test_direct_path_remediation_does_not_claim_group_access_removed(
     sqlite_evidence_db, monkeypatch
 ):

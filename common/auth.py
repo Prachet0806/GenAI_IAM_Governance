@@ -61,9 +61,81 @@ def verify_access_token(token: str) -> dict:
 def require_group(claims: dict, group_name: str, *, claim_name: str | None = None):
     if not group_name:
         raise AuthorizationError("Required reviewer group is not configured")
+    if not has_group(claims, group_name, claim_name=claim_name):
+        raise AuthorizationError("Required group membership is missing")
+
+
+def has_group(claims: dict, group_name: str, *, claim_name: str | None = None) -> bool:
+    if not group_name:
+        return False
     key = claim_name or os.getenv("OIDC_GROUP_CLAIM", "groups")
     groups = claims.get(key, [])
     if isinstance(groups, str):
         groups = [groups]
-    if not isinstance(groups, list) or group_name not in groups:
-        raise AuthorizationError("Required group membership is missing")
+    return isinstance(groups, list) and group_name in groups
+
+
+def identity_summary(claims: dict) -> dict:
+    """Return a safe, normalized identity/permission projection for the UI."""
+    claim_name = os.getenv("OIDC_GROUP_CLAIM", "groups")
+    raw_groups = claims.get(claim_name, [])
+    if isinstance(raw_groups, str):
+        groups = {raw_groups}
+    elif isinstance(raw_groups, list) and all(isinstance(value, str) for value in raw_groups):
+        groups = set(raw_groups)
+    else:
+        groups = set()
+    role_groups = {
+        "reviewer": os.getenv("REVIEWER_GROUP", ""),
+        "campaign_admin": os.getenv("CAMPAIGN_ADMIN_GROUP", ""),
+        "remediation_approver": os.getenv("REMEDIATION_APPROVER_GROUP", ""),
+        "remediation_operator": os.getenv("REMEDIATION_OPERATOR_GROUP", ""),
+        "auditor": os.getenv("AUDITOR_GROUP", ""),
+    }
+    roles = sorted(role for role, group in role_groups.items() if group and group in groups)
+    permissions_by_role = {
+        "reviewer": ["reviews:read_assigned", "reviews:decide"],
+        "campaign_admin": ["campaigns:manage", "source_coverage:read", "ai_jobs:retry"],
+        "remediation_approver": ["remediation:approve", "remediation:read"],
+        "remediation_operator": ["remediation:reconcile", "remediation:read"],
+        "auditor": ["audit:read", "exports:read"],
+    }
+    permissions = sorted({
+        permission
+        for role in roles
+        for permission in permissions_by_role[role]
+    })
+    account_claim = os.getenv("OIDC_ACCOUNT_SCOPE_CLAIM", "").strip()
+    account_scopes = None
+    if account_claim:
+        raw_scopes = claims.get(account_claim, [])
+        account_scopes = [raw_scopes] if isinstance(raw_scopes, str) else raw_scopes
+        if not isinstance(account_scopes, list) or any(
+            not isinstance(value, str) or not value.strip()
+            for value in account_scopes
+        ):
+            account_scopes = []
+        else:
+            account_scopes = sorted({value.strip() for value in account_scopes})
+    return {
+        "subject": claims["sub"],
+        "display_name": claims.get("name") or claims.get("preferred_username") or "",
+        "email": claims.get("email") or "",
+        "roles": roles,
+        "permissions": permissions,
+        "account_scopes": account_scopes,
+        "scope_mode": "claim" if account_claim else "global_admin",
+    }
+
+
+def require_account_scope(claims: dict, account_id: str | None):
+    """Enforce an optional account scope claim; absent configuration means global scope."""
+    account_claim = os.getenv("OIDC_ACCOUNT_SCOPE_CLAIM", "").strip()
+    if not account_claim:
+        return
+    if not account_id:
+        raise AuthorizationError("Resource has no account scope")
+    identity = identity_summary(claims)
+    scopes = identity["account_scopes"] or []
+    if "*" not in scopes and account_id not in scopes:
+        raise AuthorizationError("AWS account is outside the authenticated user's scope")

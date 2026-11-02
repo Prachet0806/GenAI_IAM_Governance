@@ -22,7 +22,10 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def export_audit_report():
+def export_audit_report(*, campaign_id: str | None = None,
+                        account_scopes: list[str] | None = None,
+                        requested_by: str | None = None,
+                        max_rows: int | None = None):
     ts = datetime.now(timezone.utc)
     date_part = ts.strftime("%Y-%m-%d")
     run_id = str(uuid.uuid4())
@@ -43,7 +46,13 @@ def export_audit_report():
 
     try:
         with db.get_connection() as conn:
-            rows = repo.fetch_reviews_for_export(conn)
+            rows = repo.fetch_reviews_for_export(
+                conn, campaign_id=campaign_id, account_scopes=account_scopes,
+                max_rows=max_rows + 1 if max_rows is not None else None,
+            )
+
+        if max_rows is not None and len(rows) > max_rows:
+            raise ValueError(f"Export exceeds the {max_rows} record limit")
 
         if not rows:
             raise RuntimeError(
@@ -175,6 +184,9 @@ def export_audit_report():
             "generated_at": ts.isoformat(),
             "record_count": len(rows),
             "schema_version": config.SCHEMA_VERSION,
+            "scope": {"campaign_id": campaign_id,
+                      "account_scopes": account_scopes,
+                      "requested_by": requested_by},
             "artifacts": {
                 "csv": {"path": os.path.basename(filename_csv), "sha256": csv_hash},
                 "json": {"path": os.path.basename(filename_json), "sha256": json_hash},
@@ -218,6 +230,11 @@ def export_audit_report():
                 "json_sha256": json_hash,
             }
 
+            encryption = {"ServerSideEncryption": "AES256"}
+            kms_key = os.getenv("AUDIT_S3_KMS_KEY_ID", "").strip()
+            if kms_key:
+                encryption = {"ServerSideEncryption": "aws:kms",
+                              "SSEKMSKeyId": kms_key}
             s3.upload_file(
                 filename_csv,
                 audit_bucket,
@@ -225,7 +242,7 @@ def export_audit_report():
                 ExtraArgs={
                     "Metadata": common_meta,
                     "ContentType": "text/csv",
-                    "ServerSideEncryption": "AES256",
+                    **encryption,
                 },
             )
             s3.upload_file(
@@ -235,7 +252,7 @@ def export_audit_report():
                 ExtraArgs={
                     "Metadata": common_meta,
                     "ContentType": "application/json",
-                    "ServerSideEncryption": "AES256",
+                    **encryption,
                 },
             )
             s3.upload_file(
@@ -245,7 +262,7 @@ def export_audit_report():
                 ExtraArgs={
                     "Metadata": {"manifest_sha256": manifest_hash},
                     "ContentType": "application/json",
-                    "ServerSideEncryption": "AES256",
+                    **encryption,
                 },
             )
             s3_location = f"s3://{audit_bucket}/{export_path}"
@@ -286,6 +303,14 @@ def export_audit_report():
                         "manifest_sha256": manifest_hash,
                         "export_run_id": run_id,
                         "s3_location": s3_location,
+                        "campaign_id": campaign_id,
+                        "account_scopes": account_scopes,
+                        "requested_by": requested_by,
+                        "record_count": len(rows),
+                        "generated_at": ts.isoformat(),
+                        "csv_sha256": csv_hash,
+                        "json_sha256": json_hash,
+                        "manifest_sha256": manifest_hash,
                     },
                 )
         except Exception as e:
@@ -308,6 +333,11 @@ def export_audit_report():
         "json": filename_json,
         "manifest": filename_manifest,
         "s3_location": s3_location,
+        "record_count": len(rows),
+        "csv_sha256": csv_hash,
+        "json_sha256": json_hash,
+        "manifest_sha256": manifest_hash,
+        "generated_at": ts.isoformat(),
     }
 
 

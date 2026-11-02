@@ -14,6 +14,7 @@ A Python prototype for IAM inventory, entitlement risk assessment, access review
 - Keeps remediation in dry-run mode by default. Staging live execution requires `APP_ENV=staging`, `AWS_ACCOUNT_ID`, `STAGING_REMEDIATION_ACCEPTANCE_ID`, `ENABLE_REMEDIATION=true`, `ALLOW_LIVE_REMEDIATION=true`, `DRY_RUN=false`, and a non-empty exact-match allowlist. Production live execution remains blocked. The worker supports direct managed and direct inline IAM user policy paths; group, role, trust, and Identity Center paths remain ineligible.
 - Exports unique CSV/JSON artifacts and a manifest with SHA-256 hashes. S3 uploads use a per-export run path and surface upload errors.
 - Persists audit events, decision-bound artifact IDs, durable AI jobs and attempts, and immutable validated AI artifacts. Legacy summaries remain a labelled compatibility view.
+- Includes a role-scoped Next.js frontend for reviewers, campaign administrators, independent remediation approvers, auditors, and platform operators. Server-side APIs enforce role and AWS account scope; the frontend does not replace the discovery, evidence, risk, or remediation safety model.
 
 ## GenAI explanation
 
@@ -70,7 +71,17 @@ Run the API behind a TLS-terminating gateway with restricted network access:
 uvicorn api.review_service:app --host 127.0.0.1 --port 8080
 ```
 
-Campaign administrators assign reviewers with `POST /campaigns/{campaign_id}/reviewers`, assign individual reviews with `POST /reviews/{review_id}/assignment`, and manage campaign state, owner, deadlines, and exceptions through the API. Assigned reviewers use `GET /reviews/queue?limit=100&offset=0` for paged queues; campaign events also accept `limit` and `offset`. The API exposes frozen path and policy evidence, source coverage and freshness, and reports principal access as `not_evaluated`. A different authenticated remediation approver must approve a revoked, snapshot-pinned direct user policy path before staging live execution. Approval and action events bind the exact decision, snapshot, grant, and worker outcome. `GET /reviews/{review_id}/remediation` exposes that history to authorized reviewers, admins, approvers, and remediation operators. When an action outcome requires reconciliation, an operator in `REMEDIATION_OPERATOR_GROUP` can submit `POST /reviews/{review_id}/remediation/reconciliation` with a nonblank `reason`; the staging worker then performs a read-only exact-path AWS check and records an immutable result. A still-present or unreadable path remains on hold, and the worker does not repeat the destructive action. A newer scan requires a new pinned review and approval; a failed newer scan blocks live action while retaining the prior snapshot for audit. See [staging remediation acceptance](docs/staging-remediation-acceptance.md) before setting the staging gate.
+The role workspaces use the existing unversioned API. Campaign administrators can check `GET /snapshots/{snapshot_id}/readiness`, create a campaign with `POST /campaigns`, assign reviewers, allocate individual reviews, and monitor progress and lifecycle events. Reviewers use a filterable, offset-paginated `GET /reviews/queue` and can inspect frozen grant evidence and decision history. Campaign administrators can also open scoped, read-only review evidence; decision mutations still require reviewer authorization and assignment. Remediation approvers use `GET /approvals` and `/approvals/{review_id}`, then record an independent approval or decline with a reason at `/approvals/{review_id}/decision`. Auditors use `GET /audit/events` and the scoped `/exports` endpoints to create, download, and verify manifests. Operators use `/operations/health`, `/operations/integrations`, `/operations/jobs`, and `/operations/audit`; worker heartbeat is reported as unavailable until an actual heartbeat source is deployed. The generated frontend API schema is in `frontend/src/lib/api/schema.d.ts`; the proposed `/api/v1` routes in the contract document are not the routes currently called by the app.
+
+### Frontend workspaces
+
+The local frontend and container setup are described in [frontend workspaces](docs/frontend-workspaces.md) and [frontend setup](frontend/README.md). For a local OIDC-backed integration stack, copy `.env.example` to `.env`, configure the API and frontend OIDC settings and group names, then run:
+
+```bash
+docker compose up --build
+```
+
+The stack uses PostgreSQL, runs migrations before starting the API, and defaults to mock IAM discovery, disabled GenAI, and dry-run remediation. The frontend is bound to `127.0.0.1:3000`. This is a local integration deployment, not AWS staging or production infrastructure. For frontend development without containers, follow `frontend/README.md`.
 
 ## Configuration
 
@@ -82,7 +93,9 @@ Campaign administrators assign reviewers with `POST /campaigns/{campaign_id}/rev
 - `AUDIT_S3_BUCKET`, `AUDIT_S3_PREFIX`, `LOCAL_ONLY`: audit export target.
 - `APP_ENV`: environment mode; only `staging` can execute live remediation after the other gates pass. Production remains code-blocked. The review API always requires valid OIDC configuration.
 - `MAX_DISCOVERY_AGE_HOURS`: maximum age of a complete AWS scan for non-production live remediation (default 24, maximum 168).
-- `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`, `OIDC_GROUP_CLAIM`, `REVIEWER_GROUP`, `CAMPAIGN_ADMIN_GROUP`, `REMEDIATION_APPROVER_GROUP`, `REMEDIATION_OPERATOR_GROUP`: OIDC and authorization configuration for the review API.
+- `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`, `OIDC_GROUP_CLAIM`, `OIDC_ACCOUNT_SCOPE_CLAIM`, `REVIEWER_GROUP`, `CAMPAIGN_ADMIN_GROUP`, `REMEDIATION_APPROVER_GROUP`, `REMEDIATION_OPERATOR_GROUP`, `AUDITOR_GROUP`: OIDC and authorization configuration for the API. Use immutable OIDC `sub` values for actors and reviewer assignments; the account-scope claim is enforced by the API.
+- Frontend `AUTH_OIDC_ISSUER`, `AUTH_CLIENT_ID`, `AUTH_CLIENT_SECRET`, `AUTH_SECRET`, `AUTH_SCOPE`, `IAM_API_BASE_URL`, and `FRONTEND_ORIGIN`: Auth.js OIDC client, server-side API proxy, and CSRF origin configuration. Keep client secrets and signing secrets outside source control.
+- Local Compose `POSTGRES_PASSWORD` and optional `FRONTEND_PORT`: local database credential and loopback frontend port.
 
 Copy `.env.example` for local configuration. Do not commit credentials.
 
@@ -90,12 +103,12 @@ Copy `.env.example` for local configuration. Do not commit credentials.
 
 Ordered migrations are in `sql/migrations/`. Each numbered portable SQL file may have a matching `.sqlite.sql` or `.postgres.sql` file. Run `python scripts/migrate.py` before starting workers or the review API. The runner applies pending migrations transactionally, records a SHA-256 checksum in `schema_migrations`, and rejects edited or missing applied migrations. Migration 0001 also upgrades older databases that predate its compatibility columns. Add new numbered files for future schema changes; do not edit an applied migration. Export artifacts are written under `reports/` using date plus unique run ID, with a `.manifest.json` file. Set `LOCAL_ONLY=true` to skip S3.
 
-GitHub Actions runs the SQLite suite and a separate Postgres 17 service job for fresh and upgrade migrations, source publication, concurrent remediation claims, and AI job claims in [.github/workflows/ci.yml](.github/workflows/ci.yml). AWS, Identity Center, S3, and AI provider integrations are not part of these CI jobs.
+GitHub Actions is configured to run the SQLite suite, a separate Postgres 17 migration/concurrency job, frontend typecheck/lint/unit tests/build, and API/frontend container image builds in [.github/workflows/ci.yml](.github/workflows/ci.yml). A workflow definition is not evidence that hosted CI passed at this checkout. AWS, Identity Center, S3, OIDC-provider integration, and AI-provider calls are not exercised by these jobs.
 
 ## Known boundaries
 
 - A revoked path is a decision about that path; other grants can still give the principal similar access. The system does not compute aggregate effective access. Descriptive user/policy tables can retain stale entities even though the published grant view is source-scoped.
 - Historical reviews created before snapshot pinning retain unknown path and policy-version provenance; the current mutable policy must not be treated as their historical evidence.
 - The reviewer CLI is not an authentication system.
-- Deployment infrastructure, event sources, secret-manager integration, provider retention approval, and production alerting are not defined here.
+- Docker Compose supports a local integration stack only. Cloud infrastructure, managed identity, TLS/WAF, worker scheduling and heartbeat, secret-manager integration, provider retention approval, and production alerting are not provisioned here.
 - Local tests and the Postgres service test do not establish AWS, S3, AI-provider, or production deployment readiness.

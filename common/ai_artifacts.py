@@ -144,8 +144,11 @@ def retry_failed_job(conn, job_id: str, *, actor_sub: str, pseudonym_key: str):
     if existing:
         if existing[1] == "FAILED":
             raise ValueError("This job was already retried; retry its failed successor")
-        return dict(zip(("job_id", "status", "generation", "provider_model",
-                         "idempotency_key"), existing))
+        return {
+            **dict(zip(("job_id", "status", "generation", "provider_model",
+                        "idempotency_key"), existing)),
+            "review_id": previous[0],
+        }
     db.execute(cur, "SELECT COALESCE(MAX(generation),0) FROM ai_jobs WHERE review_id=?",
                (previous[0],))
     generation = cur.fetchone()[0] + 1
@@ -162,7 +165,7 @@ def retry_failed_job(conn, job_id: str, *, actor_sub: str, pseudonym_key: str):
         details={"actor_sub": actor_sub, "previous_job_id": job_id,
                  "new_job_id": job["job_id"], "generation": job["generation"]},
     )
-    return job
+    return {**job, "review_id": previous[0]}
 
 
 def claim_job(conn, *, job_id: str | None = None, lease_seconds: int = 120):

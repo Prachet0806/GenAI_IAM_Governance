@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: iam_governance
+      POSTGRES_USER: iam_governance
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - iam-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iam_governance -d iam_governance"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: ["python", "scripts/migrate.py"]
+    environment:
+      DB_URL: postgresql://iam_governance:${POSTGRES_PASSWORD}@postgres:5432/iam_governance
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      DB_URL: postgresql://iam_governance:${POSTGRES_PASSWORD}@postgres:5432/iam_governance
+      LOCAL_ONLY: "false"
+      MOCK_IAM: "true"
+      DRY_RUN: "true"
+      ENABLE_GENAI: "false"
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+      OIDC_ISSUER: ${OIDC_ISSUER:?Set OIDC_ISSUER in .env}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:?Set OIDC_AUDIENCE in .env}
+      OIDC_JWKS_URL: ${OIDC_JWKS_URL:?Set OIDC_JWKS_URL in .env}
+      REVIEWER_GROUP: ${REVIEWER_GROUP:-reviewer}
+      CAMPAIGN_ADMIN_GROUP: ${CAMPAIGN_ADMIN_GROUP:-campaign_admin}
+      REMEDIATION_APPROVER_GROUP: ${REMEDIATION_APPROVER_GROUP:-remediation_approver}
+      REMEDIATION_OPERATOR_GROUP: ${REMEDIATION_OPERATOR_GROUP:-remediation_operator}
+      AUDITOR_GROUP: ${AUDITOR_GROUP:-auditor}
+    volumes:
+      - ./reports:/app/reports
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      NODE_ENV: production
+      AUTH_SECRET: ${AUTH_SECRET:?Set AUTH_SECRET in .env}
+      AUTH_OIDC_ISSUER: ${AUTH_OIDC_ISSUER:?Set AUTH_OIDC_ISSUER in .env}
+      AUTH_CLIENT_ID: ${AUTH_CLIENT_ID:?Set AUTH_CLIENT_ID in .env}
+      AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET:?Set AUTH_CLIENT_SECRET in .env}
+      AUTH_TRUST_HOST: "true"
+      AUTH_URL: ${FRONTEND_ORIGIN:-http://localhost:3000}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+      IAM_API_BASE_URL: http://api:8080
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  iam-postgres:

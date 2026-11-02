@@ -1,6 +1,6 @@
 # Frontend API contract and permission matrix
 
-Status: proposed contract, grounded in the current local checkout. Some workflow additions are uncommitted in this working tree. Existing routes are marked **Present in local source**; new routes proposed below require backend work. Presence in source does not mean tested, deployed, or production-ready.
+Status: mixed implementation record and future contract proposal. The local frontend uses the **unversioned** routes listed below. The `/api/v1` catalog later in this document remains a proposed normalization and is not called by the current app. Local source presence does not mean hosted CI, staging, or production validation.
 
 ## 1. Current-state baseline
 
@@ -9,10 +9,17 @@ The local checkout contains these application routes today:
 | Method and route | Current behavior | Authorization |
 |---|---|---|
 | `GET /health` | Service health response | No OIDC dependency in the route |
-| `GET /reviews/queue` | Current reviewer's pending queue; bounded `limit`/`offset` pagination, no cursor/filter parameters | Valid OIDC token, reviewer group, campaign reviewer pool; review assignment restricts access when present |
-| `GET /reviews/{review_id}` | Returns one review, frozen grant/policy/risk evidence, evidence state, `review_scope`, `principal_access_status: not_evaluated`, validated AI artifact projection with labelled legacy fallback, assignment/deadline/exception state | Valid OIDC token, reviewer group, campaign membership, and per-review assignment if present |
+| `GET /reviews/queue` | Pending queue with bounded `limit`/`offset` and status, risk, campaign, account, principal, search, and due-date filters | Valid OIDC token, reviewer group, campaign reviewer pool; account scope applied server-side |
+| `GET /reviews/{review_id}` | Returns frozen grant/policy/risk evidence, `review_scope`, `principal_access_status: not_evaluated`, AI artifact projection, and assignment/deadline/exception state | Assigned reviewer or campaign administrator; campaign administrator access is scoped and read-only |
+| `GET /reviews/{review_id}/history` | Paged decision and workflow history | Assigned reviewer or scoped campaign administrator |
 | `POST /reviews/{review_id}/decision` | Records `APPROVED` or `REVOKED`; revocation requires a comment; duplicate/racing decisions conflict | Valid OIDC token, reviewer group, campaign membership, and per-review assignment if present; campaign must be open and review must not have an open exception |
+| `GET /reviews/summary` | Reviewer queue summary | Reviewer group; account scope applied before aggregates |
+| `GET /campaigns` | Campaign list with status, account, snapshot, progress, exception, and overdue counts | Campaign administrator or auditor; authorized account scope |
+| `GET /snapshots` / `GET /snapshots/{snapshot_id}/readiness` | Published snapshot candidates and readiness blockers | Campaign administrator; authorized account scope |
+| `POST /campaigns` | Creates a campaign from an eligible, current, risk-assessed published snapshot | Campaign administrator; readiness rechecked by the API and worker |
+| `GET /campaigns/{campaign_id}/progress`, `/reviews`, `/reviewers`, `/events` | Progress and workload, campaign reviews, reviewer pool, and workflow history | Campaign administrator for the campaign's account |
 | `POST /campaigns/{campaign_id}/reviewers` | Assigns a reviewer subject to a campaign; duplicate assignment is reported | Valid OIDC token and campaign-admin group |
+| `DELETE /campaigns/{campaign_id}/reviewers?reviewer_sub=...` | Removes a reviewer if pending work is no longer assigned to them; removal is audited | Campaign administrator |
 | `GET /campaigns/{campaign_id}` | Returns one campaign's snapshot and workflow metadata | Campaign admin, or reviewer assigned to the campaign |
 | `GET /campaigns/{campaign_id}/events` | Returns bounded workflow-event pages using `limit` and `offset` | Campaign admin, or reviewer assigned to the campaign |
 | `POST /ai/jobs/{job_id}/retry` | Queues an audited next-generation retry of a failed explanation job | Campaign-admin group; provider and privacy gates enabled |
@@ -24,12 +31,21 @@ The local checkout contains these application routes today:
 | `POST /reviews/{review_id}/exception` | Opens an exception on an assigned review; blocks reviewer decision while open | Reviewer group and campaign/review assignment |
 | `POST /reviews/{review_id}/exception/resolve` | Resolves an open exception with a reason | Campaign-admin group |
 | `POST /reviews/{review_id}/remediation-approval` | Approves/renews remediation for eligible revoked review, bound to the current eligible snapshot | Valid OIDC token, approver group, independent approver check |
+| `GET /reviews/{review_id}/remediation` | Returns immutable approval and action evidence, including reconciliation state | Assigned reviewer, campaign admin, or remediation approver |
+| `GET /approvals`, `GET /approvals/{review_id}` | Independent remediation queue, evidence, eligibility blockers, and execution history | Remediation approver; account scope and separation-of-duties enforced |
+| `POST /approvals/{review_id}/decision` | Records an independent approval or decline with a required reason | Remediation approver; self-approval is blocked |
+| `GET /audit/events` | Filtered decision, campaign, and remediation history | Auditor or campaign administrator; scoped before results are returned |
+| `GET/POST /exports`, `GET /exports/{id}`, `/verify`, `/download` | Scoped export list/create/detail, manifest verification, and artifact download | Auditor or campaign administrator; export scope checked before artifact access |
+| `GET /operations/health`, `/integrations`, `/jobs`, `/audit` | Health, sanitized configuration, recorded processing activity, redacted events | Platform operator; account scope applied where events are resource-bound |
+| `POST /reviews/{review_id}/remediation/reconciliation` | Requests a read-only exact-path AWS recheck | Platform operator; scoped review and required reason |
 
-Campaign generation is currently a worker operation, not a user-facing API. It selects an eligible published snapshot, optionally by `account_id`, requires complete risk assessments, and creates reviews pinned to snapshot evidence. Routes still missing include paginated/filterable campaign and review lists, campaign creation, reviewer-pool listing/removal, discovery and snapshot readiness, review history, remediation approval queue and execution outcomes, scoped audit/export access, and operations status. The current queue and events routes support bounded offset pages; stable cursor pagination remains a proposed improvement for changing queues.
+Campaign creation is exposed through the API and rechecks readiness against the selected snapshot before generating reviews. The current UI uses bounded offset pages, not cursor pagination. Operations data reports activity recorded in the database; it does not claim worker liveness because no heartbeat source is configured. See [frontend workspaces](frontend-workspaces.md) for the route-to-screen map and local deployment behavior.
 
-The checkout has uncommitted campaign, source, and AI-platform changes through migration `0008_ai_job_recovery`. They add campaign lifecycle and reviewer queues, source-specific evidence and risk, validated AI artifacts, and audited failed-job retry. This local contract does not establish deployment or hosted CI status.
+The current local source includes campaign, source, AI, remediation evidence, immutable approval declines, and reviewer-removal events through migration `0011_remediation_approval_declines` on `upgrade`. This local contract does not establish deployment or hosted CI status.
 
 ## 2. Authorization model
+
+The permission matrix describes the intended contract and aligns with the current role groups. Unless a paragraph is explicitly labelled **Local-source status**, the `/api/v1` route names, cursor format, and mutation conventions below are proposals. The frontend currently uses the unversioned FastAPI routes recorded in Section 1; stable cursor pagination, idempotency keys, and metadata version checks remain future work.
 
 ### Identity
 
@@ -142,7 +158,7 @@ Do not return raw tokens or assume that an email address is unique or immutable.
 | `POST /api/v1/reviews/{review_id}/decision` | Existing decision operation, versioned under v1 | Reviewer group; assigned pending item |
 | `GET /api/v1/reviews/{review_id}/history` | Decision and workflow history, including actor and timestamps | Reviewer assigned to campaign; admins/auditors by scope |
 
-Local-source status: `GET /reviews/queue` supports bounded `limit`/`offset` pages but has no stable cursor or filters. `GET /reviews/{review_id}` and `POST /reviews/{review_id}/decision` exist unversioned. The versioned paths above are the recommended frontend contract and require route migration/compatibility work.
+Local-source status: the app calls unversioned `GET /reviews/queue`, `GET /reviews/{review_id}`, `GET /reviews/{review_id}/history`, and `POST /reviews/{review_id}/decision`. The queue supports bounded filters and offset pagination but not stable cursors. The `/api/v1` paths above are future normalization proposals and require route migration/compatibility work.
 
 Queue item fields: `review_id`, `campaign_id`, `campaign_name`, `principal`, `grant_name`, `grant_type`, `risk_level`, `status`, `assigned_reviewer_sub`, `due_at`, `created_at`, `snapshot_id`.
 
@@ -168,7 +184,7 @@ Decision request:
 | `POST /api/v1/campaigns/{campaign_id}/assignments` | Assign one or more reviewers to whole campaign or explicit review IDs, depending on supported backend model | Campaign admin |
 | `DELETE /api/v1/campaigns/{campaign_id}/assignments/{reviewer_sub}` | Remove assignment only if pending work is safely reassigned or explicitly unassigned | Campaign admin |
 
-Local-source status: `GET /campaigns/{campaign_id}` and `POST /campaigns/{campaign_id}/reviewers` exist unversioned. There is no campaign list, progress endpoint, interactive create endpoint, or reviewer-pool listing/removal endpoint. Campaign creation is currently performed by the worker.
+Local-source status: list, create, readiness, progress, review, reviewer-pool, assignment, lifecycle, and event operations exist as unversioned routes. The app calls those routes directly through its BFF. Reviewer-pool membership and per-review assignment are separate concepts; removal is rejected while the reviewer still has pending work assigned.
 
 Campaign create request:
 
@@ -194,7 +210,7 @@ Creation must fail closed with `409 NO_ELIGIBLE_SNAPSHOT`, `409 SNAPSHOT_RISK_IN
 | `GET /api/v1/discovery-runs` | Attempts including RUNNING, COMPLETE, INCOMPLETE, FAILED and superseded context | Campaign admin; operator; auditor read-only |
 | `GET /api/v1/discovery-runs/{run_id}` | Run detail and failure/coverage summary | Same |
 
-Snapshot readiness must distinguish last published snapshot from latest attempt. Return explicit booleans/reasons such as `is_published`, `is_latest_attempt`, `is_complete`, `risk_assessments_complete`, `is_fresh`, `blocked_by_newer_attempt`, and `eligible_for_campaign`/`eligible_for_remediation`. Include account and declared source scope. Avoid a single ambiguous `healthy` value.
+Local-source status: `GET /snapshots` and `GET /snapshots/{snapshot_id}/readiness` exist unversioned. Readiness distinguishes the current published snapshot, newest attempt, risk-assessment completeness, existing active campaign, and human-readable blockers. The endpoint is a campaign-creation check; it does not promise live-remediation eligibility.
 
 ### P1 — Campaign lifecycle and allocation
 
@@ -217,7 +233,7 @@ The current local source already contains unversioned lifecycle routes: `GET /ca
 | `POST /api/v1/remediation/{review_id}/approval` | Existing approval operation, versioned under v1 | Approver group; different `sub` from reviewer |
 | `POST /api/v1/remediation/{review_id}/approval-decision` | Optional explicit rejection if product supports reject/decline | Approver group; requires new audited state model |
 
-Local-source status: `POST /reviews/{review_id}/remediation-approval` exists unversioned. The queue, explicit rejection, and worker outcome endpoints are not present.
+Local-source status: `GET /approvals`, `GET /approvals/{review_id}`, and `POST /approvals/{review_id}/decision` provide the approver queue, eligibility/evidence detail, and immutable approve/decline decisions. The earlier `POST /reviews/{review_id}/remediation-approval` remains as an approval-only compatibility route. Approval does not establish that an AWS action completed.
 
 Eligibility response must state exact reasons, including unsupported grant type, legacy/unpinned evidence, stale or superseded snapshot, no longer-current grant, non-revoked review, missing independent reviewer identity, self-approval, dry-run configuration, and production live-remediation block. Approval is not proof that AWS action succeeded. The worker result must separately report queued/running/succeeded/failed/reconciled/skipped and the verified direct attachment outcome. Never claim that the principal lost all effective access.
 
@@ -231,7 +247,7 @@ Eligibility response must state exact reasons, including unsupported grant type,
 | `GET /api/v1/exports/{export_id}` | Export state, counts, artifact hashes and storage metadata | Same |
 | `GET /api/v1/exports/{export_id}/download` | Authenticated download or short-lived scoped URL | Same |
 
-Do not expose arbitrary filesystem paths or unrestricted S3 URLs. Bind exports to explicit authorized campaign/account scope, audit each request and download, and return the manifest/hash so the user can verify integrity. Current export code generates artifacts for all available review rows; authorization-scoped export retrieval is additional backend work.
+Local-source status: `/audit/events` and `/exports` list/create/detail/verify/download routes are implemented unversioned. Export rows are filtered to authorized account/campaign scope before access; downloads are audited and the manifest exposes hashes for integrity verification. Do not expose arbitrary filesystem paths or unrestricted S3 URLs.
 
 ### P2 — Operations
 
@@ -242,23 +258,25 @@ Do not expose arbitrary filesystem paths or unrestricted S3 URLs. Bind exports t
 | `GET /api/v1/operations/jobs` | Discovery, evaluation, campaign, export, remediation job state | Platform operator |
 | `GET /api/v1/operations/audit` | Operational event stream with filters and pagination | Platform operator; sensitive fields redacted |
 
-Operations endpoints require a production deployment and job/event model. Do not build simulated controls that imply a worker, queue, scheduler, alert, or secret manager exists when it does not.
+Local-source status: the four operations GET routes are implemented unversioned and restricted to the operator group. Job rows are recorded activity, not worker heartbeat or scheduler health. The UI says heartbeat is unavailable. Do not interpret configuration presence as verified connectivity or healthy workers.
 
 ## 5. Screen-to-endpoint map
 
 | Screen | Primary endpoint dependencies |
 |---|---|
-| Sign-in / app bootstrap | OIDC flow, `GET /me`, `GET /me/permissions` |
-| Reviewer home / My reviews | `GET /reviews`, `GET /campaigns` (assigned subset) |
+| Sign-in / app bootstrap | Auth.js OIDC, `GET /me`, role-aware navigation |
+| Reviewer home / My reviews | `GET /reviews/summary`, `GET /reviews/queue` |
 | Review detail | `GET /reviews/{id}`, `GET /reviews/{id}/history`, `POST /reviews/{id}/decision` |
-| Campaign list / detail | `GET /campaigns`, `GET /campaigns/{id}`, `/progress`, `/assignments` |
-| Create campaign wizard | `GET /snapshots`, `/readiness`, `POST /campaigns`, assignment endpoint |
-| Assignment management | `/assignments`, assignment mutation endpoints, campaign progress |
-| Remediation approvals | `GET /remediation/approvals`, `GET /remediation/{id}`, approval mutation |
-| Auditor workspace | campaign/audit endpoints, exports list/create/detail/download |
-| Operations | health, integrations, jobs, operational audit |
+| Campaign list / detail | `GET /campaigns`, campaign detail/progress/reviews/reviewers/events, lifecycle mutations |
+| Create campaign wizard | `GET /snapshots`, `GET /snapshots/{id}/readiness`, `POST /campaigns` |
+| Assignment management | Campaign reviewer pool, per-review assignment, reviewer removal, exception resolution |
+| Remediation approvals | `GET /approvals`, `GET /approvals/{id}`, `POST /approvals/{id}/decision` |
+| Auditor workspace | `GET /audit/events`, exports list/create/detail/verify/download |
+| Operations | `/operations/health`, `/integrations`, `/jobs`, `/audit`, reconciliation request |
 
 ## 6. Delivery gates
+
+Reviewer, campaign administration, remediation approval, auditor, and operator screens are implemented locally. The gates below remain useful for authorization review and deployment acceptance; their inclusion is not a claim that staging or production is complete.
 
 ### Gate A — Contract before business UI
 

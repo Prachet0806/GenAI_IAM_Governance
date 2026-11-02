@@ -23,6 +23,7 @@ def generate_campaign(event, context):
         repo.lock_inventory_remediation(conn)
         requested_account = (event or {}).get("account_id") if isinstance(event, dict) else None
         requested_scope = (event or {}).get("source_scope") if isinstance(event, dict) else None
+        expected_snapshot = (event or {}).get("snapshot_id") if isinstance(event, dict) else None
         allowed_scopes = {
             evidence.IAM_USER_POLICY_SCOPE, evidence.IAM_ROLE_POLICY_SCOPE,
             evidence.IDENTITY_CENTER_SCOPE,
@@ -36,6 +37,9 @@ def generate_campaign(event, context):
         if not snapshot:
             return {"status": "blocked", "reason": "no_eligible_published_snapshot"}
         snapshot_id = snapshot["snapshot_id"]
+        if expected_snapshot and expected_snapshot != snapshot_id:
+            return {"status": "blocked", "reason": "snapshot_changed",
+                    "snapshot_id": snapshot_id}
         if not repo.snapshot_risk_complete(
             conn, snapshot_id, evidence.POLICY_RULE_VERSION
         ):
@@ -52,7 +56,8 @@ def generate_campaign(event, context):
                     "snapshot_id": snapshot_id}
         campaign_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
-        campaign_name = f"Access Campaign {now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+        requested_name = (event or {}).get("name") if isinstance(event, dict) else None
+        campaign_name = requested_name.strip() if isinstance(requested_name, str) and requested_name.strip() else f"Access Campaign {now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
         owner_sub = (event or {}).get("owner_sub", "system") if isinstance(event, dict) else "system"
         if not isinstance(owner_sub, str) or not owner_sub.strip():
             return {"status": "blocked", "reason": "invalid_campaign_owner"}

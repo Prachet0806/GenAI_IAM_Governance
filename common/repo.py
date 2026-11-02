@@ -587,6 +587,30 @@ def assign_campaign_reviewer(
     return cur.rowcount == 1
 
 
+def remove_campaign_reviewer(conn, campaign_id: str, reviewer_sub: str):
+    cur = conn.cursor()
+    db.execute(cur, """SELECT 1 FROM access_reviews WHERE campaign_id=?
+        AND assigned_reviewer_sub=? AND status='PENDING' LIMIT 1""",
+        (campaign_id, reviewer_sub))
+    if cur.fetchone():
+        return "has_pending_reviews"
+    db.execute(cur, "DELETE FROM campaign_reviewers WHERE campaign_id=? AND reviewer_sub=?",
+               (campaign_id, reviewer_sub))
+    return "removed" if cur.rowcount == 1 else "not_found"
+
+
+def record_campaign_reviewer_event(conn, *, campaign_id: str, reviewer_sub: str,
+                                   event_type: str, actor_sub: str):
+    if event_type not in {"ADDED", "REMOVED"}:
+        raise ValueError("Unsupported campaign reviewer event")
+    event_id = str(uuid.uuid4())
+    db.execute(conn.cursor(), """INSERT INTO campaign_reviewer_events
+        (event_id,campaign_id,reviewer_sub,event_type,actor_sub,created_at)
+        VALUES (?,?,?,?,?,?)""", (event_id, campaign_id, reviewer_sub, event_type,
+        actor_sub, datetime.now(timezone.utc).isoformat()))
+    return event_id
+
+
 def is_campaign_reviewer(conn, campaign_id: str, reviewer_sub: str) -> bool:
     cur = conn.cursor()
     db.execute(
@@ -650,6 +674,33 @@ def get_remediation_approval(conn, review_id: str):
     return cur.fetchone()
 
 
+def remediation_decline(conn, review_id: str):
+    cur = conn.cursor()
+    db.execute(cur, """SELECT decline_id,decision_event_id,approver_sub,declined_at,
+        snapshot_id,grant_id,observation_id,risk_assessment_id,reason
+        FROM remediation_approval_declines WHERE review_id=?""", (review_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return dict(zip(("decline_id", "decision_event_id", "approver_sub", "declined_at",
+                     "snapshot_id", "grant_id", "observation_id",
+                     "risk_assessment_id", "reason"),
+                    (str(value) if isinstance(value, datetime) else value for value in row)))
+
+
+def record_remediation_decline(conn, *, decline_id: str, review_id: str,
+                               decision_event_id: str, approver_sub: str,
+                               declined_at: str, binding: dict, reason: str):
+    db.execute(conn.cursor(), """INSERT INTO remediation_approval_declines
+        (decline_id,review_id,decision_event_id,approver_sub,declined_at,
+         snapshot_id,grant_id,observation_id,risk_assessment_id,reason)
+        VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (decline_id, review_id, decision_event_id, approver_sub, declined_at,
+         binding["snapshot_id"], binding["grant_id"], binding["observation_id"],
+         binding["risk_assessment_id"], reason))
+    return decline_id
+
+
 def authenticated_revocation_event(conn, review_id: str) -> str | None:
     cur = conn.cursor()
     db.execute(cur, """SELECT e.event_id FROM access_reviews r
@@ -708,18 +759,19 @@ def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool
 def record_remediation_approval_event(
     conn, approval_id: str, review_id: str, decision_event_id: str,
     approver_sub: str, approved_at: str, event_type: str, binding: dict,
+    approval_reason: str = "",
 ) -> str:
     action_type = REMEDIATION_ACTIONS[binding["grant_type"]]
     event_id = str(uuid.uuid4())
     db.execute(conn.cursor(), """INSERT INTO remediation_approval_events
         (event_id,approval_id,review_id,decision_event_id,event_type,
          approver_sub,approved_at,snapshot_id,grant_id,observation_id,
-         risk_assessment_id,grant_type,action_type)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         risk_assessment_id,grant_type,action_type,approval_reason)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (event_id, approval_id, review_id, decision_event_id, event_type,
          approver_sub, approved_at, binding["snapshot_id"], binding["grant_id"],
          binding["observation_id"], binding["risk_assessment_id"],
-         binding["grant_type"], action_type))
+         binding["grant_type"], action_type, approval_reason.strip()))
     return event_id
 
 
@@ -911,15 +963,28 @@ def remediation_history(conn, review_id: str) -> dict:
     cur = conn.cursor()
     db.execute(cur, """SELECT event_id,approval_id,decision_event_id,event_type,
                approver_sub,approved_at,snapshot_id,grant_id,observation_id,
-               risk_assessment_id,grant_type,action_type
+               risk_assessment_id,grant_type,action_type,approval_reason
         FROM remediation_approval_events WHERE review_id=?
         ORDER BY approved_at,event_id""", (review_id,))
     approvals = [dict(zip((
         "event_id", "approval_id", "decision_event_id", "event_type",
         "approver_sub", "approved_at", "snapshot_id", "grant_id",
         "observation_id", "risk_assessment_id", "grant_type", "action_type",
+        "reason",
     ), (str(x) if isinstance(x, datetime) else x for x in row)))
         for row in cur.fetchall()]
+    db.execute(cur, """SELECT decline_id,decision_event_id,approver_sub,declined_at,
+               snapshot_id,grant_id,observation_id,risk_assessment_id,reason
+        FROM remediation_approval_declines WHERE review_id=?""", (review_id,))
+    declines = [dict(zip((
+        "event_id", "approval_id", "decision_event_id", "event_type",
+        "approver_sub", "approved_at", "snapshot_id", "grant_id",
+        "observation_id", "risk_assessment_id", "grant_type", "action_type",
+        "reason",
+    ), (row[0], None, row[1], "DECLINED", row[2], str(row[3]), row[4],
+        row[5], row[6], row[7], None, None, row[8]))) for row in cur.fetchall()]
+    approvals.extend(declines)
+    approvals.sort(key=lambda item: (item["approved_at"], item["event_id"]))
     db.execute(cur, """SELECT event_id,attempt_id,approval_event_id,event_type,
                event_sequence,action_type,actor_id,snapshot_id,grant_id,fencing_token,
                evidence_json,created_at
@@ -950,7 +1015,8 @@ def remediation_history(conn, review_id: str) -> dict:
         item["evidence"] = json.loads(item["evidence"])
         item["created_at"] = str(item["created_at"])
         reconciliations.append(item)
-    return {"approval_events": approvals, "action_events": actions,
+    return {"approval_events": approvals, "decline_events": declines,
+            "action_events": actions,
             "reconciliation_events": reconciliations,
             "reconciliation_required": remediation_reconciliation_required(conn, review_id)}
 
@@ -1351,14 +1417,31 @@ def mark_remediated(conn, review_id: str, ts: str):
     )
 
 
-def fetch_reviews_for_export(conn) -> list[tuple[Any, ...]]:
+def fetch_reviews_for_export(conn, *, campaign_id: str | None = None,
+                             account_scopes: list[str] | None = None,
+                             max_rows: int | None = None) -> list[tuple[Any, ...]]:
     """Export frozen evidence with the single validated-artifact projection."""
     from common import ai_artifacts
 
     cur = conn.cursor()
+    clauses = []
+    values: list = []
+    if campaign_id:
+        clauses.append("r.campaign_id=?")
+        values.append(campaign_id)
+    if account_scopes is not None:
+        if not account_scopes:
+            clauses.append("1=0")
+        elif "*" not in account_scopes:
+            clauses.append("ps.account_id IN (" + ",".join("?" for _ in account_scopes) + ")")
+            values.extend(account_scopes)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    limit_sql = " LIMIT ?" if max_rows is not None else ""
+    if max_rows is not None:
+        values.append(max_rows)
     db.execute(
         cur,
-        """
+        f"""
         SELECT 
             r.review_id,
             r.campaign_id,
@@ -1395,8 +1478,9 @@ def fetch_reviews_for_export(conn) -> list[tuple[Any, ...]]:
         LEFT JOIN grant_paths gp ON gp.grant_id=r.grant_id
         LEFT JOIN grant_risk_assessments gra ON gra.assessment_id=r.risk_assessment_id
         LEFT JOIN policy_risk_assessments pra ON pra.assessment_id=gra.policy_assessment_id
-        ORDER BY r.created_at DESC
+        {where} ORDER BY r.created_at DESC,r.review_id{limit_sql}
         """,
+        values,
     )
     results = []
     for raw in cur.fetchall():
