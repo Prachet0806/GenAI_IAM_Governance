@@ -175,3 +175,31 @@ def test_campaign_reviewer_assignment_validates_subject_and_records_event(tmp_pa
     events = _request(client, "GET", "/campaigns/C1/events", "admin").json()["events"]
     assert events[0]["event_type"] == "CAMPAIGN_REVIEWER_ADDED"
     assert events[0]["new_value"] == "dave"
+
+
+def test_operations_audit_applies_operator_account_scope(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    client, _ = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("REMEDIATION_OPERATOR_GROUP", "operators")
+    monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "aws_account_scopes")
+    monkeypatch.setattr(auth, "verify_access_token", lambda token: {
+        "sub": token, "groups": ["operators"],
+        "aws_account_scopes": ["123456789012"],
+    })
+    with db.get_connection() as conn:
+        db.execute(conn.cursor(), "UPDATE campaigns SET account_id=? WHERE campaign_id=?",
+                   ("123456789012", "C1"))
+        db.execute(conn.cursor(), "UPDATE campaigns SET account_id=? WHERE campaign_id=?",
+                   ("999999999999", "C2"))
+        repo.insert_audit_log(
+            conn, "AUDIT-C1", datetime.now(timezone.utc), "INFO", "campaign_update",
+            "success", "Scoped event", entity_type="campaign", entity_id="C1",
+        )
+        repo.insert_audit_log(
+            conn, "AUDIT-C2", datetime.now(timezone.utc), "INFO", "campaign_update",
+            "success", "Out-of-scope event", entity_type="campaign", entity_id="C2",
+        )
+    response = _request(client, "GET", "/operations/audit", "operator")
+    assert response.status_code == 200
+    assert [event["event_id"] for event in response.json()["events"]] == ["AUDIT-C1"]

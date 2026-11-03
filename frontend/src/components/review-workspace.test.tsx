@@ -32,6 +32,7 @@ describe("ReviewWorkspace", () => {
   beforeEach(() => {
     apiFetch.mockReset();
     apiFetch.mockImplementation((path: string) => {
+      if (path === "me") return Promise.resolve({ subject: "oidc|reviewer", roles: ["reviewer"] });
       if (path.startsWith("reviews/review-1/history")) return Promise.resolve({ events: [] });
       if (path === "reviews/review-1") return Promise.resolve(review);
       return Promise.resolve({ status: "REVOKED" });
@@ -56,10 +57,25 @@ describe("ReviewWorkspace", () => {
   });
 
   it("blocks decisions when the bound snapshot is no longer eligible", async () => {
-    apiFetch.mockImplementation((path: string) => path.startsWith("reviews/review-1/history") ? Promise.resolve({ events: [] }) : Promise.resolve({ ...review, snapshot_current_eligible: false }));
+    apiFetch.mockImplementation((path: string) => {
+      if (path === "me") return Promise.resolve({ subject: "oidc|reviewer", roles: ["reviewer"] });
+      if (path.startsWith("reviews/review-1/history")) return Promise.resolve({ events: [] });
+      return Promise.resolve({ ...review, snapshot_current_eligible: false });
+    });
     renderReview();
     expect(await screen.findByRole("alert")).toHaveTextContent("Evidence is no longer current");
     expect(screen.getByRole("button", { name: "Approve grant path" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Revoke grant path" })).toBeDisabled();
+  });
+
+  it("lets a campaign-pool reviewer act when the review has no individual assignee", async () => {
+    apiFetch.mockImplementation((path: string) => {
+      if (path === "me") return Promise.resolve({ subject: "oidc|reviewer", roles: ["reviewer"] });
+      if (path.startsWith("reviews/review-1/history")) return Promise.resolve({ events: [] });
+      if (path === "reviews/review-1") return Promise.resolve({ ...review, assigned_reviewer_sub: null });
+      return Promise.resolve({ status: "APPROVED" });
+    });
+    renderReview();
+    expect(await screen.findByRole("button", { name: "Approve grant path" })).toBeEnabled();
   });
 });

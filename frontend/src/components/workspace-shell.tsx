@@ -6,6 +6,7 @@ import { signOut, useSession } from "next-auth/react";
 import { useQuery } from "@tanstack/react-query";
 import { apiFetch } from "@/lib/api/client";
 import type { AppIdentity } from "@/lib/api/types";
+import { defaultWorkspacePath } from "@/lib/navigation";
 
 const workspaceNav = [
   { href: "/reviews", label: "My review queue", icon: "▤", roles: ["reviewer"] },
@@ -33,7 +34,7 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="shell">
       <aside className="sidebar">
-        <Link href="/reviews" className="brand"><span className="brand-mark">IG</span><span>IAM Governance</span></Link>
+        <Link href={defaultWorkspacePath(roles)} className="brand"><span className="brand-mark">IG</span><span>IAM Governance</span></Link>
         <div>
           <div className="nav-label">Workspace</div>
           {visibleNav.map((item) => <Link className={`nav-link ${pathname.startsWith(item.href) ? "active" : ""}`} href={item.href} key={item.href}><span className="nav-icon" aria-hidden="true">{item.icon}</span>{item.label}</Link>)}

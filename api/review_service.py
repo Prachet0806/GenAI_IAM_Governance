@@ -1488,6 +1488,7 @@ def operations_audit(
     claims: dict = Depends(current_reviewer),
 ):
     require_remediation_operator(claims)
+    scopes = auth.identity_summary(claims)["account_scopes"]
     with db.get_connection() as conn:
         cur = conn.cursor()
         values: list = []

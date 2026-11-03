@@ -12,6 +12,8 @@ The Next.js app provides separate workspaces for the governance roles. It uses t
 
 The frontend presents decisions about an observed grant path. It does not infer that a principal has lost equivalent or effective access through other paths. GenAI explanations remain advisory.
 
+After sign-in, `/` reads the authenticated `/me` role summary and routes to the first available workspace in this order: reviewer, campaign administrator, remediation approver, auditor, then platform operator. Users with no configured workspace role receive an access-denied page. This routing is navigation only; API authorization remains authoritative.
+
 ## Local development
 
 1. Install Node.js 22 and pnpm 11.25.0.

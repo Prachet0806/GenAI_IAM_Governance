@@ -26,7 +26,7 @@ export function ReviewWorkspace({ reviewId }: { reviewId: string }) {
   });
   const explainError = explanation.error instanceof Error ? explanation.error.message : "An explanation could not be requested.";
   const decisionReady = detail.data?.status === "PENDING" && detail.data.campaign_state === "OPEN" && detail.data.exception_state !== "OPEN";
-  const canActAsReviewer = Boolean(identity.data?.roles.includes("reviewer") && detail.data?.assigned_reviewer_sub === identity.data.subject);
+  const canActAsReviewer = Boolean(identity.data?.roles.includes("reviewer") && (!detail.data?.assigned_reviewer_sub || detail.data.assigned_reviewer_sub === identity.data.subject));
   const current = detail.data?.snapshot_current_eligible;
   const timeline = useMemo(() => [...(history.data?.events ?? [])].reverse(), [history.data]);
 
@@ -86,7 +86,7 @@ export function ReviewWorkspace({ reviewId }: { reviewId: string }) {
           {item.campaign_state !== "OPEN" && <div className="notice warning">This campaign is {pretty(item.campaign_state).toLowerCase()}.</div>}
           {item.status !== "PENDING" && <div className="notice">A decision has already been recorded for this review.</div>}
           {decisionReady && canActAsReviewer && <><div className="field"><label htmlFor="comment">Reviewer comment {item.status === "PENDING" ? <span className="optional">(required for revocation)</span> : null}</label><textarea id="comment" className="textarea" maxLength={4000} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Record the reason for your decision. A comment is required to revoke." /></div><div className="decision-actions"><button className="button primary" disabled={decision.isPending || current === false} onClick={() => decide("APPROVED")}>{decision.isPending ? "Saving…" : "Approve grant path"}</button><button className="button danger" disabled={decision.isPending || current === false || !comment.trim()} onClick={() => decide("REVOKED")}>Revoke grant path</button></div>{current === false && <p className="secondary">Decisions are disabled because this snapshot is no longer current.</p>}<p className="decision-disclaimer">Your action is recorded in the certification history. Revoking this path does not prove that all access has been removed.</p></>}
-          {decisionReady && !canActAsReviewer && <div className="notice">Read-only evidence view. Only an assigned campaign reviewer can record a decision or request an explanation.</div>}
+          {decisionReady && !canActAsReviewer && <div className="notice">Read-only evidence view. A reviewer in this campaign must be assigned to this item before recording a decision or requesting an explanation.</div>}
         </div></section>
         <section className="panel"><div className="panel-head"><h2>Review context</h2></div><div className="panel-body"><dl className="context-list"><EvidenceItem label="Assignment" value={item.assigned_reviewer_sub || "Campaign reviewer"} /><EvidenceItem label="Due date" value={item.due_at ? new Date(item.due_at).toLocaleString() : "No deadline"} /><EvidenceItem label="Evidence state" value={pretty(item.evidence_state)} /><EvidenceItem label="Source coverage" value={item.source_coverage ? "Available" : "Not recorded"} /></dl></div></section>
       </aside>
