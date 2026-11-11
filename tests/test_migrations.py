@@ -515,6 +515,105 @@ def test_postgres_remediation_approval_events_and_worker_contention(
             db.execute(conn.cursor(), "DELETE FROM remediation_approval_events")
 
 
+def test_postgres_remediation_approval_decline_are_mutually_exclusive(
+    postgres_schema, monkeypatch
+):
+    """Concurrent approvers cannot record both terminal outcomes or execute a decline."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from fastapi import HTTPException, Response
+
+    from api import review_service
+    from common import repo
+    from common.db import db
+    from lambdas.generate_reviews.handler import generate_campaign
+    from lambdas.remediation import handler as remediation
+    from lambdas.risk_evaluation.handler import evaluate_risk
+    from tests.test_evidence_workflow import ACCOUNT_A, _policies, _publish
+    from tests.test_remediation_workflow import FakeIam
+
+    migrate.apply_postgres()
+    _publish(policies=_policies()[:1])
+    evaluate_risk(None, None)
+    campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT review_id FROM access_reviews WHERE campaign_id=%s",
+                    (campaign["campaign_id"],))
+        review_id = cur.fetchone()[0]
+        repo.assign_campaign_reviewer(conn, campaign["campaign_id"], "reviewer", "admin")
+    monkeypatch.setenv("REVIEWER_GROUP", "reviewers")
+    monkeypatch.setenv("REMEDIATION_APPROVER_GROUP", "approvers")
+    review_service.decide_review(
+        review_id,
+        review_service.DecisionRequest(decision="REVOKED", comment="remove path"),
+        {"sub": "reviewer", "groups": ["reviewers"]},
+    )
+
+    barrier = Barrier(2)
+
+    def attempt(decision):
+        barrier.wait()
+        try:
+            if decision == "APPROVED":
+                return review_service.approve_remediation(
+                    review_id, Response(), {"sub": "approver-a", "groups": ["approvers"]},
+                    review_service.RemediationApprovalRequest(
+                        decision="APPROVED", reason="Approved independently"
+                    ),
+                )["status"]
+            return review_service.decide_remediation_approval(
+                review_id,
+                review_service.RemediationApprovalRequest(
+                    decision="DECLINED", reason="Declined independently"
+                ),
+                Response(),
+                {"sub": "approver-b", "groups": ["approvers"]},
+            )["status"]
+        except HTTPException as exc:
+            assert exc.status_code == 409
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(attempt, ("APPROVED", "DECLINED")))
+    assert outcomes.count("conflict") == 1
+    assert sum(outcome in ("approved", "declined") for outcome in outcomes) == 1
+
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM remediation_approval_events WHERE review_id=%s",
+            (review_id,),
+        )
+        approval_count = cur.fetchone()[0]
+        cur.execute(
+            "SELECT COUNT(*) FROM remediation_approval_declines WHERE review_id=%s",
+            (review_id,),
+        )
+        decline_count = cur.fetchone()[0]
+        assert (approval_count, decline_count) in ((1, 0), (0, 1))
+        if decline_count:
+            binding = repo.review_evidence_binding(conn, review_id)
+            assert not repo.is_remediation_approved(
+                conn, review_id, binding["snapshot_id"]
+            )
+
+    if outcomes[1] == "declined":
+        monkeypatch.setenv("MOCK_IAM", "false")
+        monkeypatch.setenv("DRY_RUN", "false")
+        monkeypatch.setenv("ENABLE_REMEDIATION", "true")
+        monkeypatch.setenv("ALLOW_LIVE_REMEDIATION", "true")
+        monkeypatch.setenv("REMEDIATION_ALLOWLIST", "Reader")
+        monkeypatch.setenv("AWS_ACCOUNT_ID", ACCOUNT_A)
+        monkeypatch.setenv("STAGING_REMEDIATION_ACCEPTANCE_ID", "pg-test-acceptance")
+        monkeypatch.setenv("APP_ENV", "staging")
+        fake = FakeIam()
+        monkeypatch.setattr(remediation, "_get_iam_client", lambda: fake)
+        assert remediation.remediate_access(None, None)["remediated"] == 0
+        assert fake.actions == 0
+
+
 def test_postgres_operator_reconciliation_is_lease_bound(postgres_schema, monkeypatch):
     """A held action requires an operator request and a verified read-only result."""
     import psycopg2

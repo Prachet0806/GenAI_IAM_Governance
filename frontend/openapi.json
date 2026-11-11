@@ -624,6 +624,23 @@
           },
           {
             "in": "query",
+            "name": "event_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Event Type"
+            }
+          },
+          {
+            "in": "query",
             "name": "remediation_status",
             "required": false,
             "schema": {
@@ -1865,6 +1882,21 @@
                 }
               ],
               "title": "Risk Level"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "default": "due_date",
+              "enum": [
+                "due_date",
+                "risk",
+                "principal"
+              ],
+              "title": "Sort By",
+              "type": "string"
             }
           },
           {

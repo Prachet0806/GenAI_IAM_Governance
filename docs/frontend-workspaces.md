@@ -8,15 +8,21 @@ Start the stack with `docker compose up --build`. The frontend listens on `127.0
 
 ## Role workspaces
 
-- Reviewer: assigned queue, evidence detail, decision and history.
+- Reviewer: campaign-pool queue, evidence detail, decision and history. Explicitly assigned reviews are limited to that reviewer; unassigned reviews are available to any reviewer in the campaign pool.
 - Campaign administrator: published snapshot readiness, campaign creation, reviewer pool and assignments, progress, exceptions and lifecycle events.
 - Remediation approver: independent approval queue, eligibility blockers, decision reason, execution/reconciliation history.
 - Auditor: scoped decision history, export generation, download and manifest verification.
 - Platform operator: health, configured integrations, recorded processing activity, redacted operational events and exact-path reconciliation requests.
 
-The backend authorizes each request and account scope. The browser receives only the `/me` role summary; bearer access tokens stay in the server-side Auth.js session and BFF. Campaign and export aggregates are calculated only after scope predicates are applied. Compose forwards `OIDC_ACCOUNT_SCOPE_CLAIM`, defaulting to `aws_account_scopes`; tokens without that claim receive no account-scoped rows. When running the API directly, configure this variable explicitly: if it is unset, the current API treats scope as organization-wide. A wildcard scope must be explicitly issued by the identity provider. Operations activity does not imply worker liveness: this release reports worker heartbeat as unavailable until a heartbeat source is deployed.
+The backend authorizes each request and account scope. The browser receives only the `/me` role summary; bearer access tokens stay in the server-side Auth.js session and BFF. Campaign and export aggregates are calculated only after scope predicates are applied. Compose forwards `OIDC_ACCOUNT_SCOPE_CLAIM`, defaulting to `aws_account_scopes`; missing, empty, or malformed claim values receive no account-scoped access. Staging and production refuse API startup if the claim name is not configured. An explicit wildcard in the trusted identity-provider claim grants global scope; local global scope otherwise requires `OIDC_ALLOW_GLOBAL_SCOPE=true`. Operations activity does not imply worker liveness: this release reports worker heartbeat as unavailable until a heartbeat source is deployed.
 
-Campaign reviewer assignment currently accepts an administrator-entered OIDC subject. There is no identity-provider directory integration, so the API cannot validate that a target subject belongs to the reviewer group. Verify subjects and group membership through the organization's identity process before assignment; an eligible-reviewer directory endpoint remains follow-up work.
+Campaign reviewer assignment has no identity-provider directory integration. Shared environments reject assignment and reassignment until provider-backed eligibility lookup is available. Local development can explicitly enable unverified subject entry with `OIDC_ALLOW_UNVERIFIED_REVIEWER_ASSIGNMENTS=true`; do not use that setting for authenticated staging acceptance.
+
+## Frontend interaction and verification
+
+The workspaces render named governance fields and workflow states rather than arbitrary response keys. Paginated lists request bounded server-side pages; the reviewer queue can filter status, risk, and search text and sort by due date, risk, or principal. Campaign administrators can allocate or reassign selected pending reviews, with separate API requests and a clear partial-success message. Audit event type is an exact match filter. Confirmation dialogs identify the principal, account, grant path, snapshot, or target before high-impact actions.
+
+Run `pnpm test:e2e` from `frontend` for browser journeys across the five roles. These tests mint a test-only Auth.js session, mock `/api/backend` responses, and run Axe against WCAG 2.2 AA criteria on each workspace. Automated checks do not replace manual assistive-technology testing. The journeys do not establish real OIDC, API authorization, AWS connectivity, worker execution, or cloud deployment readiness. Notifications, global search, and identity-provider reviewer lookup need supporting API endpoints before they can be represented as live product capabilities. Effective access across every possible grant path remains unevaluated by the engine.
 
 ## Deployment boundary
 

@@ -40,12 +40,14 @@ describe("ReviewerQueue", () => {
 
     fireEvent.change(screen.getByLabelText("Decision status"), { target: { value: "ALL" } });
     fireEvent.change(screen.getByLabelText("Risk level"), { target: { value: "HIGH" } });
+    fireEvent.change(screen.getByLabelText("Sort reviews"), { target: { value: "risk" } });
     fireEvent.change(screen.getByLabelText("Search principal or grant"), { target: { value: "billing" } });
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
 
     await waitFor(() => expect(apiFetch).toHaveBeenCalledWith(expect.stringContaining("status=ALL")));
     expect(apiFetch).toHaveBeenCalledWith(expect.stringContaining("risk_level=HIGH"));
     expect(apiFetch).toHaveBeenCalledWith(expect.stringContaining("search=billing"));
+    expect(apiFetch).toHaveBeenCalledWith(expect.stringContaining("sort_by=risk"));
     expect(await screen.findByRole("link", { name: "Review →" })).toHaveAttribute("href", "/reviews/review-1");
   });
 

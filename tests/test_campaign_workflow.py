@@ -5,6 +5,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,9 +38,17 @@ def _setup(tmp_path, monkeypatch):
     def verify(token):
         if token == "bad":
             raise auth.AuthenticationError("invalid")
+        if token == "outsider":
+            groups = ["reviewers"]
+        elif token == "dual_admin":
+            groups = ["reviewers", "campaign-admins"]
+        elif token == "admin":
+            groups = ["campaign-admins"]
+        else:
+            groups = ["reviewers"]
         return {
             "sub": token,
-            "groups": ["campaign-admins"] if token == "admin" else ["reviewers"],
+            "groups": groups,
         }
 
     monkeypatch.setattr(auth, "verify_access_token", verify)
@@ -57,13 +66,16 @@ def test_queue_assignment_and_cross_campaign_isolation(tmp_path, monkeypatch):
     assert [row["review_id"] for row in _request(client, "GET", "/reviews/queue", "alice").json()["reviews"]] == ["REV1"]
     assert _request(client, "GET", "/reviews/REV2", "alice").status_code == 403
     assert _request(client, "POST", "/reviews/REV1/assignment", "alice", {"reviewer_sub": "bob"}).status_code == 403
-    assert _request(client, "POST", "/reviews/REV1/assignment", "admin", {"reviewer_sub": "charlie"}).status_code == 422
+    invalid_assignment = _request(client, "POST", "/reviews/REV1/assignment", "admin", {"reviewer_sub": "charlie"})
+    assert invalid_assignment.status_code == 422, invalid_assignment.text
     assigned = _request(client, "POST", "/reviews/REV1/assignment", "admin", {"reviewer_sub": "bob"})
     assert assigned.status_code == 200
     assert _request(client, "GET", "/reviews/queue", "alice").json()["reviews"] == []
     assert _request(client, "GET", "/reviews/REV1", "alice").status_code == 403
     assert _request(client, "POST", "/reviews/REV1/decision", "alice", {"decision": "APPROVED"}).status_code == 403
-    assert _request(client, "GET", "/reviews/REV1", "bob").status_code == 200
+    bob_review = _request(client, "GET", "/reviews/REV1", "bob")
+    assert bob_review.status_code == 200
+    assert bob_review.json()["can_decide"] is True
     events = _request(client, "GET", "/campaigns/C1/events", "bob").json()["events"]
     assert events[0]["event_type"] == "REVIEW_ASSIGNED"
     assert _request(client, "GET", "/campaigns/C2/events", "bob").status_code == 403
@@ -109,6 +121,111 @@ def test_frontend_identity_queue_filters_summary_and_account_scope(tmp_path, mon
     assert scoped_queue["total"] == 0
 
 
+def test_account_scope_fails_closed_and_accepts_explicit_scopes(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "staging")
+    monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "account_scopes")
+    monkeypatch.setenv("OIDC_ALLOW_GLOBAL_SCOPE", "true")
+
+    one = auth.identity_summary({"sub": "user", "account_scopes": "123456789012"})
+    assert one["account_scopes"] == ["123456789012"]
+    auth.require_account_scope({"sub": "user", "account_scopes": ["123456789012"]}, "123456789012")
+    with pytest.raises(auth.AuthorizationError):
+        auth.require_account_scope({"sub": "user", "account_scopes": ["123456789012"]}, "999999999999")
+
+    multiple = auth.identity_summary({"sub": "user", "account_scopes": ["999999999999", "123456789012"]})
+    assert multiple["account_scopes"] == ["123456789012", "999999999999"]
+    wildcard = {"sub": "user", "account_scopes": ["*"]}
+    auth.require_account_scope(wildcard, "999999999999")
+
+    for bad_claim in (None, [], [""], ["not-an-account"], ["*", "123456789012"], [123]):
+        claims = {"sub": "user"}
+        if bad_claim is not None:
+            claims["account_scopes"] = bad_claim
+        assert auth.identity_summary(claims)["account_scopes"] == []
+        with pytest.raises(auth.AuthorizationError):
+            auth.require_account_scope(claims, "123456789012")
+
+    monkeypatch.delenv("OIDC_ACCOUNT_SCOPE_CLAIM", raising=False)
+    monkeypatch.setenv("OIDC_ALLOW_GLOBAL_SCOPE", "false")
+    unconfigured = {"sub": "user"}
+    assert auth.identity_summary(unconfigured)["scope_mode"] == "unconfigured"
+    with pytest.raises(auth.AuthorizationError):
+        auth.require_account_scope(unconfigured, "123456789012")
+
+
+def test_shared_environment_requires_account_scope_claim(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.delenv("OIDC_ACCOUNT_SCOPE_CLAIM", raising=False)
+    with pytest.raises(RuntimeError, match="OIDC_ACCOUNT_SCOPE_CLAIM"):
+        auth.validate_account_scope_configuration()
+    with pytest.raises(RuntimeError, match="OIDC_ACCOUNT_SCOPE_CLAIM"):
+        with TestClient(app):
+            pass
+
+
+def test_api_rejects_missing_empty_and_malformed_account_scope_claims(tmp_path, monkeypatch):
+    client, _ = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "account_scopes")
+
+    def verify(token):
+        claims = {"sub": token, "groups": ["reviewers"]}
+        if token == "valid":
+            claims["account_scopes"] = ["123456789012"]
+        elif token == "empty":
+            claims["account_scopes"] = []
+        elif token == "malformed":
+            claims["account_scopes"] = ["not-an-account"]
+        return claims
+
+    monkeypatch.setattr(auth, "verify_access_token", verify)
+    assert _request(client, "GET", "/me", "missing").status_code == 403
+    assert _request(client, "GET", "/me", "empty").status_code == 403
+    assert _request(client, "GET", "/me", "malformed").status_code == 403
+    valid = _request(client, "GET", "/me", "valid")
+    assert valid.status_code == 200
+    assert valid.json()["account_scopes"] == ["123456789012"]
+
+
+def test_review_detail_returns_authoritative_decision_eligibility(tmp_path, monkeypatch):
+    client, _ = _setup(tmp_path, monkeypatch)
+    # A campaign-pool reviewer can decide an unassigned item.
+    pool = _request(client, "GET", "/reviews/REV1", "alice").json()
+    assert pool["can_decide"] is True
+    assert pool["can_decide_reason"] is None
+
+    # A dual-role campaign administrator still needs reviewer-pool membership.
+    admin = _request(client, "GET", "/reviews/REV1", "dual_admin").json()
+    assert admin["can_decide"] is False
+    assert admin["can_decide_reason"] == "CAMPAIGN_MEMBERSHIP_REQUIRED"
+
+    # Membership does not override an individual assignment to someone else.
+    with db.get_connection() as conn:
+        repo.assign_campaign_reviewer(conn, "C1", "dual_admin", "admin")
+        workflow.assign_review(conn, "REV1", "bob", "admin")
+    assigned_elsewhere = _request(client, "GET", "/reviews/REV1", "dual_admin").json()
+    assert assigned_elsewhere["can_decide"] is False
+    assert assigned_elsewhere["can_decide_reason"] == "ASSIGNED_TO_ANOTHER_REVIEWER"
+
+    # A nonmember reviewer cannot read a review to infer its evidence or eligibility.
+    assert _request(client, "GET", "/reviews/REV1", "outsider").status_code == 403
+    assert _request(client, "POST", "/reviews/REV1/decision", "outsider", {"decision": "APPROVED"}).status_code == 403
+
+
+def test_shared_environment_blocks_unverified_reviewer_assignments(tmp_path, monkeypatch):
+    client, _ = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("APP_ENV", "staging")
+    monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "account_scopes")
+    monkeypatch.setattr(auth, "verify_access_token", lambda token: {
+        "sub": token, "groups": ["campaign-admins"], "account_scopes": ["*"]
+    })
+    monkeypatch.setenv("OIDC_ALLOW_UNVERIFIED_REVIEWER_ASSIGNMENTS", "true")
+    response = _request(client, "POST", "/campaigns/C1/reviewers", "admin", {"reviewer_sub": "dave"})
+    assert response.status_code == 503
+    assert "identity-provider directory verification" in response.json()["error"]["message"]
+    reassignment = _request(client, "POST", "/reviews/REV1/assignment", "admin", {"reviewer_sub": "bob"})
+    assert reassignment.status_code == 503
+
+
 def test_exception_blocks_decision_and_campaign_close_until_resolved(tmp_path, monkeypatch):
     client, path = _setup(tmp_path, monkeypatch)
     opened = _request(client, "POST", "/reviews/REV1/exception", "alice", {"reason": "Manager review needed"})
@@ -151,6 +268,9 @@ def test_campaign_ownership_scope_deadlines_and_invalid_transitions(tmp_path, mo
     assert first_page.status_code == second_page.status_code == 200
     assert len(first_page.json()["events"]) == len(second_page.json()["events"]) == 1
     assert first_page.json()["events"][0]["event_id"] != second_page.json()["events"][0]["event_id"]
+    assert first_page.json()["total"] >= 2
+    assert first_page.json()["has_more"] is True
+    assert second_page.json()["offset"] == 1
     assert _request(client, "GET", "/campaigns/C1/events?limit=0", "admin").status_code == 422
 
 
@@ -162,6 +282,46 @@ def test_queue_repository_limits_and_preserves_pool_access(tmp_path, monkeypatch
     assert _request(client, "GET", "/reviews/queue?limit=1&offset=0", "alice").json()["reviews"][0]["review_id"] == "REV1"
     assert _request(client, "GET", "/reviews/queue?limit=1&offset=1", "alice").json()["reviews"] == []
     assert _request(client, "GET", "/reviews/queue?limit=0", "alice").status_code == 422
+    assert _request(client, "GET", "/reviews/queue?sort_by=risk", "alice").status_code == 200
+    assert _request(client, "GET", "/reviews/queue?sort_by=arbitrary_sql", "alice").status_code == 422
+
+
+def test_audit_event_type_filter_returns_only_matching_events(tmp_path, monkeypatch):
+    client, _ = _setup(tmp_path, monkeypatch)
+    assigned = _request(client, "POST", "/campaigns/C1/reviewers", "admin", {"reviewer_sub": "dave"})
+    assert assigned.status_code == 201
+    all_events = _request(client, "GET", "/audit/events", "admin")
+    assert all_events.status_code == 200
+    assert all_events.json()["events"]
+    filtered = _request(client, "GET", "/audit/events?event_type=NOT_A_REAL_EVENT", "admin")
+    assert filtered.status_code == 200
+    assert filtered.json()["events"] == []
+
+
+def test_audit_aggregation_includes_campaign_events_past_old_fetch_cap(
+    tmp_path, monkeypatch
+):
+    from common import workspaces
+
+    _setup(tmp_path, monkeypatch)
+    with db.get_connection() as conn:
+        db.executemany(
+            conn.cursor(),
+            """INSERT INTO review_workflow_events
+               (event_id,campaign_id,review_id,event_type,actor_sub,
+                previous_value,new_value,details,created_at)
+               VALUES (?,? ,NULL,?,?,NULL,NULL,'{}',?)""",
+            [
+                (f"BULK-{index:04d}", "C1", "BULK_EVENT", "admin", "2000-01-01T00:00:00+00:00")
+                for index in range(1001)
+            ],
+        )
+        result = workspaces.audit_events(
+            conn, None, campaign_id="C1", limit=50, offset=1000
+        )
+
+    assert result["total"] >= 1001
+    assert any(event["event_id"] == "BULK-0000" for event in result["events"])
 
 
 def test_campaign_reviewer_assignment_validates_subject_and_records_event(tmp_path, monkeypatch):

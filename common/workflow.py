@@ -117,6 +117,7 @@ def queue(
     campaign_id: str | None = None, account_id: str | None = None,
     principal: str | None = None, search: str | None = None,
     due_before: str | None = None,
+    sort_by: str = "due_date",
     account_scopes: list[str] | None = None,
 ):
     cur = conn.cursor()
@@ -126,6 +127,13 @@ def queue(
         due_before=due_before,
         account_scopes=account_scopes,
     )
+    risk_sql = "CASE WHEN r.observation_id IS NULL THEN rol.risk_level ELSE gra.risk_level END"
+    principal_sql = "LOWER(COALESCE(go.principal_name,u.user_name))"
+    order_by = {
+        "due_date": "CASE WHEN r.due_at IS NULL THEN 1 ELSE 0 END,r.due_at",
+        "risk": f"CASE {risk_sql} WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 WHEN 'LOW' THEN 2 ELSE 3 END,CASE WHEN r.due_at IS NULL THEN 1 ELSE 0 END,r.due_at",
+        "principal": f"{principal_sql},CASE WHEN r.due_at IS NULL THEN 1 ELSE 0 END,r.due_at",
+    }[sort_by]
     db.execute(
         cur,
         f"""SELECT r.review_id,r.campaign_id,r.status,r.assigned_reviewer_sub,
@@ -134,8 +142,7 @@ def queue(
                   COALESCE(go.principal_name,u.user_name) AS principal,
                   COALESCE(go.policy_name,rol.role_name) AS grant_name,
                   gp.grant_type,go.source_name,
-                  CASE WHEN r.observation_id IS NULL THEN rol.risk_level
-                       ELSE gra.risk_level END AS risk_level
+                  {risk_sql} AS risk_level
            FROM access_reviews r
            JOIN campaigns c ON c.campaign_id=r.campaign_id
            JOIN campaign_reviewers cr ON cr.campaign_id=r.campaign_id
@@ -146,8 +153,7 @@ def queue(
            LEFT JOIN grant_risk_assessments gra
              ON gra.assessment_id=r.risk_assessment_id
            WHERE {where}
-           ORDER BY CASE WHEN r.due_at IS NULL THEN 1 ELSE 0 END,
-                    r.due_at,r.created_at,r.review_id LIMIT ? OFFSET ?""",
+           ORDER BY {order_by},r.created_at,r.review_id LIMIT ? OFFSET ?""",
         [reviewer_sub, reviewer_sub, *filters, limit, offset],
     )
     rows = [_row_dict(cur, row) for row in cur.fetchall()]

@@ -37,7 +37,7 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
         <Link href={defaultWorkspacePath(roles)} className="brand"><span className="brand-mark">IG</span><span>IAM Governance</span></Link>
         <div>
           <div className="nav-label">Workspace</div>
-          {visibleNav.map((item) => <Link className={`nav-link ${pathname.startsWith(item.href) ? "active" : ""}`} href={item.href} key={item.href}><span className="nav-icon" aria-hidden="true">{item.icon}</span>{item.label}</Link>)}
+          {visibleNav.map((item) => <Link aria-current={pathname.startsWith(item.href) ? "page" : undefined} className={`nav-link ${pathname.startsWith(item.href) ? "active" : ""}`} href={item.href} key={item.href}><span className="nav-icon" aria-hidden="true">{item.icon}</span>{item.label}</Link>)}
         </div>
         <div className="sidebar-footer">
           <div>Evidence-led certification</div>
@@ -46,9 +46,9 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
       </aside>
       <div className="main">
         <header className="topbar">
-          <div className="crumb">Governance <span aria-hidden="true">/</span> {titleForPath(pathname)}</div>
-          <nav className="mobile-nav" aria-label="Workspaces">{visibleNav.map((item) => <Link className={pathname.startsWith(item.href) ? "active" : ""} href={item.href} key={item.href}>{item.label}</Link>)}</nav>
-          <div className="user-menu"><span className="avatar" aria-hidden="true">{initials}</span><span className="user-name">{name}</span><button className="button subtle signout" onClick={() => signOut({ callbackUrl: "/login" })}>Sign out</button></div>
+          <div className="crumb"><Link href={defaultWorkspacePath(roles)}>Workspace</Link> <span aria-hidden="true">/</span> {titleForPath(pathname)}</div>
+          <nav className="mobile-nav" aria-label="Workspaces">{visibleNav.map((item) => <Link aria-current={pathname.startsWith(item.href) ? "page" : undefined} className={pathname.startsWith(item.href) ? "active" : ""} href={item.href} key={item.href}>{item.label}</Link>)}</nav>
+          <details className="profile-menu"><summary className="user-menu"><span className="avatar" aria-hidden="true">{initials}</span><span className="user-name">{name}</span><span className="profile-caret" aria-hidden="true">⌄</span></summary><div className="profile-popover"><strong>{name}</strong><span className="secondary">{identity?.email || "Organization account"}</span><div className="profile-divider"/><span className="profile-label">Assigned roles</span><div className="profile-roles">{identity?.roles.map((role) => <span className="status-badge neutral" key={role}>{role.replaceAll("_", " ")}</span>)}</div><span className="profile-label">Account scope</span><span>{identity?.scope_mode === "claim" ? identity.account_scopes?.join(", ") || "No account scope claim" : "Organization-wide scope"}</span><button className="button subtle signout" onClick={() => void signOut({ callbackUrl: "/login" })}>Sign out</button></div></details>
         </header>
         <main className="page">
           {identityQuery.isLoading && <div className="loading" role="status">Checking your workspace access…</div>}

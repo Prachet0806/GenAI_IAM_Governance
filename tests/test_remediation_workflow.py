@@ -17,12 +17,17 @@ from scripts import migrate
 from tests.test_evidence_workflow import ACCOUNT_A, POLICY_ARN, READ_POLICY, _publish, _user
 
 
+def _scoped_claims(sub, groups):
+    return {"sub": sub, "groups": groups, "aws_account_scopes": ["*"]}
+
+
 @pytest.fixture
 def prepared_review(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_URL", f"sqlite:///{tmp_path / 'remediation.db'}")
     monkeypatch.setenv("LOCAL_ONLY", "true")
     monkeypatch.setenv("REVIEWER_GROUP", "reviewers")
     monkeypatch.setenv("REMEDIATION_APPROVER_GROUP", "approvers")
+    monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "aws_account_scopes")
     migrate.apply_sqlite()
 
     def create(grant_type="DIRECT_MANAGED"):
@@ -57,10 +62,10 @@ def prepared_review(tmp_path, monkeypatch):
             review_service.DecisionRequest(
                 decision="REVOKED", comment="Remove this exact path"
             ),
-            {"sub": "reviewer", "groups": ["reviewers"]},
+            _scoped_claims("reviewer", ["reviewers"]),
         )
         approval = review_service.approve_remediation(
-            review_id, Response(), {"sub": "approver", "groups": ["approvers"]}
+            review_id, Response(), _scoped_claims("approver", ["approvers"])
         )
         assert approval["action_type"] == repo.REMEDIATION_ACTIONS[grant_type]
         with db.get_connection() as conn:
@@ -171,12 +176,12 @@ def test_inline_policy_delete_has_exact_path_evidence(
     from fastapi import HTTPException
 
     visible = review_service.get_remediation_history(
-        review_id, {"sub": "approver", "groups": ["approvers"]}
+        review_id, _scoped_claims("approver", ["approvers"])
     )
     assert len(visible["action_events"]) == 3
     with pytest.raises(HTTPException) as denied:
         review_service.get_remediation_history(
-            review_id, {"sub": "stranger", "groups": []}
+            review_id, _scoped_claims("stranger", [])
         )
     assert denied.value.status_code == 403
     monkeypatch.chdir(tmp_path)
@@ -286,15 +291,15 @@ def test_operator_recheck_resolves_hold_without_repeating_action(
     request = review_service.ExceptionRequest(reason="Investigated the uncertain result")
     with pytest.raises(HTTPException) as denied:
         review_service.request_remediation_reconciliation(
-            review_id, request, {"sub": "approver", "groups": ["approvers"]}
+            review_id, request, _scoped_claims("approver", ["approvers"])
         )
     assert denied.value.status_code == 403
     requested = review_service.request_remediation_reconciliation(
-        review_id, request, {"sub": "operator", "groups": ["operators"]}
+        review_id, request, _scoped_claims("operator", ["operators"])
     )
     with pytest.raises(HTTPException) as duplicate:
         review_service.request_remediation_reconciliation(
-            review_id, request, {"sub": "operator", "groups": ["operators"]}
+            review_id, request, _scoped_claims("operator", ["operators"])
         )
     assert duplicate.value.status_code == 409
     assert remediation.remediate_access(None, None)["reconciliation_required"] == 1
@@ -308,7 +313,7 @@ def test_operator_recheck_resolves_hold_without_repeating_action(
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("DELETE FROM remediation_reconciliation_events")
     review_service.request_remediation_reconciliation(
-        review_id, request, {"sub": "operator", "groups": ["operators"]}
+        review_id, request, _scoped_claims("operator", ["operators"])
     )
     fake.present = False  # External investigation removed the exact attachment.
     assert remediation.remediate_access(None, None)["remediated"] == 1
@@ -339,7 +344,7 @@ def test_operator_recheck_unreadable_keeps_hold(prepared_review, monkeypatch):
     fake.get_user = unreadable
     review_service.request_remediation_reconciliation(
         review_id, review_service.ExceptionRequest(reason="Check uncertain inline deletion"),
-        {"sub": "operator", "groups": ["operators"]},
+        _scoped_claims("operator", ["operators"]),
     )
     assert remediation.remediate_access(None, None)["reconciliation_required"] == 1
     assert fake.actions == 1
@@ -356,7 +361,7 @@ def test_operator_recheck_unreadable_keeps_hold(prepared_review, monkeypatch):
     }}
     review_service.request_remediation_reconciliation(
         review_id, review_service.ExceptionRequest(reason="Check principal identity"),
-        {"sub": "operator", "groups": ["operators"]},
+        _scoped_claims("operator", ["operators"]),
     )
     assert remediation.remediate_access(None, None)["reconciliation_required"] == 1
     assert fake.actions == 1
@@ -384,7 +389,7 @@ def test_pre_migration_hold_uses_immutable_preflight_identity(
         )
     review_service.request_remediation_reconciliation(
         review_id, review_service.ExceptionRequest(reason="Verify historical hold"),
-        {"sub": "operator", "groups": ["operators"]},
+        _scoped_claims("operator", ["operators"]),
     )
     fake.present = False
     assert remediation.remediate_access(None, None)["remediated"] == 1

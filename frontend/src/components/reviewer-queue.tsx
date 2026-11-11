@@ -12,13 +12,14 @@ function pretty(value: string) { return value.toLowerCase().replaceAll("_", " ")
 export function ReviewerQueue() {
   const [status, setStatus] = useState("PENDING");
   const [risk, setRisk] = useState("");
+  const [sortBy, setSortBy] = useState("due_date");
   const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
-  const query = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(page * PAGE_SIZE), status });
+  const query = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(page * PAGE_SIZE), status, sort_by: sortBy });
   if (risk) query.set("risk_level", risk);
   if (search) query.set("search", search);
-  const queue = useQuery({ queryKey: ["queue", status, risk, search, page], queryFn: () => apiFetch<ReviewQueueResponse>(`reviews/queue?${query}`) });
+  const queue = useQuery({ queryKey: ["queue", status, risk, search, sortBy, page], queryFn: () => apiFetch<ReviewQueueResponse>(`reviews/queue?${query}`) });
   const summary = useQuery({ queryKey: ["summary"], queryFn: () => apiFetch<ReviewSummary>("reviews/summary") });
   const error = queue.error instanceof Error ? queue.error.message : "The assigned queue could not be loaded.";
 
@@ -34,6 +35,7 @@ export function ReviewerQueue() {
       <form className="filters" onSubmit={applySearch}>
         <div className="field"><label htmlFor="status">Decision status</label><select id="status" className="select" value={status} onChange={(e) => { setStatus(e.target.value); setPage(0); }}><option value="PENDING">Awaiting decision</option><option value="ALL">All assigned</option><option value="APPROVED">Approved</option><option value="REVOKED">Revoked</option></select></div>
         <div className="field"><label htmlFor="risk">Risk level</label><select id="risk" className="select" value={risk} onChange={(e) => { setRisk(e.target.value); setPage(0); }}><option value="">All levels</option><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option><option value="UNKNOWN">Unknown</option></select></div>
+        <div className="field"><label htmlFor="sort-by">Sort reviews</label><select id="sort-by" className="select" value={sortBy} onChange={(e) => { setSortBy(e.target.value); setPage(0); }}><option value="due_date">Due date</option><option value="risk">Highest risk</option><option value="principal">Principal A to Z</option></select></div>
         <div className="field grow"><label htmlFor="search">Search principal or grant</label><input id="search" className="input" value={searchInput} onChange={(e) => setSearchInput(e.target.value)} placeholder="Name, permission, source" /></div>
         <button className="button primary" type="submit">Search</button>
       </form>

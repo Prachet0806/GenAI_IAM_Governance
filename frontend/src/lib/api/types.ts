@@ -95,6 +95,8 @@ export type ReviewDetail = {
   principal_access_status: "not_evaluated";
   ai_explanation: AiExplanation;
   assigned_reviewer_sub: string | null;
+  can_decide: boolean;
+  can_decide_reason: string | null;
   due_at: string | null;
   exception_state: string;
   campaign_state: string;

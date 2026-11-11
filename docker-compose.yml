@@ -31,6 +31,7 @@ services:
       context: .
       dockerfile: Dockerfile.api
     environment:
+      APP_ENV: ${APP_ENV:-development}
       DB_URL: postgresql://iam_governance:${POSTGRES_PASSWORD}@postgres:5432/iam_governance
       LOCAL_ONLY: "false"
       MOCK_IAM: "true"
@@ -41,6 +42,8 @@ services:
       OIDC_AUDIENCE: ${OIDC_AUDIENCE:?Set OIDC_AUDIENCE in .env}
       OIDC_JWKS_URL: ${OIDC_JWKS_URL:?Set OIDC_JWKS_URL in .env}
       OIDC_ACCOUNT_SCOPE_CLAIM: ${OIDC_ACCOUNT_SCOPE_CLAIM:-aws_account_scopes}
+      OIDC_ALLOW_GLOBAL_SCOPE: ${OIDC_ALLOW_GLOBAL_SCOPE:-false}
+      OIDC_ALLOW_UNVERIFIED_REVIEWER_ASSIGNMENTS: ${OIDC_ALLOW_UNVERIFIED_REVIEWER_ASSIGNMENTS:-false}
       REVIEWER_GROUP: ${REVIEWER_GROUP:-reviewer}
       CAMPAIGN_ADMIN_GROUP: ${CAMPAIGN_ADMIN_GROUP:-campaign_admin}
       REMEDIATION_APPROVER_GROUP: ${REMEDIATION_APPROVER_GROUP:-remediation_approver}

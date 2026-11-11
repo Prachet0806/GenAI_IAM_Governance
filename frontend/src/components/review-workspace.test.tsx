@@ -19,6 +19,7 @@ const review: ReviewDetail = {
   snapshot_published_at: "2026-01-01T00:00:00Z", snapshot_current_eligible: true,
   review_scope: "GRANT_PATH", principal_access_status: "not_evaluated",
   ai_explanation: { status: "not_available", summary: null }, assigned_reviewer_sub: "oidc|reviewer",
+  can_decide: true, can_decide_reason: null,
   due_at: null, exception_state: "NONE", campaign_state: "OPEN",
 };
 
@@ -40,7 +41,6 @@ describe("ReviewWorkspace", () => {
   });
 
   it("keeps observed grant evidence distinct from effective access and records a commented revocation", async () => {
-    vi.spyOn(window, "confirm").mockReturnValue(true);
     renderReview();
     expect(await screen.findByText("BillingReadOnly")).toBeInTheDocument();
     expect(screen.getByText("Not evaluated")).toBeInTheDocument();
@@ -49,11 +49,23 @@ describe("ReviewWorkspace", () => {
 
     fireEvent.change(screen.getByLabelText(/Reviewer comment/), { target: { value: "No longer required" } });
     fireEvent.click(screen.getByRole("button", { name: "Revoke grant path" }));
+    expect(await screen.findByRole("dialog")).toHaveTextContent("Jordan Lee");
+    expect(screen.getByRole("dialog")).toHaveTextContent("BillingReadOnly");
+    expect(apiFetch).not.toHaveBeenCalledWith("reviews/review-1/decision", expect.anything());
+    fireEvent.click(screen.getByRole("button", { name: "Record revocation" }));
 
     await waitFor(() => expect(apiFetch).toHaveBeenCalledWith("reviews/review-1/decision", expect.objectContaining({
       method: "POST", body: JSON.stringify({ decision: "REVOKED", comment: "No longer required" }),
     })));
-    expect(window.confirm).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a decision without sending it to the API", async () => {
+    renderReview();
+    fireEvent.click(await screen.findByRole("button", { name: "Approve grant path" }));
+    expect(await screen.findByRole("dialog")).toHaveTextContent("This exact review decision will be recorded");
+    fireEvent.click(screen.getByRole("button", { name: "Go back" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(apiFetch).not.toHaveBeenCalledWith("reviews/review-1/decision", expect.anything());
   });
 
   it("blocks decisions when the bound snapshot is no longer eligible", async () => {
@@ -77,5 +89,18 @@ describe("ReviewWorkspace", () => {
     });
     renderReview();
     expect(await screen.findByRole("button", { name: "Approve grant path" })).toBeEnabled();
+  });
+
+  it("uses API eligibility and explains a read-only review", async () => {
+    apiFetch.mockImplementation((path: string) => {
+      if (path.startsWith("reviews/review-1/history")) return Promise.resolve({ events: [] });
+      if (path === "reviews/review-1") return Promise.resolve({
+        ...review, can_decide: false, can_decide_reason: "CAMPAIGN_MEMBERSHIP_REQUIRED",
+      });
+      return Promise.resolve({});
+    });
+    renderReview();
+    expect(await screen.findByText(/not assigned to this campaign's reviewer pool/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve grant path" })).not.toBeInTheDocument();
   });
 });

@@ -9,6 +9,7 @@ import hashlib
 import os
 import re
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Literal
@@ -23,9 +24,15 @@ from pydantic import BaseModel, Field
 from common import ai_artifacts, auth, config, repo, workflow, workspaces
 from common.db import db
 
+@asynccontextmanager
+async def lifespan(_app):
+    auth.validate_account_scope_configuration()
+    yield
+
+
 app = FastAPI(
     title="IAM Access Review API", docs_url=None, redoc_url=None,
-    openapi_url="/openapi.json",
+    openapi_url="/openapi.json", lifespan=lifespan,
 )
 bearer = HTTPBearer(auto_error=False)
 
@@ -153,6 +160,13 @@ def current_reviewer(
             detail="Invalid access token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    try:
+        auth.validate_account_scope_claim(claims)
+    except auth.AuthorizationError:
+        raise HTTPException(
+            status_code=403,
+            detail="A valid account-scope claim is required",
+        ) from None
     return claims
 
 
@@ -290,6 +304,7 @@ def reviewer_queue(
     offset: int = Query(default=0, ge=0),
     status: Literal["ALL", "PENDING", "APPROVED", "REVOKED"] = "PENDING",
     risk_level: Literal["LOW", "MEDIUM", "HIGH", "UNKNOWN"] | None = None,
+    sort_by: Literal["due_date", "risk", "principal"] = "due_date",
     campaign_id: str | None = Query(default=None, max_length=128),
     account_id: str | None = Query(default=None, min_length=12, max_length=12),
     principal: str | None = Query(default=None, max_length=256),
@@ -313,7 +328,8 @@ def reviewer_queue(
             "account_scopes": account_scopes,
         }
         reviews = workflow.queue(
-            conn, claims["sub"], limit=limit, offset=offset, **filters
+            conn, claims["sub"], limit=limit, offset=offset,
+            sort_by=sort_by, **filters
         )
         total = workflow.queue_total(conn, claims["sub"], **filters)
         return {
@@ -406,10 +422,20 @@ def create_campaign(request: CampaignCreateRequest, claims: dict = Depends(curre
     return {**created, "name": request.name.strip(), "state": "OPEN"}
 
 
-def _review_detail_payload(conn, review_id: str, review_state: dict):
+def _review_detail_payload(conn, review_id: str, review_state: dict, claims: dict):
     row = repo.fetch_review_ai_context(conn, review_id)
     if not row:
         raise HTTPException(status_code=404, detail="Review not found")
+    if not auth.has_group(claims, os.getenv("REVIEWER_GROUP", "")):
+        decision_reason = "REVIEWER_GROUP_REQUIRED"
+    elif not repo.is_campaign_reviewer(
+        conn, review_state["campaign_id"], claims["sub"]
+    ):
+        decision_reason = "CAMPAIGN_MEMBERSHIP_REQUIRED"
+    elif review_state["assigned_reviewer_sub"] not in (None, claims["sub"]):
+        decision_reason = "ASSIGNED_TO_ANOTHER_REVIEWER"
+    else:
+        decision_reason = None
     return {
             "review_id": row[0],
             "status": row[1],
@@ -444,6 +470,8 @@ def _review_detail_payload(conn, review_id: str, review_state: dict):
             "principal_access_status": "not_evaluated",
             "ai_explanation": ai_artifacts.projection(conn, review_id),
             "assigned_reviewer_sub": review_state["assigned_reviewer_sub"],
+            "can_decide": decision_reason is None,
+            "can_decide_reason": decision_reason,
             "due_at": review_state["due_at"],
             "exception_state": review_state["exception_state"],
         "campaign_state": review_state["campaign_state"],
@@ -464,7 +492,7 @@ def get_review(review_id: str, claims: dict = Depends(current_reviewer)):
             review_state = require_review_assignment(
                 conn, review_id, review[1], claims["sub"], claims=claims
             )
-        return _review_detail_payload(conn, review_id, review_state)
+        return _review_detail_payload(conn, review_id, review_state, claims)
 
 
 @app.get("/reviews/{review_id}/history")
@@ -658,6 +686,10 @@ def assign_reviewer(
     claims: dict = Depends(current_reviewer),
 ):
     require_campaign_admin(claims)
+    try:
+        auth.require_verified_reviewer_assignment()
+    except auth.AuthorizationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     reviewer_sub = _nonblank(request.reviewer_sub, "reviewer_sub")
     with db.get_connection() as conn:
         campaign_row = workflow.campaign(conn, campaign_id, lock=True)
@@ -785,8 +817,15 @@ def get_campaign_events(
             require_reviewer_group(claims)
             require_campaign_assignment(conn, campaign_id, claims["sub"])
             require_account_scope(claims, item["account_id"])
-        return {"events": workflow.events(conn, campaign_id, limit=limit, offset=offset),
-                "limit": limit, "offset": offset}
+        cur = conn.cursor()
+        db.execute(cur, "SELECT COUNT(*) FROM review_workflow_events WHERE campaign_id=?", (campaign_id,))
+        workflow_total = int(cur.fetchone()[0])
+        db.execute(cur, "SELECT COUNT(*) FROM campaign_reviewer_events WHERE campaign_id=?", (campaign_id,))
+        reviewer_total = int(cur.fetchone()[0])
+        events = workflow.events(conn, campaign_id, limit=limit, offset=offset)
+        total = workflow_total + reviewer_total
+        return {"events": events, "limit": limit, "offset": offset,
+                "total": total, "has_more": offset + len(events) < total}
 
 
 @app.post("/campaigns/{campaign_id}/state")
@@ -839,6 +878,10 @@ def set_review_assignment(
     claims: dict = Depends(current_reviewer),
 ):
     require_campaign_admin(claims)
+    try:
+        auth.require_verified_reviewer_assignment()
+    except auth.AuthorizationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     reviewer_sub = _nonblank(request.reviewer_sub, "reviewer_sub")
     with db.get_connection() as conn:
         item = require_review_scope(conn, claims, review_id)
@@ -910,6 +953,8 @@ def approve_remediation(
     if approval_request and approval_request.decision != "APPROVED":
         raise HTTPException(status_code=422, detail="Approval endpoint accepts APPROVED only")
     with db.get_connection() as conn:
+        # Serialize approval and decline decisions before reading either state.
+        repo.lock_inventory_remediation(conn)
         review = repo.fetch_review_for_decision(conn, review_id)
         if not review:
             raise HTTPException(status_code=404, detail="Review not found")
@@ -940,7 +985,6 @@ def approve_remediation(
             )
         if repo.remediation_decline(conn, review_id):
             raise HTTPException(status_code=409, detail="This remediation request was already declined")
-        repo.lock_inventory_remediation(conn)
         binding = repo.review_evidence_binding(conn, review_id)
         if (not binding or binding["grant_type"] not in repo.REMEDIATION_ACTIONS
                 or binding["evidence_status"] != "COMPLETE"
@@ -1061,6 +1105,9 @@ def decide_remediation_approval(
         return result
 
     with db.get_connection() as conn:
+        # Use the same transaction lock as approval so only one terminal
+        # decision can be committed for this remediation request.
+        repo.lock_inventory_remediation(conn)
         review = repo.fetch_review_for_decision(conn, review_id)
         if not review:
             raise HTTPException(status_code=404, detail="Remediation request not found")
@@ -1174,6 +1221,7 @@ def list_audit_events(
     principal: str | None = Query(default=None, max_length=256),
     actor_sub: str | None = Query(default=None, max_length=256),
     decision: Literal["APPROVED", "REVOKED"] | None = None,
+    event_type: str | None = Query(default=None, max_length=64),
     remediation_status: str | None = Query(default=None, max_length=48),
     since: datetime | None = None,
     until: datetime | None = None,
@@ -1194,7 +1242,7 @@ def list_audit_events(
         return workspaces.audit_events(
             conn, scopes, limit=limit, offset=offset, campaign_id=campaign_id,
             account_id=account_id, review_id=review_id, principal=principal,
-            actor_sub=actor_sub, decision=decision,
+            actor_sub=actor_sub, decision=decision, event_type=event_type,
             remediation_status=remediation_status,
             since=since.astimezone(timezone.utc).isoformat() if since else None,
             until=until.astimezone(timezone.utc).isoformat() if until else None,

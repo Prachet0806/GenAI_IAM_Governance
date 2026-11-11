@@ -328,7 +328,7 @@ def remediation_queue(conn, scopes: list[str] | None, approver_sub: str,
 
 def audit_events(conn, scopes: list[str] | None, *, limit=100, offset=0,
                  campaign_id=None, account_id=None, review_id=None,
-                 principal=None, actor_sub=None, decision=None,
+                 principal=None, actor_sub=None, decision=None, event_type=None,
                  remediation_status=None, since=None, until=None):
     from common import workflow
 
@@ -349,16 +349,23 @@ def audit_events(conn, scopes: list[str] | None, *, limit=100, offset=0,
     campaign_ids = [row[0] for row in cur.fetchall()]
     events = []
     for current_campaign in campaign_ids:
-        campaign_events = workflow.events(conn, current_campaign, limit=1000, offset=0)
         if not principal and not review_id:
-            for event in campaign_events:
-                events.append({
-                    "event_id": event["event_id"], "campaign_id": current_campaign,
-                    "review_id": event.get("review_id"), "event_type": event["event_type"],
-                    "actor_sub": event["actor_sub"], "created_at": event["created_at"],
-                    "summary": event["event_type"].replace("_", " ").title(),
-                    "details": event.get("details", {}),
-                })
+            event_offset = 0
+            while True:
+                campaign_events = workflow.events(
+                    conn, current_campaign, limit=1000, offset=event_offset
+                )
+                for event in campaign_events:
+                    events.append({
+                        "event_id": event["event_id"], "campaign_id": current_campaign,
+                        "review_id": event.get("review_id"), "event_type": event["event_type"],
+                        "actor_sub": event["actor_sub"], "created_at": event["created_at"],
+                        "summary": event["event_type"].replace("_", " ").title(),
+                        "details": event.get("details", {}),
+                    })
+                if len(campaign_events) < 1000:
+                    break
+                event_offset += len(campaign_events)
         review_values: list = [current_campaign]
         review_clauses = ["r.campaign_id=?"]
         if review_id:
@@ -395,6 +402,9 @@ def audit_events(conn, scopes: list[str] | None, *, limit=100, offset=0,
         events = [event for event in events if event.get("actor_sub") == actor_sub]
     if decision:
         events = [event for event in events if event.get("decision") == decision]
+    if event_type:
+        event_type_key = event_type.casefold()
+        events = [event for event in events if event.get("event_type", "").casefold() == event_type_key]
     if remediation_status:
         events = [event for event in events if remediation_status in event["event_type"]]
     if since:

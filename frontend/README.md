@@ -10,6 +10,8 @@ The Next.js app provides separate workspaces for the governance roles. It uses t
 - **Auditor:** scoped decision/workflow history, export creation and download, and manifest/artifact verification.
 - **Platform operator:** service and dependency configuration, recorded processing activity, redacted operational events, and exact-path reconciliation requests. Worker heartbeat is currently unavailable and is shown as such.
 
+List views use API `limit`/`offset` pagination where the route supports it. The reviewer queue supports server-side status, risk, search, and sorting by due date, risk, or principal. Campaign review history supports status filtering; the audit view supports account, campaign, principal, actor, event type, decision, and time filters. Decision, lifecycle, assignment, and reconciliation actions use an impact confirmation dialog. Campaign bulk assignment is issued as separate API requests and may partially succeed; the UI reports the outcome and refreshes the records.
+
 The frontend presents decisions about an observed grant path. It does not infer that a principal has lost equivalent or effective access through other paths. GenAI explanations remain advisory.
 
 After sign-in, `/` reads the authenticated `/me` role summary and routes to the first available workspace in this order: reviewer, campaign administrator, remediation approver, auditor, then platform operator. Users with no configured workspace role receive an access-denied page. This routing is navigation only; API authorization remains authoritative.
@@ -23,7 +25,7 @@ After sign-in, `/` reads the authenticated `/me` role summary and routes to the 
 5. Register `http://localhost:3000/api/auth/callback/corporate-oidc` as an OIDC redirect URI.
 6. From this directory, run `pnpm install`, `pnpm api:types`, and `pnpm dev`.
 
-The API must accept the access-token audience it validates. Configure API `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`, `OIDC_GROUP_CLAIM`, and role-group values to match the identity provider. `OIDC_ACCOUNT_SCOPE_CLAIM` should identify the authorized AWS account IDs; if account scope is omitted, API behavior follows its configured global-scope rules. The API uses OIDC `sub` for actor identity and authorization.
+The API must accept the access-token audience it validates. Configure API `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`, `OIDC_GROUP_CLAIM`, and role-group values to match the identity provider. Staging and production require `OIDC_ACCOUNT_SCOPE_CLAIM`; a missing or invalid account scope denies access. Global scope is development-only and requires `OIDC_ALLOW_GLOBAL_SCOPE=true`. The API uses OIDC `sub` for actor identity and authorization. Reviewer assignment remains blocked in shared environments until identity-provider directory verification is implemented.
 
 ## Local container stack
 
@@ -42,6 +44,9 @@ pnpm typecheck
 pnpm lint
 pnpm test
 pnpm build
+pnpm test:e2e
 ```
+
+`pnpm test:e2e` runs five Playwright role journeys against a local Next.js server with a mocked backend API. Each workspace screen is checked with Axe against WCAG 2.2 AA criteria. Automated checks do not replace a manual accessibility review. The journeys do not test live OIDC, API authorization, AWS behavior, worker execution, or production deployment. Install the Chromium browser once with `pnpm exec playwright install chromium` if it is missing. The E2E test secret is local-only and must never be reused for deployment.
 
 The root CI workflow also builds the API and frontend container images. Local checks do not establish hosted CI, AWS, S3, provider, or production deployment status.

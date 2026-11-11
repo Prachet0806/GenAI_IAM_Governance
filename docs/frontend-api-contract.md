@@ -10,7 +10,7 @@ The local checkout contains these application routes today:
 |---|---|---|
 | `GET /health` | Service health response | No OIDC dependency in the route |
 | `GET /reviews/queue` | Pending queue with bounded `limit`/`offset` and status, risk, campaign, account, principal, search, and due-date filters | Valid OIDC token, reviewer group, campaign reviewer pool; account scope applied server-side |
-| `GET /reviews/{review_id}` | Returns frozen grant/policy/risk evidence, `review_scope`, `principal_access_status: not_evaluated`, AI artifact projection, and assignment/deadline/exception state | Assigned reviewer or campaign administrator; campaign administrator access is scoped and read-only |
+| `GET /reviews/{review_id}` | Returns frozen grant/policy/risk evidence, `review_scope`, `principal_access_status: not_evaluated`, AI artifact projection, assignment/deadline/exception state, and API-authoritative `can_decide` plus `can_decide_reason` | Assigned reviewer or scoped campaign administrator; decision eligibility requires reviewer group, campaign pool membership, and no conflicting individual assignment |
 | `GET /reviews/{review_id}/history` | Paged decision and workflow history | Assigned reviewer or scoped campaign administrator |
 | `POST /reviews/{review_id}/decision` | Records `APPROVED` or `REVOKED`; revocation requires a comment; duplicate/racing decisions conflict | Valid OIDC token, reviewer group, campaign membership, and per-review assignment if present; campaign must be open and review must not have an open exception |
 | `GET /reviews/summary` | Reviewer queue summary | Reviewer group; account scope applied before aggregates |
@@ -18,7 +18,7 @@ The local checkout contains these application routes today:
 | `GET /snapshots` / `GET /snapshots/{snapshot_id}/readiness` | Published snapshot candidates and readiness blockers | Campaign administrator; authorized account scope |
 | `POST /campaigns` | Creates a campaign from an eligible, current, risk-assessed published snapshot | Campaign administrator; readiness rechecked by the API and worker |
 | `GET /campaigns/{campaign_id}/progress`, `/reviews`, `/reviewers`, `/events` | Progress and workload, campaign reviews, reviewer pool, and workflow history | Campaign administrator for the campaign's account |
-| `POST /campaigns/{campaign_id}/reviewers` | Assigns a reviewer subject to a campaign; duplicate assignment is reported | Valid OIDC token and campaign-admin group |
+| `POST /campaigns/{campaign_id}/reviewers` | Assigns a reviewer subject to a campaign; shared environments currently fail closed until an identity-provider directory verifier is configured | Valid OIDC token and campaign-admin group; unverified assignment is development-only and explicitly opted in |
 | `DELETE /campaigns/{campaign_id}/reviewers?reviewer_sub=...` | Removes a reviewer if pending work is no longer assigned to them; removal is audited | Campaign administrator |
 | `GET /campaigns/{campaign_id}` | Returns one campaign's snapshot and workflow metadata | Campaign admin, or reviewer assigned to the campaign |
 | `GET /campaigns/{campaign_id}/events` | Returns bounded workflow-event pages using `limit` and `offset` | Campaign admin, or reviewer assigned to the campaign |
@@ -26,7 +26,7 @@ The local checkout contains these application routes today:
 | `POST /campaigns/{campaign_id}/state` | Opens, pauses, resumes, or closes a campaign subject to lifecycle constraints | Campaign-admin group |
 | `POST /campaigns/{campaign_id}/owner` | Changes campaign owner | Campaign-admin group |
 | `POST /campaigns/{campaign_id}/deadline` | Sets campaign deadline; requires a future timezone-aware timestamp | Campaign-admin group |
-| `POST /reviews/{review_id}/assignment` | Assigns/reassigns a pending review to a reviewer already in the campaign pool | Campaign-admin group |
+| `POST /reviews/{review_id}/assignment` | Assigns/reassigns a pending review; shared environments currently fail closed until an identity-provider directory verifier is configured | Campaign-admin group; unverified assignment is development-only and explicitly opted in |
 | `POST /reviews/{review_id}/deadline` | Sets deadline on a pending review | Campaign-admin group |
 | `POST /reviews/{review_id}/exception` | Opens an exception on an assigned review; blocks reviewer decision while open | Reviewer group and campaign/review assignment |
 | `POST /reviews/{review_id}/exception/resolve` | Resolves an open exception with a reason | Campaign-admin group |

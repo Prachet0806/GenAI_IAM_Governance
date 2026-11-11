@@ -1,6 +1,7 @@
 """OIDC access-token validation for the reviewer API."""
 
 import os
+import re
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -11,6 +12,37 @@ class AuthenticationError(Exception):
 
 class AuthorizationError(Exception):
     pass
+
+
+def validate_account_scope_configuration() -> None:
+    """Fail startup when a shared environment has no account boundary."""
+    environment = os.getenv("APP_ENV", "").strip().lower()
+    account_claim = os.getenv("OIDC_ACCOUNT_SCOPE_CLAIM", "").strip()
+    if environment in {"staging", "production"} and not account_claim:
+        raise RuntimeError(
+            "OIDC_ACCOUNT_SCOPE_CLAIM must be configured in staging and production"
+        )
+
+
+def require_verified_reviewer_assignment() -> None:
+    """Keep unverified subject entry out of shared environments until a directory is wired."""
+    environment = os.getenv("APP_ENV", "").strip().lower()
+    local_opt_in = (
+        environment == "development"
+        and os.getenv("OIDC_ALLOW_UNVERIFIED_REVIEWER_ASSIGNMENTS", "")
+        .strip().lower() == "true"
+    )
+    if not local_opt_in:
+        raise AuthorizationError(
+            "Reviewer assignment requires identity-provider directory verification"
+        )
+
+
+def validate_account_scope_claim(claims: dict) -> None:
+    """Reject authenticated API requests without a valid tenant-scope claim."""
+    identity = identity_summary(claims)
+    if identity["scope_mode"] == "unconfigured":
+        raise AuthorizationError("A valid account-scope claim is required")
 
 
 @lru_cache(maxsize=4)
@@ -106,17 +138,37 @@ def identity_summary(claims: dict) -> dict:
         for permission in permissions_by_role[role]
     })
     account_claim = os.getenv("OIDC_ACCOUNT_SCOPE_CLAIM", "").strip()
-    account_scopes = None
+    environment = os.getenv("APP_ENV", "").strip().lower()
+    global_scope_enabled = (
+        environment == "development"
+        and os.getenv("OIDC_ALLOW_GLOBAL_SCOPE", "").strip().lower() == "true"
+    )
+    account_scopes: list[str] = []
+    scope_mode = "unconfigured"
     if account_claim:
-        raw_scopes = claims.get(account_claim, [])
-        account_scopes = [raw_scopes] if isinstance(raw_scopes, str) else raw_scopes
-        if not isinstance(account_scopes, list) or any(
-            not isinstance(value, str) or not value.strip()
-            for value in account_scopes
+        raw_scopes = claims.get(account_claim)
+        values = [raw_scopes] if isinstance(raw_scopes, str) else raw_scopes
+        if (
+            isinstance(values, list)
+            and values
+            and all(isinstance(value, str) and value.strip() for value in values)
         ):
-            account_scopes = []
-        else:
-            account_scopes = sorted({value.strip() for value in account_scopes})
+            normalized = [value.strip() for value in values]
+            if (
+                all(
+                    value == "*" or re.fullmatch(r"\d{12}", value)
+                    for value in normalized
+                )
+                and (
+                    "*" not in normalized or len(normalized) == 1
+                )
+            ):
+                account_scopes = sorted(set(normalized))
+                scope_mode = "claim"
+    elif global_scope_enabled:
+        # Local development global access is an explicit operator opt-in.
+        account_scopes = ["*"]
+        scope_mode = "global_admin"
     return {
         "subject": claims["sub"],
         "display_name": claims.get("name") or claims.get("preferred_username") or "",
@@ -124,18 +176,15 @@ def identity_summary(claims: dict) -> dict:
         "roles": roles,
         "permissions": permissions,
         "account_scopes": account_scopes,
-        "scope_mode": "claim" if account_claim else "global_admin",
+        "scope_mode": scope_mode,
     }
 
 
 def require_account_scope(claims: dict, account_id: str | None):
-    """Enforce an optional account scope claim; absent configuration means global scope."""
-    account_claim = os.getenv("OIDC_ACCOUNT_SCOPE_CLAIM", "").strip()
-    if not account_claim:
-        return
-    if not account_id:
-        raise AuthorizationError("Resource has no account scope")
+    """Enforce claim scope, or an explicit development-only global-scope opt-in."""
     identity = identity_summary(claims)
     scopes = identity["account_scopes"] or []
+    if not account_id and "*" not in scopes:
+        raise AuthorizationError("Resource has no account scope")
     if "*" not in scopes and account_id not in scopes:
         raise AuthorizationError("AWS account is outside the authenticated user's scope")

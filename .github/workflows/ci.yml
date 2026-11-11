@@ -112,13 +112,17 @@ jobs:
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+
       - name: Export and type the API contract
         working-directory: frontend
         run: pnpm api:types && git diff --exit-code -- openapi.json src/lib/api/schema.d.ts
 
       - name: Check frontend
         working-directory: frontend
-        run: pnpm typecheck && pnpm lint && pnpm test && pnpm build
+        run: pnpm typecheck && pnpm lint && pnpm test && pnpm test:e2e && pnpm build
 
   container-build:
     runs-on: ubuntu-latest

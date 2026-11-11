@@ -730,6 +730,10 @@ def is_remediation_approved(conn, review_id: str, discovery_run_id: str) -> bool
           AND r.snapshot_id=? AND r.grant_id IS NOT NULL
           AND r.observation_id IS NOT NULL AND r.risk_assessment_id IS NOT NULL
           AND a.approver_sub <> r.reviewer_sub AND a.discovery_run_id=?
+          AND NOT EXISTS (
+              SELECT 1 FROM remediation_approval_declines d
+              WHERE d.review_id=a.review_id
+          )
           AND EXISTS (
               SELECT 1 FROM remediation_approval_events ae
               JOIN review_decision_events e ON e.event_id=ae.decision_event_id

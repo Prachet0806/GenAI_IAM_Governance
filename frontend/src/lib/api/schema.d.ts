@@ -1012,6 +1012,7 @@ export interface operations {
                 principal?: string | null;
                 actor_sub?: string | null;
                 decision?: ("APPROVED" | "REVOKED") | null;
+                event_type?: string | null;
                 remediation_status?: string | null;
                 since?: string | null;
                 until?: string | null;
@@ -1756,6 +1757,7 @@ export interface operations {
                 offset?: number;
                 status?: "ALL" | "PENDING" | "APPROVED" | "REVOKED";
                 risk_level?: ("LOW" | "MEDIUM" | "HIGH" | "UNKNOWN") | null;
+                sort_by?: "due_date" | "risk" | "principal";
                 campaign_id?: string | null;
                 account_id?: string | null;
                 principal?: string | null;
