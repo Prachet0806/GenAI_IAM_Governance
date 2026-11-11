@@ -312,7 +312,7 @@ def test_audit_aggregation_includes_campaign_events_past_old_fetch_cap(
                 previous_value,new_value,details,created_at)
                VALUES (?,? ,NULL,?,?,NULL,NULL,'{}',?)""",
             [
-                (f"BULK-{index:04d}", "C1", "BULK_EVENT", "admin", "2000-01-01T00:00:00+00:00")
+                (f"BULK-{index:04d}", "C1", "REVIEW_ASSIGNED", "admin", "2000-01-01T00:00:00+00:00")
                 for index in range(1001)
             ],
         )

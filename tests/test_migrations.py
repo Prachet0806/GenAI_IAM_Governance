@@ -641,12 +641,15 @@ def test_postgres_operator_reconciliation_is_lease_bound(postgres_schema, monkey
     monkeypatch.setenv("REVIEWER_GROUP", "reviewers")
     monkeypatch.setenv("REMEDIATION_APPROVER_GROUP", "approvers")
     monkeypatch.setenv("REMEDIATION_OPERATOR_GROUP", "operators")
+    monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "aws_account_scopes")
     review_service.decide_review(
         review_id, review_service.DecisionRequest(decision="REVOKED", comment="remove path"),
-        {"sub": "reviewer", "groups": ["reviewers"]},
+        {"sub": "reviewer", "groups": ["reviewers"],
+         "aws_account_scopes": [ACCOUNT_A]},
     )
     review_service.approve_remediation(
-        review_id, Response(), {"sub": "approver", "groups": ["approvers"]},
+        review_id, Response(), {"sub": "approver", "groups": ["approvers"],
+                                "aws_account_scopes": [ACCOUNT_A]},
     )
     for key, value in {
         "MOCK_IAM": "false", "DRY_RUN": "false", "ENABLE_REMEDIATION": "true",
@@ -661,7 +664,8 @@ def test_postgres_operator_reconciliation_is_lease_bound(postgres_schema, monkey
     assert remediation.remediate_access(None, None)["reconciliation_required"] == 1
     request = review_service.request_remediation_reconciliation(
         review_id, review_service.ExceptionRequest(reason="Inspect uncertain detach"),
-        {"sub": "operator", "groups": ["operators"]},
+        {"sub": "operator", "groups": ["operators"],
+         "aws_account_scopes": [ACCOUNT_A]},
     )
     fake.present = False
     assert remediation.remediate_access(None, None)["remediated"] == 1
