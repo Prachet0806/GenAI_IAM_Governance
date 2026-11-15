@@ -9,6 +9,7 @@ COPY common ./common
 COPY lambdas ./lambdas
 COPY sql ./sql
 COPY scripts ./scripts
+COPY reports/export_audit.py ./reports/export_audit.py
 RUN mkdir -p /app/reports && chown -R app:app /app
 USER app
 EXPOSE 8080

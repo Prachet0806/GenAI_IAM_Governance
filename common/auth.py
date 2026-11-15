@@ -26,16 +26,18 @@ def validate_account_scope_configuration() -> None:
 
 def require_verified_reviewer_assignment() -> None:
     """Keep unverified subject entry out of shared environments until a directory is wired."""
-    environment = os.getenv("APP_ENV", "").strip().lower()
-    local_opt_in = (
-        environment == "development"
-        and os.getenv("OIDC_ALLOW_UNVERIFIED_REVIEWER_ASSIGNMENTS", "")
-        .strip().lower() == "true"
-    )
-    if not local_opt_in:
+    if not reviewer_assignment_available():
         raise AuthorizationError(
             "Reviewer assignment requires identity-provider directory verification"
         )
+
+
+def reviewer_assignment_available() -> bool:
+    return (
+        os.getenv("APP_ENV", "").strip().lower() == "development"
+        and os.getenv("OIDC_ALLOW_UNVERIFIED_REVIEWER_ASSIGNMENTS", "")
+        .strip().lower() == "true"
+    )
 
 
 def validate_account_scope_claim(claims: dict) -> None:
@@ -156,7 +158,8 @@ def identity_summary(claims: dict) -> dict:
             normalized = [value.strip() for value in values]
             if (
                 all(
-                    value == "*" or re.fullmatch(r"\d{12}", value)
+                    (value == "*" and global_scope_enabled)
+                    or re.fullmatch(r"\d{12}", value)
                     for value in normalized
                 )
                 and (
@@ -177,6 +180,7 @@ def identity_summary(claims: dict) -> dict:
         "permissions": permissions,
         "account_scopes": account_scopes,
         "scope_mode": scope_mode,
+        "reviewer_assignment_available": reviewer_assignment_available(),
     }
 
 

@@ -109,6 +109,17 @@ def assess_policy(policy_name: str, document: dict | None):
         if statement.get("Condition") or "NotResource" in statement:
             uncertain = True
     normalized = [str(action).lower() for action in actions]
+    sensitive_actions = {
+        "sts:assumerole", "secretsmanager:getsecretvalue", "kms:decrypt",
+        "ssm:getparameter", "ssm:getparameters", "ssm:getparametersbypath",
+    }
+    privileged = any(
+        action in sensitive_actions
+        or (action.startswith("iam:") and not action.split(":", 1)[1].startswith(
+            ("get", "list", "simulate", "generatecredentialreport")
+        ))
+        for action in normalized
+    )
     # IAM accepts wildcards anywhere in an action name. A partial wildcard
     # cannot safely be called read-only without expanding the service catalog.
     wildcard = any("*" in action or "?" in action for action in normalized)
@@ -125,6 +136,8 @@ def assess_policy(policy_name: str, document: dict | None):
         risk, reason = "HIGH", "policy grants or may grant wildcard actions"
     elif uncertain:
         risk, reason = "HIGH", "policy constructs require manual evaluation"
+    elif privileged:
+        risk, reason = "HIGH", "policy grants sensitive access or IAM privilege changes"
     elif not grants:
         risk, reason = "HIGH", "no analyzable allow grants; manual review required"
     elif write:

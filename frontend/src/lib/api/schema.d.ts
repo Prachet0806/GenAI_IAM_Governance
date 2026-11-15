@@ -2121,9 +2121,9 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: {
+        requestBody: {
             content: {
-                "application/json": components["schemas"]["RemediationApprovalRequest"] | null;
+                "application/json": components["schemas"]["RemediationApprovalRequest"];
             };
         };
         responses: {

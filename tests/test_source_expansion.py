@@ -228,3 +228,13 @@ def test_role_trust_risk_corpus():
         "Effect": "Allow", "Principal": {"AWS": "210987654321"}, "Action": "sts:AssumeRole",
     }]}, ACCOUNT)[0] == "HIGH"
     assert assess_trust_policy(_role()["AssumeRolePolicyDocument"], ACCOUNT)[0] == "MEDIUM"
+
+
+@pytest.mark.parametrize("action", [
+    "iam:AddUserToGroup", "iam:PassRole", "iam:CreatePolicyVersion",
+    "secretsmanager:GetSecretValue", "kms:Decrypt", "sts:AssumeRole",
+])
+def test_sensitive_scoped_actions_are_high_risk(action):
+    policy = {"Statement": [{"Effect": "Allow", "Action": action,
+                              "Resource": "arn:aws:iam::123456789012:group/Administrators"}]}
+    assert assess_policy("sensitive", policy)[0] == "HIGH"

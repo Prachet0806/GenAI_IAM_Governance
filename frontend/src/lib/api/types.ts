@@ -6,6 +6,7 @@ export type AppIdentity = {
   permissions: string[];
   account_scopes: string[] | null;
   scope_mode: "claim" | "global_admin";
+  reviewer_assignment_available: boolean;
 };
 
 export type ReviewQueueItem = {

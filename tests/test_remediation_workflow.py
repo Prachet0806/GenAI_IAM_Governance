@@ -5,9 +5,10 @@ import uuid
 
 import pytest
 from fastapi import Response
+from fastapi.testclient import TestClient
 
 from api import review_service
-from common import repo
+from common import auth, repo, workspaces
 from common.db import db
 from lambdas.generate_reviews.handler import generate_campaign
 from lambdas.remediation import handler as remediation
@@ -18,7 +19,7 @@ from tests.test_evidence_workflow import ACCOUNT_A, POLICY_ARN, READ_POLICY, _pu
 
 
 def _scoped_claims(sub, groups):
-    return {"sub": sub, "groups": groups, "aws_account_scopes": ["*"]}
+    return {"sub": sub, "groups": groups, "aws_account_scopes": [ACCOUNT_A]}
 
 
 @pytest.fixture
@@ -30,7 +31,7 @@ def prepared_review(tmp_path, monkeypatch):
     monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "aws_account_scopes")
     migrate.apply_sqlite()
 
-    def create(grant_type="DIRECT_MANAGED"):
+    def create(grant_type="DIRECT_MANAGED", *, approve=True):
         user = _user()
         if grant_type == "DIRECT_MANAGED":
             policy = {
@@ -64,12 +65,14 @@ def prepared_review(tmp_path, monkeypatch):
             ),
             _scoped_claims("reviewer", ["reviewers"]),
         )
-        approval = review_service.approve_remediation(
-            review_id, Response(), _scoped_claims("approver", ["approvers"])
-        )
-        assert approval["action_type"] == repo.REMEDIATION_ACTIONS[grant_type]
-        with db.get_connection() as conn:
-            assert repo.is_remediation_approved(conn, review_id, snapshot_id)
+        if approve:
+            approval = review_service.approve_remediation(
+                review_id, Response(), _scoped_claims("approver", ["approvers"]),
+                review_service.RemediationApprovalRequest(decision="APPROVED", reason="Independent approval"),
+            )
+            assert approval["action_type"] == repo.REMEDIATION_ACTIONS[grant_type]
+            with db.get_connection() as conn:
+                assert repo.is_remediation_approved(conn, review_id, snapshot_id)
         monkeypatch.setenv("MOCK_IAM", "false")
         monkeypatch.setenv("DRY_RUN", "false")
         monkeypatch.setenv("ENABLE_REMEDIATION", "true")
@@ -87,6 +90,40 @@ def prepared_review(tmp_path, monkeypatch):
         return review_id
 
     return create
+
+
+def test_real_approver_detail_and_approval_routes(prepared_review, monkeypatch):
+    review_id = prepared_review(approve=False)
+    monkeypatch.setattr(auth, "verify_access_token", lambda _token: _scoped_claims("approver", ["approvers"]))
+    headers = {"Authorization": "Bearer test-token"}
+    with TestClient(review_service.app) as client:
+        detail = client.get(f"/approvals/{review_id}", headers=headers)
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["review"]["review_id"] == review_id
+        assert client.post(f"/reviews/{review_id}/remediation-approval", headers=headers).status_code == 422
+        blank = client.post(f"/reviews/{review_id}/remediation-approval", headers=headers,
+                            json={"decision": "APPROVED", "reason": " "})
+        assert blank.status_code == 422
+        approved = client.post(f"/approvals/{review_id}/decision", headers=headers,
+                               json={"decision": "APPROVED", "reason": "Independent approval"})
+        assert approved.status_code == 201, approved.text
+        assert approved.json()["status"] == "approved"
+
+
+def test_audit_events_include_decline_without_duplicate_workflow(prepared_review):
+    review_id = prepared_review(approve=False)
+    result = review_service.decide_remediation_approval(
+        review_id,
+        review_service.RemediationApprovalRequest(decision="DECLINED", reason="Evidence needs review"),
+        Response(), _scoped_claims("approver", ["approvers"]),
+    )
+    assert result["status"] == "declined"
+    with db.get_connection() as conn:
+        events = workspaces.audit_events(conn, [ACCOUNT_A], review_id=review_id)
+    assert len({event["event_id"] for event in events["events"]}) == events["total"]
+    assert any(event["event_type"] == "REMEDIATION_APPROVAL_DECLINED"
+               and event["details"]["reason"] == "Evidence needs review"
+               for event in events["events"])
 
 
 class FakeIam:

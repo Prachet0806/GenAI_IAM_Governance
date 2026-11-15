@@ -488,7 +488,8 @@ def test_postgres_remediation_approval_events_and_worker_contention(
         {"sub": "reviewer", "groups": ["reviewers"]},
     )
     review_service.approve_remediation(
-        review_id, Response(), {"sub": "approver", "groups": ["approvers"]}
+        review_id, Response(), {"sub": "approver", "groups": ["approvers"]},
+        review_service.RemediationApprovalRequest(decision="APPROVED", reason="Independent approval"),
     )
     monkeypatch.setenv("MOCK_IAM", "false")
     monkeypatch.setenv("DRY_RUN", "false")
@@ -650,6 +651,7 @@ def test_postgres_operator_reconciliation_is_lease_bound(postgres_schema, monkey
     review_service.approve_remediation(
         review_id, Response(), {"sub": "approver", "groups": ["approvers"],
                                 "aws_account_scopes": [ACCOUNT_A]},
+        review_service.RemediationApprovalRequest(decision="APPROVED", reason="Independent approval"),
     )
     for key, value in {
         "MOCK_IAM": "false", "DRY_RUN": "false", "ENABLE_REMEDIATION": "true",

@@ -68,3 +68,24 @@ def test_oidc_access_token_configuration_requires_https(monkeypatch):
     monkeypatch.setenv("OIDC_JWKS_URL", "https://issuer.example.test/jwks")
     with pytest.raises(auth.AuthenticationError, match="HTTPS JWKS"):
         auth.verify_access_token("not-a-token")
+
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
+def test_wildcard_account_claim_is_rejected_outside_development(monkeypatch, environment):
+    monkeypatch.setenv("APP_ENV", environment)
+    monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "aws_account_scopes")
+    monkeypatch.setenv("OIDC_ALLOW_GLOBAL_SCOPE", "true")
+    claims = {"sub": "reviewer", "aws_account_scopes": ["*"]}
+    assert auth.identity_summary(claims)["account_scopes"] == []
+    with pytest.raises(auth.AuthorizationError):
+        auth.require_account_scope(claims, "123456789012")
+
+
+def test_wildcard_account_claim_requires_development_opt_in(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "aws_account_scopes")
+    claims = {"sub": "reviewer", "aws_account_scopes": ["*"]}
+    monkeypatch.setenv("OIDC_ALLOW_GLOBAL_SCOPE", "false")
+    assert auth.identity_summary(claims)["account_scopes"] == []
+    monkeypatch.setenv("OIDC_ALLOW_GLOBAL_SCOPE", "true")
+    assert auth.identity_summary(claims)["account_scopes"] == ["*"]

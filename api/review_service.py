@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -947,10 +947,11 @@ def resolve_review_exception(
 @app.post("/reviews/{review_id}/remediation-approval")
 def approve_remediation(
     review_id: str, response: Response, claims: dict = Depends(current_reviewer),
-    approval_request: RemediationApprovalRequest | None = None,
+    approval_request: RemediationApprovalRequest = Body(...),
 ):
     require_remediation_approver(claims)
-    if approval_request and approval_request.decision != "APPROVED":
+    _nonblank(approval_request.reason, "reason")
+    if approval_request.decision != "APPROVED":
         raise HTTPException(status_code=422, detail="Approval endpoint accepts APPROVED only")
     with db.get_connection() as conn:
         # Serialize approval and decline decisions before reading either state.
@@ -1028,7 +1029,7 @@ def approve_remediation(
         approval_event_id = repo.record_remediation_approval_event(
             conn, approval_id, review_id, decision_event_id, claims["sub"],
             now.isoformat(), "RENEWED" if renewed else "APPROVED", binding,
-            approval_request.reason if approval_request else "",
+            approval_request.reason.strip(),
         )
         repo.insert_audit_log(
             conn,
@@ -1082,7 +1083,7 @@ def get_remediation_approval_detail(review_id: str, claims: dict = Depends(curre
         require_account_scope(claims, state["account_id"])
         eligibility = workspaces.remediation_eligibility(conn, review_id, claims["sub"])
         return {
-            "review": _review_detail_payload(conn, review_id, state),
+            "review": _review_detail_payload(conn, review_id, state, claims),
             "remediation": eligibility,
             "execution_mode": "LIVE_ENABLED" if config.is_live_remediation_explicitly_allowed() else "DRY_RUN_OR_DISABLED",
             "reconciliation_required": repo.remediation_reconciliation_required(conn, review_id),
@@ -1097,7 +1098,6 @@ def decide_remediation_approval(
     require_remediation_approver(claims)
     reason = _nonblank(request.reason, "reason")
     if request.decision == "APPROVED":
-        response = Response()
         result = approve_remediation(
             review_id, response, claims,
             RemediationApprovalRequest(decision="APPROVED", reason=reason),
@@ -1478,54 +1478,59 @@ def operations_jobs(
 ):
     require_remediation_operator(claims)
     scopes = auth.identity_summary(claims)["account_scopes"]
-    events = []
     with db.get_connection() as conn:
         cur = conn.cursor()
-        values: list = []
-        scope_sql = workspaces._scope_filter("h.account_id", scopes, values)
-        where = f"WHERE {scope_sql}" if scope_sql else ""
-        db.execute(cur, f"""SELECT d.run_id,d.started_at,d.completed_at,d.status,d.source,
-            d.users_seen,d.errors,h.account_id,h.source_scope FROM discovery_runs d
-            LEFT JOIN source_attempt_heads h ON h.attempt_id=d.run_id {where}
-            ORDER BY d.started_at DESC,d.run_id LIMIT 1000""", values)
-        for row in cur.fetchall():
-            events.append({"job_id": row[0], "job_type": "DISCOVERY", "status": row[3],
-                           "started_at": str(row[1]), "completed_at": str(row[2]) if row[2] else None,
-                           "source": row[4], "account_id": row[7], "source_scope": row[8],
-                           "items_seen": row[5], "errors": row[6]})
+        discovery_values: list = []
         ai_values: list = []
+        remediation_values: list = []
+        discovery_scope = workspaces._scope_filter("d.account_id", scopes, discovery_values)
         ai_scope = workspaces._scope_filter("c.account_id", scopes, ai_values)
-        ai_where = f" AND {ai_scope}" if ai_scope else ""
-        db.execute(cur, f"""SELECT j.job_id,j.status,j.created_at,j.updated_at,
-            j.last_error_code,j.review_id,c.account_id FROM ai_jobs j
-            JOIN access_reviews r ON r.review_id=j.review_id
+        remediation_scope = workspaces._scope_filter("c.account_id", scopes, remediation_values)
+        union = f"""WITH jobs AS (
+            SELECT d.run_id AS job_id,'DISCOVERY' AS job_type,d.status,
+                d.started_at,d.completed_at,d.source,d.account_id,d.source_scope,
+                d.users_seen AS items_seen,d.errors,NULL AS error_code,
+                NULL AS review_id,NULL AS actor_sub
+            FROM discovery_runs d WHERE {discovery_scope or '1=1'}
+            UNION ALL
+            SELECT j.job_id,'AI_EXPLANATION',j.status,j.created_at,j.updated_at,
+                NULL,c.account_id,NULL,NULL,NULL,j.last_error_code,j.review_id,NULL
+            FROM ai_jobs j JOIN access_reviews r ON r.review_id=j.review_id
             JOIN campaigns c ON c.campaign_id=r.campaign_id
-            WHERE 1=1 {ai_where} ORDER BY j.updated_at DESC,j.job_id LIMIT 1000""", ai_values)
-        for row in cur.fetchall():
-            events.append({"job_id": row[0], "job_type": "AI_EXPLANATION", "status": row[1],
-                           "started_at": str(row[2]), "completed_at": str(row[3]),
-                           "error_code": row[4], "review_id": row[5], "account_id": row[6]})
-        rem_values: list = []
-        rem_scope = workspaces._scope_filter("c.account_id", scopes, rem_values)
-        rem_where = f"WHERE {rem_scope}" if rem_scope else ""
-        db.execute(cur, f"""SELECT e.event_id,e.review_id,e.event_type,e.created_at,e.actor_id
+            WHERE {ai_scope or '1=1'}
+            UNION ALL
+            SELECT e.event_id,'REMEDIATION',e.event_type,e.created_at,NULL,
+                NULL,c.account_id,NULL,NULL,NULL,NULL,e.review_id,e.actor_id
             FROM remediation_action_events e
             JOIN access_reviews r ON r.review_id=e.review_id
             JOIN campaigns c ON c.campaign_id=r.campaign_id
-            {rem_where} ORDER BY e.created_at DESC,e.event_id DESC LIMIT 1000""", rem_values)
+            WHERE {remediation_scope or '1=1'}
+        )"""
+        values = [*discovery_values, *ai_values, *remediation_values]
+        db.execute(cur, union + " SELECT COUNT(*) FROM jobs", values)
+        total = int(cur.fetchone()[0])
+        db.execute(cur, union + """ SELECT * FROM jobs
+            ORDER BY started_at DESC,job_id DESC LIMIT ? OFFSET ?""",
+            [*values, limit, offset])
+        jobs = []
         for row in cur.fetchall():
-            state = workflow.review_workflow(conn, row[1])
-            if state:
-                try:
-                    auth.require_account_scope(claims, state["account_id"])
-                except auth.AuthorizationError:
-                    continue
-            events.append({"job_id": row[0], "job_type": "REMEDIATION", "status": row[2],
-                           "started_at": str(row[3]), "review_id": row[1], "actor_sub": row[4]})
-        events.sort(key=lambda item: (item["started_at"], item["job_id"]), reverse=True)
-        return {"jobs": events[offset:offset + limit], "limit": limit,
-                "offset": offset, "total": len(events),
-                "has_more": offset + limit < len(events),
+            item = {
+                "job_id": row[0], "job_type": row[1], "status": row[2],
+                "started_at": str(row[3]), "account_id": row[6],
+            }
+            if row[1] == "DISCOVERY":
+                item.update(completed_at=str(row[4]) if row[4] else None,
+                            source=row[5], source_scope=row[7],
+                            items_seen=row[8], errors=row[9])
+            elif row[1] == "AI_EXPLANATION":
+                item.update(completed_at=str(row[4]) if row[4] else None,
+                            error_code=row[10], review_id=row[11])
+            else:
+                item.update(review_id=row[11], actor_sub=row[12])
+            jobs.append(item)
+        return {"jobs": jobs, "limit": limit,
+                "offset": offset, "total": total,
+                "has_more": offset + len(jobs) < total,
                 "worker_heartbeat_available": False}
 
 

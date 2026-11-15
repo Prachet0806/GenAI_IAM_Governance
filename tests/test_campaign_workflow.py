@@ -135,7 +135,8 @@ def test_account_scope_fails_closed_and_accepts_explicit_scopes(monkeypatch):
     multiple = auth.identity_summary({"sub": "user", "account_scopes": ["999999999999", "123456789012"]})
     assert multiple["account_scopes"] == ["123456789012", "999999999999"]
     wildcard = {"sub": "user", "account_scopes": ["*"]}
-    auth.require_account_scope(wildcard, "999999999999")
+    with pytest.raises(auth.AuthorizationError):
+        auth.require_account_scope(wildcard, "999999999999")
 
     for bad_claim in (None, [], [""], ["not-an-account"], ["*", "123456789012"], [123]):
         claims = {"sub": "user"}
@@ -216,7 +217,7 @@ def test_shared_environment_blocks_unverified_reviewer_assignments(tmp_path, mon
     monkeypatch.setenv("APP_ENV", "staging")
     monkeypatch.setenv("OIDC_ACCOUNT_SCOPE_CLAIM", "account_scopes")
     monkeypatch.setattr(auth, "verify_access_token", lambda token: {
-        "sub": token, "groups": ["campaign-admins"], "account_scopes": ["*"]
+        "sub": token, "groups": ["campaign-admins"], "account_scopes": ["123456789012"]
     })
     monkeypatch.setenv("OIDC_ALLOW_UNVERIFIED_REVIEWER_ASSIGNMENTS", "true")
     response = _request(client, "POST", "/campaigns/C1/reviewers", "admin", {"reviewer_sub": "dave"})

@@ -22,6 +22,12 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _spreadsheet_safe(value):
+    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
 def export_audit_report(*, campaign_id: str | None = None,
                         account_scopes: list[str] | None = None,
                         requested_by: str | None = None,
@@ -118,7 +124,7 @@ def export_audit_report(*, campaign_id: str | None = None,
                     "Remediation Reconciliation Events",
                 ]
             )
-            writer.writerows(rows)
+            writer.writerows(tuple(_spreadsheet_safe(value) for value in row) for row in rows)
 
         # Write JSON canonical
         json_records = [
@@ -269,6 +275,33 @@ def export_audit_report(*, campaign_id: str | None = None,
         else:
             s3_location = None
 
+        with db.get_connection() as _audit_conn:
+            repo.insert_audit_log(
+                _audit_conn,
+                str(uuid.uuid4()),
+                datetime.now(timezone.utc),
+                "INFO",
+                "export_audit",
+                "success",
+                "Audit artifacts generated.",
+                details={
+                    "records": len(rows),
+                    "status_counts": status_counts,
+                    "csv_sha256": csv_hash,
+                    "json_sha256": json_hash,
+                    "manifest_sha256": manifest_hash,
+                    "export_run_id": run_id,
+                    "s3_location": s3_location,
+                    "campaign_id": campaign_id,
+                    "account_scopes": account_scopes,
+                    "requested_by": requested_by,
+                    "record_count": len(rows),
+                    "generated_at": ts.isoformat(),
+                    "csv_sha256": csv_hash,
+                    "json_sha256": json_hash,
+                    "manifest_sha256": manifest_hash,
+                },
+            )
         logger.log(
             "export_audit",
             "success",
@@ -285,38 +318,6 @@ def export_audit_report(*, campaign_id: str | None = None,
                 "s3_location": s3_location,
             },
         )
-        try:
-            with db.get_connection() as _audit_conn:
-                repo.insert_audit_log(
-                    _audit_conn,
-                    str(uuid.uuid4()),
-                    datetime.now(timezone.utc),
-                    "INFO",
-                    "export_audit",
-                    "success",
-                    "Audit artifacts generated.",
-                    details={
-                        "records": len(rows),
-                        "status_counts": status_counts,
-                        "csv_sha256": csv_hash,
-                        "json_sha256": json_hash,
-                        "manifest_sha256": manifest_hash,
-                        "export_run_id": run_id,
-                        "s3_location": s3_location,
-                        "campaign_id": campaign_id,
-                        "account_scopes": account_scopes,
-                        "requested_by": requested_by,
-                        "record_count": len(rows),
-                        "generated_at": ts.isoformat(),
-                        "csv_sha256": csv_hash,
-                        "json_sha256": json_hash,
-                        "manifest_sha256": manifest_hash,
-                    },
-                )
-        except Exception as e:
-            logger.log(
-                "export_audit", "warn", f"audit log write failed: {e}", level="WARN"
-            )
 
     except Exception as e:
         logger.log(

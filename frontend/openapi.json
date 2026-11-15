@@ -2504,18 +2504,11 @@
           "content": {
             "application/json": {
               "schema": {
-                "anyOf": [
-                  {
-                    "$ref": "#/components/schemas/RemediationApprovalRequest"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "title": "Approval Request"
+                "$ref": "#/components/schemas/RemediationApprovalRequest"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {

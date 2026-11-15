@@ -385,7 +385,8 @@ def test_direct_path_remediation_does_not_claim_group_access_removed(
     )
     monkeypatch.setenv("REMEDIATION_APPROVER_GROUP", "approvers")
     review_service.approve_remediation(
-        direct_review, Response(), {"sub": "approver", "groups": ["approvers"]}
+        direct_review, Response(), {"sub": "approver", "groups": ["approvers"]},
+        review_service.RemediationApprovalRequest(decision="APPROVED", reason="Independent approval"),
     )
     with db.get_connection() as conn:
         assert repo.is_remediation_approved(conn, direct_review, snapshot_id)
@@ -487,7 +488,8 @@ def test_approval_and_live_gate_are_source_specific(sqlite_evidence_db, monkeypa
         assert event_row and all(event_row)
     response = Response()
     approval = review_service.approve_remediation(
-        review_id, response, {"sub": "approver", "groups": ["approvers"]}
+        review_id, response, {"sub": "approver", "groups": ["approvers"]},
+        review_service.RemediationApprovalRequest(decision="APPROVED", reason="Independent approval"),
     )
     assert response.status_code == 201
     assert approval["snapshot_id"] == snapshot_id
@@ -500,7 +502,8 @@ def test_approval_and_live_gate_are_source_specific(sqlite_evidence_db, monkeypa
     _attempt(ACCOUNT_A, "FAILED")
     with pytest.raises(HTTPException) as exc:
         review_service.approve_remediation(
-            review_id, Response(), {"sub": "approver", "groups": ["approvers"]}
+            review_id, Response(), {"sub": "approver", "groups": ["approvers"]},
+            review_service.RemediationApprovalRequest(decision="APPROVED", reason="Independent approval"),
         )
     assert exc.value.status_code == 409
     monkeypatch.setenv("MOCK_IAM", "false")
@@ -549,6 +552,7 @@ def test_demo_origin_cannot_satisfy_live_approval(sqlite_evidence_db, monkeypatc
     monkeypatch.setenv("REMEDIATION_APPROVER_GROUP", "approvers")
     with pytest.raises(HTTPException) as exc:
         review_service.approve_remediation(
-            review_id, Response(), {"sub": "approver", "groups": ["approvers"]}
+            review_id, Response(), {"sub": "approver", "groups": ["approvers"]},
+            review_service.RemediationApprovalRequest(decision="APPROVED", reason="Independent approval"),
         )
     assert exc.value.status_code == 409

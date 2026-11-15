@@ -304,9 +304,15 @@ def remediation_queue(conn, scopes: list[str] | None, approver_sub: str,
     clauses = ["r.status='REVOKED'"]
     if scope_sql:
         clauses.append(scope_sql)
+    where = " AND ".join(clauses)
+    db.execute(cur, f"""SELECT COUNT(*) FROM access_reviews r
+        JOIN campaigns c ON c.campaign_id=r.campaign_id
+        WHERE {where}""", values)
+    total = int(cur.fetchone()[0])
     db.execute(cur, f"""SELECT r.review_id FROM access_reviews r
         JOIN campaigns c ON c.campaign_id=r.campaign_id
-        WHERE {' AND '.join(clauses)} ORDER BY r.reviewed_at DESC,r.review_id""", values)
+        WHERE {where} ORDER BY r.reviewed_at DESC,r.review_id LIMIT ? OFFSET ?""",
+        [*values, limit, offset])
     ids = [row[0] for row in cur.fetchall()]
     items = []
     for review_id in ids:
@@ -322,96 +328,165 @@ def remediation_queue(conn, scopes: list[str] | None, approver_sub: str,
         item["workflow_state"] = state
         item.pop("history", None)
         items.append(item)
-    return {"items": items[offset:offset + limit], "limit": limit, "offset": offset,
-            "total": len(items), "has_more": offset + limit < len(items)}
+    return {"items": items, "limit": limit, "offset": offset,
+            "total": total, "has_more": offset + len(items) < total}
+
+
+def _audit_event_details(conn, kind: str, event_id: str) -> dict:
+    queries = {
+        "WORKFLOW": ("review_workflow_events", "previous_value,new_value,details"),
+        "REVIEWER": ("campaign_reviewer_events", "reviewer_sub"),
+        "DECISION": ("review_decision_events",
+                     "reviewer_comment AS comment,snapshot_id,grant_id,observation_id,"
+                     "risk_assessment_id,decision_origin"),
+        "APPROVAL": ("remediation_approval_events",
+                     "approval_id,decision_event_id,approval_reason AS reason,"
+                     "snapshot_id,grant_id,observation_id,risk_assessment_id,"
+                     "grant_type,action_type"),
+        "DECLINE": ("remediation_approval_declines",
+                    "decision_event_id,reason,snapshot_id,grant_id,"
+                    "observation_id,risk_assessment_id"),
+        "ACTION": ("remediation_action_events",
+                   "attempt_id,approval_event_id,action_type,snapshot_id,"
+                   "grant_id,fencing_token,evidence_json"),
+        "RECONCILIATION": ("remediation_reconciliation_events",
+                           "request_id,hold_event_id,event_sequence,snapshot_id,"
+                           "grant_id,fencing_token,evidence_json"),
+    }
+    table, columns = queries[kind]
+    key = "decline_id" if kind == "DECLINE" else "event_id"
+    cur = conn.cursor()
+    db.execute(cur, f"SELECT {columns} FROM {table} WHERE {key}=?", (event_id,))
+    row = cur.fetchone()
+    if row is None:
+        return {}
+    result = dict(zip((column[0] for column in cur.description), row))
+    for field in ("details", "evidence_json"):
+        if field in result:
+            parsed = json.loads(result.pop(field))
+            result["evidence" if field == "evidence_json" else field] = parsed
+    return result
 
 
 def audit_events(conn, scopes: list[str] | None, *, limit=100, offset=0,
                  campaign_id=None, account_id=None, review_id=None,
                  principal=None, actor_sub=None, decision=None, event_type=None,
                  remediation_status=None, since=None, until=None):
-    from common import workflow
-
-    cur = conn.cursor()
-    values: list = []
-    clauses = []
-    scope_sql = _scope_filter("c.account_id", scopes, values)
+    campaign_values: list = []
+    campaign_clauses = []
+    scope_sql = _scope_filter("c.account_id", scopes, campaign_values)
     if scope_sql:
-        clauses.append(scope_sql)
+        campaign_clauses.append(scope_sql)
     if account_id:
-        clauses.append("c.account_id=?")
-        values.append(account_id)
+        campaign_clauses.append("c.account_id=?")
+        campaign_values.append(account_id)
     if campaign_id:
-        clauses.append("c.campaign_id=?")
-        values.append(campaign_id)
-    where = " AND ".join(clauses) if clauses else "1=1"
-    db.execute(cur, f"SELECT c.campaign_id FROM campaigns c WHERE {where}", values)
-    campaign_ids = [row[0] for row in cur.fetchall()]
-    events = []
-    for current_campaign in campaign_ids:
-        if not principal and not review_id:
-            event_offset = 0
-            while True:
-                campaign_events = workflow.events(
-                    conn, current_campaign, limit=1000, offset=event_offset
-                )
-                for event in campaign_events:
-                    events.append({
-                        "event_id": event["event_id"], "campaign_id": current_campaign,
-                        "review_id": event.get("review_id"), "event_type": event["event_type"],
-                        "actor_sub": event["actor_sub"], "created_at": event["created_at"],
-                        "summary": event["event_type"].replace("_", " ").title(),
-                        "details": event.get("details", {}),
-                    })
-                if len(campaign_events) < 1000:
-                    break
-                event_offset += len(campaign_events)
-        review_values: list = [current_campaign]
-        review_clauses = ["r.campaign_id=?"]
-        if review_id:
-            review_clauses.append("r.review_id=?")
-            review_values.append(review_id)
-        if principal:
-            review_clauses.append("LOWER(COALESCE(go.principal_name,u.user_name)) LIKE ?")
-            review_values.append(f"%{principal.lower()}%")
-        db.execute(cur, f"""SELECT r.review_id FROM access_reviews r
-            JOIN users u ON u.user_id=r.user_id
-            LEFT JOIN grant_observations go ON go.observation_id=r.observation_id
-            WHERE {' AND '.join(review_clauses)}""", review_values)
-        for (current_review,) in cur.fetchall():
-            for event in workflow.review_history(conn, current_review):
-                events.append({
-                    "event_id": event["event_id"], "campaign_id": current_campaign,
-                    "review_id": current_review, "event_type": event["event_type"],
-                    "actor_sub": event.get("actor_sub"), "created_at": event["created_at"],
-                    "decision": event.get("decision"), "summary": event.get("decision") or event["event_type"].replace("_", " ").title(),
-                    "details": {key: value for key, value in event.items() if key not in {"event_id", "event_type", "actor_sub", "created_at"}},
-                })
-            remediation = repo.remediation_history(conn, current_review)
-            for kind, key in (("APPROVAL", "approval_events"), ("ACTION", "action_events"), ("RECONCILIATION", "reconciliation_events")):
-                for event in remediation[key]:
-                    events.append({
-                        "event_id": event["event_id"], "campaign_id": current_campaign,
-                        "review_id": current_review, "event_type": f"REMEDIATION_{kind}_{event['event_type']}",
-                        "actor_sub": event.get("approver_sub") or event.get("actor_id"),
-                        "created_at": str(event.get("approved_at") or event.get("created_at")),
-                        "summary": event["event_type"].replace("_", " ").title(),
-                        "details": {key: value for key, value in event.items() if key not in {"event_id", "event_type"}},
-                    })
+        campaign_clauses.append("c.campaign_id=?")
+        campaign_values.append(campaign_id)
+    campaign_where = " AND ".join(campaign_clauses) if campaign_clauses else "1=1"
+
+    review_values: list = []
+    review_clauses = []
+    if review_id:
+        review_clauses.append("r.review_id=?")
+        review_values.append(review_id)
+    if principal:
+        review_clauses.append("LOWER(COALESCE(go.principal_name,u.user_name)) LIKE ?")
+        review_values.append(f"%{principal.lower()}%")
+    review_where = " AND ".join(review_clauses) if review_clauses else "1=1"
+    include_campaign = not principal and not review_id
+    campaign_only = "1=1" if include_campaign else "1=0"
+
+    query = f"""WITH scoped_campaigns AS (
+        SELECT c.campaign_id FROM campaigns c WHERE {campaign_where}
+    ), scoped_reviews AS (
+        SELECT r.review_id,r.campaign_id FROM access_reviews r
+        JOIN scoped_campaigns c ON c.campaign_id=r.campaign_id
+        JOIN users u ON u.user_id=r.user_id
+        LEFT JOIN grant_observations go ON go.observation_id=r.observation_id
+        WHERE {review_where}
+    ), audit_rows AS (
+        SELECT w.event_id,w.campaign_id,w.review_id,w.event_type,
+            w.actor_sub,w.created_at,NULL AS decision,'WORKFLOW' AS kind
+        FROM review_workflow_events w
+        JOIN scoped_campaigns c ON c.campaign_id=w.campaign_id
+        LEFT JOIN scoped_reviews r ON r.review_id=w.review_id
+        WHERE (w.review_id IS NULL AND {campaign_only}) OR r.review_id IS NOT NULL
+        UNION ALL
+        SELECT e.event_id,e.campaign_id,NULL,'CAMPAIGN_REVIEWER_' || e.event_type,
+            e.actor_sub,e.created_at,NULL,'REVIEWER'
+        FROM campaign_reviewer_events e
+        JOIN scoped_campaigns c ON c.campaign_id=e.campaign_id
+        WHERE {campaign_only}
+        UNION ALL
+        SELECT e.event_id,r.campaign_id,r.review_id,'REVIEW_DECISION',
+            e.reviewer_sub,e.decided_at,e.decision,'DECISION'
+        FROM review_decision_events e
+        JOIN scoped_reviews r ON r.review_id=e.review_id
+        UNION ALL
+        SELECT e.event_id,r.campaign_id,r.review_id,
+            'REMEDIATION_APPROVAL_' || e.event_type,
+            e.approver_sub,e.approved_at,NULL,'APPROVAL'
+        FROM remediation_approval_events e
+        JOIN scoped_reviews r ON r.review_id=e.review_id
+        UNION ALL
+        SELECT e.decline_id,r.campaign_id,r.review_id,
+            'REMEDIATION_APPROVAL_DECLINED',
+            e.approver_sub,e.declined_at,NULL,'DECLINE'
+        FROM remediation_approval_declines e
+        JOIN scoped_reviews r ON r.review_id=e.review_id
+        UNION ALL
+        SELECT e.event_id,r.campaign_id,r.review_id,
+            'REMEDIATION_ACTION_' || e.event_type,
+            e.actor_id,e.created_at,NULL,'ACTION'
+        FROM remediation_action_events e
+        JOIN scoped_reviews r ON r.review_id=e.review_id
+        UNION ALL
+        SELECT e.event_id,r.campaign_id,r.review_id,
+            'REMEDIATION_RECONCILIATION_' || e.event_type,
+            e.actor_id,e.created_at,NULL,'RECONCILIATION'
+        FROM remediation_reconciliation_events e
+        JOIN scoped_reviews r ON r.review_id=e.review_id
+    )"""
+    filters = []
+    filter_values: list = []
     if actor_sub:
-        events = [event for event in events if event.get("actor_sub") == actor_sub]
+        filters.append("actor_sub=?")
+        filter_values.append(actor_sub)
     if decision:
-        events = [event for event in events if event.get("decision") == decision]
+        filters.append("decision=?")
+        filter_values.append(decision)
     if event_type:
-        event_type_key = event_type.casefold()
-        events = [event for event in events if event.get("event_type", "").casefold() == event_type_key]
+        filters.append("LOWER(event_type)=?")
+        filter_values.append(event_type.casefold())
     if remediation_status:
-        events = [event for event in events if remediation_status in event["event_type"]]
+        filters.append("event_type LIKE ?")
+        filter_values.append(f"%{remediation_status}%")
     if since:
-        events = [event for event in events if event["created_at"] >= since]
+        filters.append("created_at>=?")
+        filter_values.append(since)
     if until:
-        events = [event for event in events if event["created_at"] <= until]
-    events.sort(key=lambda event: (event["created_at"], event["event_id"]), reverse=True)
-    return {"events": events[offset:offset + limit], "limit": limit, "offset": offset,
-            "total": len(events), "has_more": offset + limit < len(events)}
+        filters.append("created_at<=?")
+        filter_values.append(until)
+    where = "WHERE " + " AND ".join(filters) if filters else ""
+    values = [*campaign_values, *review_values, *filter_values]
+    cur = conn.cursor()
+    db.execute(cur, query + f" SELECT COUNT(*) FROM audit_rows {where}", values)
+    total = int(cur.fetchone()[0])
+    db.execute(cur, query + f""" SELECT event_id,campaign_id,review_id,
+        event_type,actor_sub,created_at,decision,kind FROM audit_rows {where}
+        ORDER BY created_at DESC,event_id DESC LIMIT ? OFFSET ?""",
+        [*values, limit, offset])
+    events = []
+    for event_id, campaign, review, kind_name, actor, created_at, outcome, kind in cur.fetchall():
+        events.append({
+            "event_id": event_id, "campaign_id": campaign,
+            "review_id": review, "event_type": kind_name,
+            "actor_sub": actor, "created_at": str(created_at),
+            "decision": outcome,
+            "summary": outcome or kind_name.replace("_", " ").title(),
+            "details": _audit_event_details(conn, kind, event_id),
+        })
+    return {"events": events, "limit": limit, "offset": offset,
+            "total": total, "has_more": offset + len(events) < total}
 
