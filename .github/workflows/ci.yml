@@ -112,9 +112,9 @@ jobs:
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
-      - name: Install Playwright Chromium
+      - name: Install Playwright Chromium browser
         working-directory: frontend
-        run: pnpm exec playwright install --with-deps chromium
+        run: pnpm exec playwright install chromium
 
       - name: Export and type the API contract
         working-directory: frontend
