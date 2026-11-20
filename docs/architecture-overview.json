@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "IAM Access Certification Engine",
+    "quality_profile": "showcase",
+    "viewBox": [1390, 760],
+    "repository": {
+      "url": "https://github.com/Prachet0806/GenAI_IAM_Governance",
+      "revision": "9b0adf16c31a49dd8bb0f50c2b5c1c6a2e3d3c14"
+    },
+    "views": [
+      { "id": "review-path", "label": "Review and approval", "focus": ["people", "web", "oidc", "api", "store"], "note": "Auth.js establishes the session; the API enforces roles and account scope before writing review evidence." },
+      { "id": "evidence-path", "label": "Discovery and risk", "focus": ["aws", "discovery", "risk", "store", "api"], "note": "Source-scoped discovery publishes snapshots; risk evaluation records assessments against frozen evidence." },
+      { "id": "downstream", "label": "AI, remediation, export", "focus": ["store", "ai", "remediation", "export", "s3"], "note": "AI is advisory; remediation is gated; exports include hashed artifacts and an audit index." }
+    ]
+  },
+  "components": [
+    { "id": "people", "type": "external", "label": "Review teams", "sublabel": "Five role workspaces", "pos": [40, 330], "size": [160, 72] },
+    { "id": "oidc", "type": "security", "label": "OIDC provider", "sublabel": "Identity + group claims", "pos": [280, 92], "size": [180, 72] },
+    { "id": "web", "type": "frontend", "label": "Next.js frontend", "sublabel": "Auth.js + BFF proxy", "pos": [280, 330], "size": [180, 72], "sources": [{ "path": "frontend/src/app/api/backend/[...path]/route.ts" }, { "path": "frontend/auth.ts" }] },
+    { "id": "api", "type": "backend", "label": "FastAPI review API", "sublabel": "Roles, scope, workflows", "pos": [560, 330], "size": [190, 72], "sources": [{ "path": "api/review_service.py" }, { "path": "common/auth.py" }] },
+    { "id": "store", "type": "database", "label": "Governance database", "sublabel": "Postgres / local SQLite", "pos": [830, 330], "size": [200, 72], "sources": [{ "path": "common/db.py" }, { "path": "sql/migrations/0001_baseline.sql" }] },
+    { "id": "aws", "type": "cloud", "label": "AWS access sources", "sublabel": "IAM + Identity Center", "pos": [40, 586], "size": [180, 72] },
+    { "id": "discovery", "type": "backend", "label": "Discovery workers", "sublabel": "Source-scoped inventory", "pos": [280, 586], "size": [180, 72], "sources": [{ "path": "lambdas/identity_discovery/handler.py" }, { "path": "lambdas/role_discovery/handler.py" }, { "path": "lambdas/identity_center_discovery/handler.py" }] },
+    { "id": "risk", "type": "backend", "label": "Risk evaluation", "sublabel": "Frozen policy evidence", "pos": [560, 586], "size": [180, 72], "sources": [{ "path": "lambdas/risk_evaluation/handler.py" }] },
+    { "id": "ai", "type": "backend", "label": "AI explanation", "sublabel": "Optional advisory job", "pos": [810, 92], "size": [180, 72], "sources": [{ "path": "lambdas/ai_explanation/handler.py" }] },
+    { "id": "remediation", "type": "backend", "label": "Remediation worker", "sublabel": "Staging-only IAM action", "pos": [1050, 586], "size": [200, 72], "sources": [{ "path": "lambdas/remediation/handler.py" }] },
+    { "id": "export", "type": "backend", "label": "Audit exporter", "sublabel": "CSV, JSON, manifest", "pos": [1150, 92], "size": [180, 72], "sources": [{ "path": "reports/export_audit.py" }] },
+    { "id": "s3", "type": "cloud", "label": "Audit S3 bucket", "sublabel": "Optional artifact store", "pos": [1150, 330], "size": [180, 72] }
+  ],
+  "connections": [
+    { "from": "people", "to": "web", "label": "workspace pages", "variant": "emphasis" },
+    { "from": "oidc", "to": "web", "label": "OIDC login", "variant": "security", "labelAt": [370, 178] },
+    { "from": "web", "to": "api", "label": "BFF proxy + bearer token", "variant": "emphasis", "labelAt": [510, 416] },
+    { "from": "api", "to": "store", "label": "scoped SQL + events", "variant": "emphasis", "labelAt": [790, 416] },
+    { "from": "aws", "to": "discovery", "label": "IAM / Identity Center reads", "labelAt": [250, 672] },
+    { "from": "discovery", "to": "store", "label": "publish snapshots", "fromSide": "top", "toSide": "bottom" },
+    { "from": "risk", "to": "store", "label": "frozen-evidence assessments", "fromSide": "top", "toSide": "bottom", "labelDy": 44 },
+    { "from": "store", "to": "ai", "label": "high-risk jobs", "variant": "dashed", "fromSide": "top", "toSide": "bottom" },
+    { "from": "store", "to": "remediation", "label": "approved path evidence", "fromSide": "bottom", "toSide": "top" },
+    { "from": "store", "to": "export", "label": "scoped audit data" },
+    { "from": "export", "to": "s3", "label": "hashed artifacts", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelAt": [1240, 178] }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Evidence path", "items": ["Discovery publishes immutable grant-path snapshots per account and source.", "Campaign reviews pin grant observations and risk assessments."] },
+    { "dot": "violet", "title": "Trust gates", "items": ["OIDC groups and account scopes guard API access; shared environments block manual reviewer assignment.", "Live remediation requires independent approval, a supported direct user path, and staging gates."] },
+    { "dot": "amber", "title": "Runtime boundary", "items": ["Local Compose starts Next.js, FastAPI, migrations, and PostgreSQL.", "Workers run separately; cloud scheduling and production infrastructure are absent."] }
+  ]
+}

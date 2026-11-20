@@ -2,6 +2,8 @@
 *.csv
 *.log
 *.json
+!docs/architecture-overview.json
+docs/architecture-overview.visual-check.*
 !frontend/package.json
 !frontend/tsconfig.json
 !frontend/openapi.json
