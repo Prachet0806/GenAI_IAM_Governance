@@ -1,5 +1,4 @@
--- sql/schema_postgres.sql
--- Postgres-specific statements layered on top of schema_base.sql
+-- Postgres-specific baseline upgrade statements.
 -- Idempotent: safe to re-run (DO blocks guard non-IF-NOT-EXISTS DDL).
 
 DO $$
@@ -7,21 +6,21 @@ BEGIN
     -- Normalize timestamps to TIMESTAMPTZ (only if not already timestamptz)
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'users' AND column_name = 'created_at'
+        WHERE table_schema = current_schema() AND table_name = 'users' AND column_name = 'created_at'
           AND udt_name <> 'timestamptz'
     ) THEN
         ALTER TABLE users ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at::timestamptz;
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'campaigns' AND column_name = 'created_at'
+        WHERE table_schema = current_schema() AND table_name = 'campaigns' AND column_name = 'created_at'
           AND udt_name <> 'timestamptz'
     ) THEN
         ALTER TABLE campaigns ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at::timestamptz;
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'access_reviews' AND column_name = 'created_at'
+        WHERE table_schema = current_schema() AND table_name = 'access_reviews' AND column_name = 'created_at'
           AND udt_name <> 'timestamptz'
     ) THEN
         ALTER TABLE access_reviews
@@ -29,7 +28,7 @@ BEGIN
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'access_reviews' AND column_name = 'reviewed_at'
+        WHERE table_schema = current_schema() AND table_name = 'access_reviews' AND column_name = 'reviewed_at'
           AND udt_name <> 'timestamptz'
     ) THEN
         ALTER TABLE access_reviews
@@ -37,7 +36,7 @@ BEGIN
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'access_reviews' AND column_name = 'remediated_at'
+        WHERE table_schema = current_schema() AND table_name = 'access_reviews' AND column_name = 'remediated_at'
           AND udt_name <> 'timestamptz'
     ) THEN
         ALTER TABLE access_reviews
@@ -45,7 +44,7 @@ BEGIN
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'audit_logs' AND column_name = 'timestamp'
+        WHERE table_schema = current_schema() AND table_name = 'audit_logs' AND column_name = 'timestamp'
           AND udt_name <> 'timestamptz'
     ) THEN
         ALTER TABLE audit_logs
@@ -56,14 +55,14 @@ BEGIN
     -- Enforce NOT NULL only if no NULLs remain
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'roles' AND column_name = 'risk_level' AND is_nullable = 'YES'
+        WHERE table_schema = current_schema() AND table_name = 'roles' AND column_name = 'risk_level' AND is_nullable = 'YES'
     ) AND NOT EXISTS (SELECT 1 FROM roles WHERE risk_level IS NULL) THEN
         ALTER TABLE roles ALTER COLUMN risk_level SET NOT NULL;
     END IF;
     -- Convert audit details to JSONB only when convertible
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'audit_logs' AND column_name = 'details'
+        WHERE table_schema = current_schema() AND table_name = 'audit_logs' AND column_name = 'details'
           AND udt_name <> 'jsonb'
     ) THEN
         BEGIN

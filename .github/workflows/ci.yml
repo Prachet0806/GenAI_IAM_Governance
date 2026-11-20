@@ -38,3 +38,101 @@ jobs:
 
       - name: Run test suite
         run: python -m pytest -q
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: iam_test
+          POSTGRES_PASSWORD: iam_test
+          POSTGRES_DB: iam_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U iam_test -d iam_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_TEST_URL: postgresql://iam_test:iam_test@localhost:5432/iam_test
+      MOCK_IAM: "true"
+      LOCAL_ONLY: "true"
+      ENABLE_GENAI: "false"
+      DRY_RUN: "true"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Run Postgres migration and concurrency checks
+        run: python -m pytest -q tests/test_migrations.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install backend schema dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium browser
+        working-directory: frontend
+        run: pnpm exec playwright install chromium
+
+      - name: Export and type the API contract
+        working-directory: frontend
+        run: pnpm api:types && git diff --exit-code -- openapi.json src/lib/api/schema.d.ts
+
+      - name: Check frontend
+        working-directory: frontend
+        run: pnpm typecheck && pnpm lint && pnpm test && pnpm test:e2e && pnpm build
+
+  container-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build API image
+        run: docker build --file Dockerfile.api --tag iam-governance-api:ci .
+
+      - name: Build frontend image
+        run: docker build --file frontend/Dockerfile --tag iam-governance-frontend:ci frontend
