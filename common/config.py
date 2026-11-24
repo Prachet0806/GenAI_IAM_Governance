@@ -23,6 +23,7 @@ DB_URL = os.getenv("DB_URL", "sqlite:///iam_governance.db")
 AWS_REGION = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
 AWS_PROFILE = os.getenv("AWS_PROFILE")
 MOCK_IAM = _get_bool("MOCK_IAM", False)
+SEEDED_IAM = _get_bool("SEEDED_IAM", False)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # Remediation safety (snapshots; prefer runtime getters below)
@@ -45,12 +46,58 @@ GENAI_MODEL = os.getenv("GENAI_MODEL", "gemini-3.8-flash")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Schema/versioning
-SCHEMA_VERSION = "2026-11-observation-identity-reconciliation"
+SCHEMA_VERSION = "2026-11-phase0-evidence-risk"
 
 
 # --- Runtime getters (avoid import-time freezing for Lambda) ---
-def is_mock_iam() -> bool:
-    return _get_bool("MOCK_IAM", False)
+def iam_source_mode() -> str:
+    """MOCK_IAM=false routes SDK calls to Floci; true uses live AWS."""
+    seeded = _get_bool("SEEDED_IAM", False)
+    live = _get_bool("MOCK_IAM", False)
+    if seeded and live:
+        raise ValueError("SEEDED_IAM and MOCK_IAM=true cannot be combined")
+    return "MOCK" if seeded else "AWS" if live else "FLOCI"
+
+
+def is_seeded_iam() -> bool:
+    return iam_source_mode() == "MOCK"
+
+
+def is_live_aws() -> bool:
+    return iam_source_mode() == "AWS"
+
+
+def is_floci() -> bool:
+    return iam_source_mode() == "FLOCI"
+
+
+def get_floci_endpoint_url() -> str:
+    return os.getenv("FLOCI_ENDPOINT_URL", "http://127.0.0.1:4566").strip()
+
+
+def get_floci_account_id() -> str:
+    account_id = os.getenv("FLOCI_ACCOUNT_ID", "111111111111").strip()
+    if not re.fullmatch(r"\d{12}", account_id):
+        raise ValueError("FLOCI_ACCOUNT_ID must be a 12-digit synthetic account ID")
+    return account_id
+
+
+def get_source_account_id() -> str:
+    account_id = get_aws_account_id()
+    if is_floci() and account_id != get_floci_account_id():
+        raise ValueError("AWS_ACCOUNT_ID must match FLOCI_ACCOUNT_ID in Floci mode")
+    return account_id
+
+
+def is_emulator_mutation_allowed() -> bool:
+    return _get_bool("ALLOW_EMULATOR_MUTATION", False)
+
+
+def remediation_source_mode() -> str:
+    """The emulator approval path is exclusive to the emulator environment."""
+    if is_floci() and os.getenv("APP_ENV", "").strip().lower() == "emulator":
+        return "FLOCI"
+    return "AWS"
 
 
 def is_dry_run() -> bool:

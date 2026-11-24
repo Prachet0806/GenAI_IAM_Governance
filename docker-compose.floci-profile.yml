@@ -1,0 +1,9 @@
+# Use only with docker-compose.floci-benchmark.yml for B0 diagnostics.
+services:
+  postgres:
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track_planning=on

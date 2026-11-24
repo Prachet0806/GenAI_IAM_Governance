@@ -8,13 +8,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import boto3
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import config, logger, repo
+from common import aws_clients, config, evidence_manifest, logger, repo
 from common.db import db
 
 
@@ -39,6 +38,7 @@ def export_audit_report(*, campaign_id: str | None = None,
     os.makedirs(report_dir, exist_ok=True)
     filename_csv = f"{report_dir}/access_certification_{date_part}_{run_id}.csv"
     filename_json = f"{report_dir}/access_certification_{date_part}_{run_id}.json"
+    filename_evidence = f"{report_dir}/access_certification_{date_part}_{run_id}.evidence.json"
     filename_manifest = (
         f"{report_dir}/access_certification_{date_part}_{run_id}.manifest.json"
     )
@@ -56,6 +56,40 @@ def export_audit_report(*, campaign_id: str | None = None,
                 conn, campaign_id=campaign_id, account_scopes=account_scopes,
                 max_rows=max_rows + 1 if max_rows is not None else None,
             )
+            annotations = {}
+            source_manifests = {}
+            review_manifests = {}
+            for row in rows:
+                if row[15] and row[15] not in source_manifests:
+                    source_manifests[row[15]] = evidence_manifest.source_manifest(
+                        conn, row[15]
+                    )
+                pinned = evidence_manifest.review_manifest(
+                    conn, row[0], source=source_manifests.get(row[15]),
+                )
+                if pinned:
+                    review_manifests[row[0]] = pinned
+                assessment = repo.review_assessment_payload(conn, row[0])
+                eligible = None
+                if pinned:
+                    body = pinned["manifest"]
+                    current = repo.eligible_published_snapshot(
+                        conn, body["account_id"], body["source_scope"],
+                    )
+                    eligible = bool(current and current["snapshot_id"] == body["snapshot_id"])
+                annotations[row[0]] = {
+                    "assessment": assessment,
+                    "source_manifest_sha256": (
+                        pinned["manifest"]["source_manifest_sha256"] if pinned else None
+                    ),
+                    "review_manifest_sha256": pinned["sha256"] if pinned else None,
+                    "evidence_invalidations": (
+                        repo.list_evidence_invalidations(conn, row[15])
+                        if row[15] else []
+                    ),
+                    "current_snapshot_eligible_at_export": eligible,
+                    "eligibility_checked_at": ts.isoformat() if pinned else None,
+                }
 
         if max_rows is not None and len(rows) > max_rows:
             raise ValueError(f"Export exceeds the {max_rows} record limit")
@@ -122,9 +156,26 @@ def export_audit_report(*, campaign_id: str | None = None,
                     "Remediation Action Events",
                     "Observed Principal ARN",
                     "Remediation Reconciliation Events",
+                    "Assessment",
+                    "Source Manifest SHA256",
+                    "Review Manifest SHA256",
+                    "Evidence Invalidations",
+                    "Current Snapshot Eligible At Export",
+                    "Eligibility Checked At",
                 ]
             )
-            writer.writerows(tuple(_spreadsheet_safe(value) for value in row) for row in rows)
+            for row in rows:
+                note = annotations[row[0]]
+                extra = (
+                    json.dumps(note["assessment"], sort_keys=True)
+                    if note["assessment"] is not None else None,
+                    note["source_manifest_sha256"],
+                    note["review_manifest_sha256"],
+                    json.dumps(note["evidence_invalidations"], sort_keys=True),
+                    note["current_snapshot_eligible_at_export"],
+                    note["eligibility_checked_at"],
+                )
+                writer.writerow(tuple(_spreadsheet_safe(value) for value in (*row, *extra)))
 
         # Write JSON canonical
         json_records = [
@@ -173,17 +224,32 @@ def export_audit_report(*, campaign_id: str | None = None,
                 "remediation_action_events": json.loads(r[39]),
                 "observed_principal_arn": r[40],
                 "remediation_reconciliation_events": json.loads(r[41]),
+                **annotations[r[0]],
             }
             for r in rows
         ]
         with open(filename_json, "w", encoding="utf-8") as jf:
             json.dump(json_records, jf, ensure_ascii=False, indent=2)
 
+        evidence_bundle = {
+            "schema_version": "audit-evidence-v1",
+            "generated_at": ts.isoformat(),
+            "source_manifests": {
+                snapshot_id: item for snapshot_id, item in source_manifests.items()
+                if item is not None
+            },
+            "review_manifests": review_manifests,
+        }
+        with open(filename_evidence, "w", encoding="utf-8") as ef:
+            json.dump(evidence_bundle, ef, ensure_ascii=False, indent=2, sort_keys=True)
+
         # Hashes
         with open(filename_csv, "rb") as f:
             csv_hash = _sha256_bytes(f.read())
         with open(filename_json, "rb") as f:
             json_hash = _sha256_bytes(f.read())
+        with open(filename_evidence, "rb") as f:
+            evidence_hash = _sha256_bytes(f.read())
 
         manifest = {
             "export_run_id": run_id,
@@ -196,6 +262,7 @@ def export_audit_report(*, campaign_id: str | None = None,
             "artifacts": {
                 "csv": {"path": os.path.basename(filename_csv), "sha256": csv_hash},
                 "json": {"path": os.path.basename(filename_json), "sha256": json_hash},
+                "evidence": {"path": os.path.basename(filename_evidence), "sha256": evidence_hash},
             },
         }
         with open(filename_manifest, "w", encoding="utf-8") as mf:
@@ -209,10 +276,9 @@ def export_audit_report(*, campaign_id: str | None = None,
         if audit_bucket and not local_only:
             from botocore.config import Config as BotoConfig
 
-            s3 = boto3.client(
+            s3 = aws_clients.client(
                 "s3",
-                region_name=config.get_aws_region(),
-                config=BotoConfig(
+                client_config=BotoConfig(
                     connect_timeout=10, read_timeout=30, retries={"max_attempts": 3}
                 ),
             )
@@ -262,6 +328,16 @@ def export_audit_report(*, campaign_id: str | None = None,
                 },
             )
             s3.upload_file(
+                filename_evidence,
+                audit_bucket,
+                f"{export_path}/evidence.json",
+                ExtraArgs={
+                    "Metadata": common_meta,
+                    "ContentType": "application/json",
+                    **encryption,
+                },
+            )
+            s3.upload_file(
                 filename_manifest,
                 audit_bucket,
                 f"{export_path}/manifest.json",
@@ -289,6 +365,7 @@ def export_audit_report(*, campaign_id: str | None = None,
                     "status_counts": status_counts,
                     "csv_sha256": csv_hash,
                     "json_sha256": json_hash,
+                    "evidence_sha256": evidence_hash,
                     "manifest_sha256": manifest_hash,
                     "export_run_id": run_id,
                     "s3_location": s3_location,
@@ -297,9 +374,6 @@ def export_audit_report(*, campaign_id: str | None = None,
                     "requested_by": requested_by,
                     "record_count": len(rows),
                     "generated_at": ts.isoformat(),
-                    "csv_sha256": csv_hash,
-                    "json_sha256": json_hash,
-                    "manifest_sha256": manifest_hash,
                 },
             )
         logger.log(
@@ -311,9 +385,11 @@ def export_audit_report(*, campaign_id: str | None = None,
                 "status_counts": status_counts,
                 "csv_path": os.path.abspath(filename_csv),
                 "json_path": os.path.abspath(filename_json),
+                "evidence_path": os.path.abspath(filename_evidence),
                 "manifest_path": os.path.abspath(filename_manifest),
                 "csv_sha256": csv_hash,
                 "json_sha256": json_hash,
+                "evidence_sha256": evidence_hash,
                 "manifest_sha256": manifest_hash,
                 "s3_location": s3_location,
             },
@@ -332,11 +408,13 @@ def export_audit_report(*, campaign_id: str | None = None,
         "export_run_id": run_id,
         "csv": filename_csv,
         "json": filename_json,
+        "evidence": filename_evidence,
         "manifest": filename_manifest,
         "s3_location": s3_location,
         "record_count": len(rows),
         "csv_sha256": csv_hash,
         "json_sha256": json_hash,
+        "evidence_sha256": evidence_hash,
         "manifest_sha256": manifest_hash,
         "generated_at": ts.isoformat(),
     }

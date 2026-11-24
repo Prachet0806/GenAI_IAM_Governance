@@ -1,7 +1,10 @@
 *.db
+benchmarks/results/
 *.csv
 *.log
 *.json
+!tests/fixtures/floci/manifest.schema.json
+!tests/fixtures/floci/profiles/*.json
 !docs/architecture-overview.json
 docs/architecture-overview.visual-check.*
 !frontend/package.json

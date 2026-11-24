@@ -1,28 +1,22 @@
 """Identity Center account assignment paths with explicit policy gaps."""
 
-import json
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import boto3
-
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import config, evidence
+from common import aws_clients, config, evidence, policy_assessment
 from common.source_scanner import publish_source
 from lambdas.identity_discovery.handler import _get_policy_document
 
 
 def _clients():
-    session = boto3.Session(
-        profile_name=config.get_aws_profile() or None,
-        region_name=config.get_aws_region(),
-    )
-    return session.client("sso-admin"), session.client("identitystore"), session.client("iam")
+    return (aws_clients.client("sso-admin"), aws_clients.client("identitystore"),
+            aws_clients.client("iam"))
 
 
 def _pages(client, operation: str, key: str, **arguments):
@@ -62,7 +56,7 @@ def _permission_set_policy(admin, iam, instance_arn: str, permission_set_arn: st
         InstanceArn=instance_arn, PermissionSetArn=permission_set_arn
     ).get("InlinePolicy")
     if inline:
-        parsed = json.loads(inline)
+        parsed = policy_assessment.decode_policy_json(inline)
         if not isinstance(parsed, dict):
             raise ValueError("Identity Center inline policy is invalid")
         items = parsed.get("Statement", [])
@@ -148,6 +142,13 @@ def discover_identity_center(event, context):
     account_id = str(event.get("account_id", ""))
     if not re.fullmatch(r"\d{12}", account_id):
         return {"status": "blocked", "reason": "account_id_required"}
+    mode = config.iam_source_mode()
+    if mode == "MOCK":
+        return {"status": "blocked", "reason": "seeded_source_unsupported"}
+    if mode == "FLOCI":
+        if account_id != config.get_source_account_id():
+            return {"status": "blocked", "reason": "floci_account_mismatch"}
+        aws_clients.assert_floci_ready()
     def principals():
         admin, store, iam = _clients()
         instance_arn, identity_store_id = _instance(admin, event.get("instance_arn"))
@@ -158,6 +159,7 @@ def discover_identity_center(event, context):
     return publish_source(
         account_id, evidence.IDENTITY_CENTER_SCOPE,
         principals(),
+        source=mode,
         covered=["account_assignments", "permission_sets", "inline_policy",
                  "aws_managed_policy_documents", "identity_store_principal_names"],
         unassessed=["identity_center_group_membership", "permission_boundaries",

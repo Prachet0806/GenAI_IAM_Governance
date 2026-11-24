@@ -1,0 +1,7 @@
+{
+  "name": "baseline",
+  "users": 100,
+  "active_users": 95,
+  "groups": 4,
+  "managed_policies": 6
+}

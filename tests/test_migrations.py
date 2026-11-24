@@ -34,13 +34,34 @@ def _set_sqlite(monkeypatch, path):
     monkeypatch.setenv("DB_URL", f"sqlite:///{path}")
 
 
+SQL_COMMENT_CASES = """
+-- only a comment;
+/* another comment; */;
+CREATE TABLE migration_comment_probe (value TEXT);
+-- between statements;
+INSERT INTO migration_comment_probe(value) VALUES ('/* literal; -- text */');
+/* between statements */
+INSERT INTO migration_comment_probe(value) VALUES ('second');;;
+-- trailing comment
+"""
+
+
+def test_sqlite_statement_execution_skips_comments_and_empty_statements():
+    with sqlite3.connect(":memory:") as conn:
+        migrate._execute_statements(conn.cursor(), SQL_COMMENT_CASES)
+        assert conn.execute("SELECT value FROM migration_comment_probe ORDER BY rowid").fetchall() == [
+            ("/* literal; -- text */",), ("second",),
+        ]
+        migrate._execute_statements(conn.cursor(), " -- comment only\n /* block only */; ;")
+
+
 def test_sqlite_fresh_install_and_rerun(tmp_path, monkeypatch):
     path = tmp_path / "fresh.db"
     _set_sqlite(monkeypatch, path)
     migrate.apply_sqlite()
     migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 11
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 14
         assert conn.execute("SELECT COUNT(*) FROM governance_mutex").fetchone()[0] == 1
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -64,7 +85,7 @@ def test_sqlite_legacy_upgrade_preserves_data(tmp_path, monkeypatch):
             assert column in {
                 row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')
             }
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 11
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 14
 
 
 def test_sqlite_upgrade_from_committed_pr1_ledger(tmp_path, monkeypatch):
@@ -81,7 +102,7 @@ def test_sqlite_upgrade_from_committed_pr1_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", source)
     migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (11,)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (14,)
         assert conn.execute("SELECT role_name FROM roles WHERE role_id='R1'").fetchone() == ("Reader",)
 
 
@@ -111,7 +132,7 @@ def test_sqlite_upgrade_from_pr3_with_existing_grant_evidence(tmp_path, monkeypa
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert conn.execute("SELECT grant_type FROM grant_paths WHERE grant_id='G1'").fetchone() == ("DIRECT_MANAGED",)
         assert conn.execute("SELECT evidence_status FROM grant_observations WHERE observation_id='O1'").fetchone() == ("COMPLETE",)
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (11,)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (14,)
         assert conn.execute("SELECT principal_arn FROM grant_observations WHERE observation_id='O1'").fetchone() == (None,)
 
 
@@ -121,7 +142,7 @@ def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeyp
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", files)
     path = tmp_path / "rollback.db"
     _set_sqlite(monkeypatch, path)
-    (files / "0012_bad.sql").write_text(
+    (files / "0015_bad.sql").write_text(
         "CREATE TABLE should_rollback (id INTEGER); INSERT INTO absent VALUES (1);",
         encoding="utf-8",
     )
@@ -129,7 +150,7 @@ def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeyp
         migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
-    (files / "0012_bad.sql").unlink()
+    (files / "0015_bad.sql").unlink()
     migrate.apply_sqlite()
     baseline = files / "0001_baseline.sql"
     baseline.write_text(
@@ -186,9 +207,64 @@ def test_postgres_fresh_install_and_concurrent_migration(postgres_schema):
             ("0009_remediation_evidence", 64),
             ("0010_observation_identity_reconciliation", 64),
             ("0011_remediation_approval_declines", 64),
+            ("0012_collection_receipts", 64),
+            ("0013_grant_assessment_evidence", 64),
+            ("0014_evidence_invalidations", 64),
         ]
         cur.execute("SELECT COUNT(*) FROM governance_mutex")
         assert cur.fetchone() == (1,)
+
+
+def test_postgres_statement_execution_skips_comments_and_empty_statements(postgres_schema):
+    import psycopg2
+
+    with psycopg2.connect(postgres_schema) as conn, conn.cursor() as cur:
+        migrate._execute_statements(cur, SQL_COMMENT_CASES)
+        cur.execute("SELECT value FROM migration_comment_probe ORDER BY value")
+        assert cur.fetchall() == [("/* literal; -- text */",), ("second",)]
+        migrate._execute_statements(cur, " -- comment only\n /* block only */; ;")
+
+
+def test_postgres_collection_receipt_survives_superseded_publication(postgres_schema):
+    from datetime import datetime, timezone
+
+    from common import evidence, repo
+    from common.db import db
+
+    migrate.apply_postgres()
+    account = "123456789012"
+    scope = evidence.IAM_USER_POLICY_SCOPE
+    now = datetime.now(timezone.utc).isoformat()
+    coverage = {
+        "scope_version": scope, "pagination_complete": True,
+        "complete_for_declared_scope": True, "principal_count": 0,
+        "grant_count": 0, "missing_policy_evidence": 0,
+    }
+    with db.get_connection() as conn:
+        repo.start_discovery_attempt(conn, "older", now, "MOCK", account, scope)
+        repo.record_collection_success(
+            conn, "older", account, scope, now, [], [], coverage,
+        )
+    with db.get_connection() as conn:
+        repo.start_discovery_attempt(conn, "newer", now, "MOCK", account, scope)
+    with db.get_connection() as conn:
+        assert repo.discovery_attempt_outcome(conn, "older") == {
+            "collection": "SUCCEEDED",
+            "publication": "SUPERSEDED_BEFORE_PUBLICATION",
+        }
+        assert repo.publish_discovery_snapshot(
+            conn, "older", account, scope, now, [], [], coverage,
+        ) is False
+    with db.get_connection() as conn:
+        repo.record_collection_success(
+            conn, "newer", account, scope, now, [], [], coverage,
+        )
+    with db.get_connection() as conn:
+        assert repo.publish_discovery_snapshot(
+            conn, "newer", account, scope, now, [], [], coverage,
+        ) is True
+        assert repo.discovery_attempt_outcome(conn, "older")["collection"] == "SUCCEEDED"
+        assert repo.discovery_attempt_outcome(conn, "newer")["publication"] == "CURRENT_PUBLISHED"
 
 
 def test_postgres_legacy_upgrade_and_claim_contention(postgres_schema):
@@ -241,7 +317,7 @@ def test_postgres_upgrade_from_committed_pr1_ledger(postgres_schema, tmp_path, m
     migrate.apply_postgres()
     with psycopg2.connect(postgres_schema) as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM schema_migrations")
-        assert cur.fetchone() == (11,)
+        assert cur.fetchone() == (14,)
         cur.execute("SELECT role_name FROM roles WHERE role_id='R1'")
         assert cur.fetchone() == ("Reader",)
 
@@ -368,8 +444,17 @@ def test_postgres_ai_claim_contention(postgres_schema):
     now = user["CreateDate"].isoformat()
     with db.get_connection() as conn:
         repo.start_discovery_attempt(conn, run_id, now, "MOCK", ACCOUNT_A, evidence.IAM_USER_POLICY_SCOPE)
+        coverage = {
+            "scope_version": evidence.IAM_USER_POLICY_SCOPE,
+            "pagination_complete": True,
+            "complete_for_declared_scope": True,
+        }
+        repo.record_collection_success(
+            conn, run_id, ACCOUNT_A, evidence.IAM_USER_POLICY_SCOPE,
+            now, [user], [observation], coverage,
+        )
         repo.publish_discovery_snapshot(conn, run_id, ACCOUNT_A, evidence.IAM_USER_POLICY_SCOPE,
-                                        now, [user], [observation], {"complete_for_declared_scope": True})
+                                        now, [user], [observation], coverage)
     evaluate_risk(None, None)
     campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
     assert campaign["reviews_created"] == 1
@@ -491,7 +576,7 @@ def test_postgres_remediation_approval_events_and_worker_contention(
         review_id, Response(), {"sub": "approver", "groups": ["approvers"]},
         review_service.RemediationApprovalRequest(decision="APPROVED", reason="Independent approval"),
     )
-    monkeypatch.setenv("MOCK_IAM", "false")
+    monkeypatch.setenv("MOCK_IAM", "true")
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("ENABLE_REMEDIATION", "true")
     monkeypatch.setenv("ALLOW_LIVE_REMEDIATION", "true")
@@ -601,7 +686,7 @@ def test_postgres_remediation_approval_decline_are_mutually_exclusive(
             )
 
     if outcomes[1] == "declined":
-        monkeypatch.setenv("MOCK_IAM", "false")
+        monkeypatch.setenv("MOCK_IAM", "true")
         monkeypatch.setenv("DRY_RUN", "false")
         monkeypatch.setenv("ENABLE_REMEDIATION", "true")
         monkeypatch.setenv("ALLOW_LIVE_REMEDIATION", "true")
@@ -654,7 +739,7 @@ def test_postgres_operator_reconciliation_is_lease_bound(postgres_schema, monkey
         review_service.RemediationApprovalRequest(decision="APPROVED", reason="Independent approval"),
     )
     for key, value in {
-        "MOCK_IAM": "false", "DRY_RUN": "false", "ENABLE_REMEDIATION": "true",
+        "MOCK_IAM": "true", "DRY_RUN": "false", "ENABLE_REMEDIATION": "true",
         "ALLOW_LIVE_REMEDIATION": "true", "REMEDIATION_ALLOWLIST": "Reader",
         "AWS_ACCOUNT_ID": ACCOUNT_A,
         "STAGING_REMEDIATION_ACCEPTANCE_ID": "pg-test-acceptance",

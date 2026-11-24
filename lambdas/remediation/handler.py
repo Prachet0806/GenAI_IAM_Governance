@@ -9,13 +9,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
-import boto3
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import config, evidence, logger, repo
+from common import aws_clients, config, evidence, logger, repo
 from common.db import db
 from lambdas.identity_discovery.handler import _get_policy_document
 
@@ -62,14 +61,7 @@ def _get_iam_client():
         connect_timeout=5, read_timeout=20,
         retries={"mode": "standard", "max_attempts": 3},
     )
-    profile = config.get_aws_profile()
-    if profile:
-        return boto3.Session(
-            profile_name=profile, region_name=config.get_aws_region()
-        ).client("iam", config=client_config)
-    return boto3.client(
-        "iam", region_name=config.get_aws_region(), config=client_config
-    )
+    return aws_clients.client("iam", client_config=client_config)
 
 
 def _is_policy_attached(iam, user_name: str, policy_arn: str) -> bool:
@@ -155,7 +147,8 @@ def _eligible_path(conn, review_id: str, binding: dict, account_id: str) -> bool
             or binding["account_id"] != account_id):
         return False
     snapshot = repo.eligible_published_snapshot(
-        conn, binding["account_id"], binding["source_scope"], require_aws=True
+        conn, binding["account_id"], binding["source_scope"],
+        required_source=config.remediation_source_mode(),
     )
     return bool(
         snapshot and snapshot["snapshot_id"] == binding["snapshot_id"]
@@ -438,12 +431,27 @@ def remediate_access(event, context):
             "failed": 0, "reconciliation_required": 0, "dry_run": True,
             "total_pending": len(revocations), "preview": preview,
         }
-    if os.getenv("APP_ENV", "development").lower() == "production":
+    mode = config.iam_source_mode()
+    environment = os.getenv("APP_ENV", "development").lower()
+    if environment == "production":
         reason = "production_live_remediation_disabled"
-    elif os.getenv("APP_ENV", "development").lower() != "staging":
+    elif mode == "MOCK":
+        reason = "seeded_mode"
+    elif mode == "FLOCI":
+        if environment != "emulator":
+            reason = "emulator_environment_required"
+        elif (not config.is_emulator_mutation_allowed() or not config.get_allowlist()
+              or config.is_live_remediation_explicitly_allowed()):
+            reason = "missing_emulator_safety_configuration"
+        else:
+            try:
+                aws_clients.assert_floci_ready()
+            except Exception:
+                reason = "floci_unavailable"
+            else:
+                reason = None
+    elif environment != "staging":
         reason = "staging_environment_required"
-    elif config.is_mock_iam():
-        reason = "mock_mode"
     elif not config.is_live_remediation_explicitly_allowed() or not config.get_allowlist():
         reason = "missing_live_safety_configuration"
     elif not config.get_staging_remediation_acceptance_id():
@@ -455,9 +463,9 @@ def remediate_access(event, context):
                 "skipped": 0, "failed": 0, "reconciliation_required": 0,
                 "dry_run": False}
     try:
-        account_id = config.get_aws_account_id()
+        account_id = config.get_source_account_id()
     except ValueError:
-        return {"status": "blocked", "reason": "aws_account_id_required",
+        return {"status": "blocked", "reason": "source_account_id_invalid",
                 "remediated": 0, "skipped": 0, "failed": 0,
                 "reconciliation_required": 0, "dry_run": False}
     actor_id = getattr(context, "aws_request_id", None) or os.getenv(

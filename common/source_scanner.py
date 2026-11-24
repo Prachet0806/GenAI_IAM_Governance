@@ -32,6 +32,8 @@ def publish_source(
         )
         coverage = {
             "scope_version": source_scope,
+            "source_kind": source,
+            "pagination_complete": True,
             "complete_for_declared_scope": True,
             "coverage": covered,
             "unassessed_surfaces": unassessed,
@@ -39,11 +41,17 @@ def publish_source(
             "principal_count": len(identities),
             "grant_count": len(observations),
         }
+        collected_at = datetime.now(timezone.utc).isoformat()
+        with db.get_connection() as conn:
+            repo.record_collection_success(
+                conn, run_id, account_id, source_scope, collected_at,
+                identities, observations, coverage,
+            )
         with db.get_connection() as conn:
             repo.lock_inventory_remediation(conn)
             published = repo.publish_discovery_snapshot(
                 conn, run_id, account_id, source_scope,
-                datetime.now(timezone.utc).isoformat(), identities, observations,
+                collected_at, identities, observations,
                 coverage,
             )
         return {
@@ -57,10 +65,13 @@ def publish_source(
         }
     except Exception as exc:
         with db.get_connection() as conn:
+            collection_complete = repo.collection_succeeded(conn, run_id)
             repo.finish_discovery_run(
                 conn, run_id, datetime.now(timezone.utc).isoformat(),
-                "FAILED", len(identities), 1,
-                {"error_type": type(exc).__name__, "source_scope": source_scope},
+                "INCOMPLETE" if collection_complete else "FAILED",
+                len(identities), 1,
+                {"error_type": type(exc).__name__, "source_scope": source_scope,
+                 "reason": "publication_failed" if collection_complete else "collection_failed"},
             )
         logger.log(
             "publish_source", "failed", "Source scan did not publish",

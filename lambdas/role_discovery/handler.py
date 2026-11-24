@@ -1,6 +1,5 @@
 """IAM role policy and trust observations, scoped separately from IAM users."""
 
-import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import config, evidence
+from common import aws_clients, config, evidence, policy_assessment
 from common.source_scanner import publish_source
 from lambdas.identity_discovery.handler import (
     _get_policy_document, _iam_client, _is_mock, _list_all, _source_account_id,
@@ -19,7 +18,7 @@ from lambdas.identity_discovery.handler import (
 
 def _document(value):
     if isinstance(value, str):
-        value = json.loads(unquote(value))
+        value = policy_assessment.decode_policy_json(unquote(value))
     if not isinstance(value, dict):
         raise ValueError("IAM role policy document is missing or invalid")
     return value
@@ -93,10 +92,13 @@ def _iter_roles(account_id: str):
 
 
 def discover_roles(event, context):
-    account_id = _source_account_id() if _is_mock() else config.get_aws_account_id()
+    mode = config.iam_source_mode()
+    account_id = _source_account_id() if _is_mock() else config.get_source_account_id()
+    if mode == "FLOCI":
+        aws_clients.assert_floci_ready()
     return publish_source(
         account_id, evidence.IAM_ROLE_POLICY_SCOPE, _iter_roles(account_id),
-        source="MOCK" if _is_mock() else "AWS",
+        source=mode,
         covered=["iam_roles", "role_attached_managed_policies", "role_inline_policies", "role_trust_policies"],
         unassessed=["role_permission_boundaries", "service_control_policies", "resource_policies", "effective_permissions"],
     )

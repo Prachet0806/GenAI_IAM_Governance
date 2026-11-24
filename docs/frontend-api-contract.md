@@ -16,6 +16,8 @@ The local checkout contains these application routes today:
 | `GET /reviews/summary` | Reviewer queue summary | Reviewer group; account scope applied before aggregates |
 | `GET /campaigns` | Campaign list with status, account, snapshot, progress, exception, and overdue counts | Campaign administrator or auditor; authorized account scope |
 | `GET /snapshots` / `GET /snapshots/{snapshot_id}/readiness` | Published snapshot candidates and readiness blockers | Campaign administrator; authorized account scope |
+| `GET /discovery-attempts` | Paged account-scoped collection attempts with separate collection and publication outcomes, receipt coverage, and counts | Campaign administrator; authorized account scope |
+| `GET /snapshots/{snapshot_id}/compare/{other_snapshot_id}` | Bounded added, removed, and changed observed grant paths for two published snapshots of the same account and declared scope; includes observation windows, manifest hashes, and invalidations | Campaign administrator; authorized account scope |
 | `POST /campaigns` | Creates a campaign from an eligible, current, risk-assessed published snapshot | Campaign administrator; readiness rechecked by the API and worker |
 | `GET /campaigns/{campaign_id}/progress`, `/reviews`, `/reviewers`, `/events` | Progress and workload, campaign reviews, reviewer pool, and workflow history | Campaign administrator for the campaign's account |
 | `POST /campaigns/{campaign_id}/reviewers` | Assigns a reviewer subject to a campaign; shared environments currently fail closed until an identity-provider directory verifier is configured | Valid OIDC token and campaign-admin group; unverified assignment is development-only and explicitly opted in |
@@ -35,13 +37,15 @@ The local checkout contains these application routes today:
 | `GET /approvals`, `GET /approvals/{review_id}` | Independent remediation queue, evidence, eligibility blockers, and execution history | Remediation approver; account scope and separation-of-duties enforced |
 | `POST /approvals/{review_id}/decision` | Records an independent approval or decline with a required reason | Remediation approver; self-approval is blocked |
 | `GET /audit/events` | Filtered decision, campaign, and remediation history | Auditor or campaign administrator; scoped before results are returned |
-| `GET/POST /exports`, `GET /exports/{id}`, `/verify`, `/download` | Scoped export list/create/detail, manifest verification, and artifact download | Auditor or campaign administrator; export scope checked before artifact access |
+| `GET /audit/reviews/{review_id}` | Historical frozen grant, assessment, source/review manifests, decision, remediation, and invalidation reconstruction with current eligibility labelled separately | Auditor or campaign administrator; account scope checked before returning evidence |
+| `GET/POST /exports`, `GET /exports/{id}`, `/verify`, `/download` | Scoped export list/create/detail, manifest verification, and CSV, JSON, evidence-bundle, or manifest download | Auditor or campaign administrator; export scope checked before artifact access |
 | `GET /operations/health`, `/integrations`, `/jobs`, `/audit` | Health, sanitized configuration, recorded processing activity, redacted events | Platform operator; account scope applied where events are resource-bound |
+| `POST /snapshots/{snapshot_id}/invalidate` | Adds an immutable evidence-defect annotation and blocks current snapshot eligibility | Campaign administrator with account scope |
 | `POST /reviews/{review_id}/remediation/reconciliation` | Requests a read-only exact-path AWS recheck | Platform operator; scoped review and required reason |
 
 Campaign creation is exposed through the API and rechecks readiness against the selected snapshot before generating reviews. The current UI uses bounded offset pages, not cursor pagination. Operations data reports activity recorded in the database; it does not claim worker liveness because no heartbeat source is configured. See [frontend workspaces](frontend-workspaces.md) for the route-to-screen map and local deployment behavior.
 
-The current local source includes campaign, source, AI, remediation evidence, immutable approval declines, and reviewer-removal events through migration `0011_remediation_approval_declines` on `upgrade`. This local contract does not establish deployment or hosted CI status.
+The current local worktree includes campaign, source, AI, remediation evidence, immutable approval declines, reviewer-removal events, and Phase 0 collection/grant-assessment/invalidation evidence through migration `0014_evidence_invalidations` on `upgrade`. `GET /reviews/{review_id}` adds nullable `assessment`, observed grant-path relationships, source/review manifest hashes, and evidence invalidations while retaining legacy risk fields. Audit exports distinguish pinned manifest hashes from eligibility checked at export time and include an independently hashed evidence bundle with the frozen manifest bodies. This local contract does not establish deployment or hosted CI status.
 
 ## 2. Authorization model
 
@@ -210,7 +214,7 @@ Creation must fail closed with `409 NO_ELIGIBLE_SNAPSHOT`, `409 SNAPSHOT_RISK_IN
 | `GET /api/v1/discovery-runs` | Attempts including RUNNING, COMPLETE, INCOMPLETE, FAILED and superseded context | Campaign admin; operator; auditor read-only |
 | `GET /api/v1/discovery-runs/{run_id}` | Run detail and failure/coverage summary | Same |
 
-Local-source status: `GET /snapshots` and `GET /snapshots/{snapshot_id}/readiness` exist unversioned. Readiness distinguishes the current published snapshot, newest attempt, risk-assessment completeness, existing active campaign, and human-readable blockers. The endpoint is a campaign-creation check; it does not promise live-remediation eligibility.
+Local-source status: `GET /snapshots`, `GET /snapshots/{snapshot_id}/readiness`, `GET /discovery-attempts`, and `GET /snapshots/{snapshot_id}/compare/{other_snapshot_id}` exist unversioned. Readiness distinguishes the current published snapshot, newest attempt, risk-assessment completeness, existing active campaign, and human-readable blockers. The comparison reports observed grant paths only and rejects different accounts or scopes. The readiness endpoint is a campaign-creation check; it does not promise live-remediation eligibility.
 
 ### P1 — Campaign lifecycle and allocation
 
@@ -247,7 +251,7 @@ Eligibility response must state exact reasons, including unsupported grant type,
 | `GET /api/v1/exports/{export_id}` | Export state, counts, artifact hashes and storage metadata | Same |
 | `GET /api/v1/exports/{export_id}/download` | Authenticated download or short-lived scoped URL | Same |
 
-Local-source status: `/audit/events` and `/exports` list/create/detail/verify/download routes are implemented unversioned. Export rows are filtered to authorized account/campaign scope before access; downloads are audited and the manifest exposes hashes for integrity verification. Do not expose arbitrary filesystem paths or unrestricted S3 URLs.
+Local-source status: `/audit/events`, `/audit/reviews/{review_id}`, and `/exports` list/create/detail/verify/download routes are implemented unversioned. Export rows are filtered to authorized account/campaign scope before access; downloads are audited and the manifest exposes hashes for integrity verification. New exports include an `evidence` artifact with frozen source and review manifest bodies; legacy exports remain readable without it. Do not expose arbitrary filesystem paths or unrestricted S3 URLs.
 
 ### P2 — Operations
 

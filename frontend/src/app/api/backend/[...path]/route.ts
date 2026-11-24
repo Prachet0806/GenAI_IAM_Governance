@@ -12,8 +12,10 @@ function allowed(path: string[], method: string): boolean {
       "reviews/queue",
       "campaigns",
       "snapshots",
+      "discovery-attempts",
       "approvals",
       "audit/events",
+      /^audit\/reviews\/[^/]+$/,
       "exports",
       "operations/health",
       "operations/integrations",
@@ -24,6 +26,7 @@ function allowed(path: string[], method: string): boolean {
       /^campaigns\/[^/]+$/,
       /^campaigns\/[^/]+\/(events|progress|reviews|reviewers)$/,
       /^snapshots\/[^/]+\/readiness$/,
+      /^snapshots\/[^/]+\/compare\/[^/]+$/,
       /^approvals\/[^/]+$/,
       /^exports\/[^/]+(\/verify|\/download)?$/,
       /^ai\/jobs\/[^/]+$/,
@@ -33,6 +36,7 @@ function allowed(path: string[], method: string): boolean {
     return [
       /^reviews\/[^/]+\/(decision|ai\/explanation|assignment|exception(\/resolve)?|remediation\/reconciliation)$/,
       /^campaigns(\/[^/]+\/(reviewers|state|owner|deadline))?$/,
+      /^snapshots\/[^/]+\/invalidate$/,
       /^approvals\/[^/]+\/decision$/,
       /^exports$/,
     ].some((route) => route.test(joined));

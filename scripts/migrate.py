@@ -133,11 +133,33 @@ def _split_statements(sql_blob: str):
     return stmts
 
 
+def _has_sql_code(statement: str) -> bool:
+    """Ignore comments and whitespace without treating quoted text as comments."""
+    index = 0
+    while index < len(statement):
+        if statement[index].isspace() or statement[index] == ";":
+            index += 1
+        elif statement.startswith("--", index):
+            newline = statement.find("\n", index + 2)
+            index = len(statement) if newline < 0 else newline + 1
+        elif statement.startswith("/*", index):
+            close = statement.find("*/", index + 2)
+            if close < 0:
+                raise ValueError("Unterminated SQL block comment")
+            index = close + 2
+        else:
+            return True
+    return False
+
+
 def _execute_statements(cur, sql_blob: str):
     """
     Execute multiple statements (quote/comment/$$ aware splitter).
     """
     for stmt in _split_statements(sql_blob):
+        # PostgreSQL rejects a statement consisting only of SQL comments.
+        if not _has_sql_code(stmt):
+            continue
         cur.execute(stmt)
 
 

@@ -58,6 +58,8 @@ def test_missing_and_legacy_column_only_summary(tmp_path, monkeypatch):
     client = _seed(tmp_path, monkeypatch)
     missing = _get(client)
     assert missing.status_code == 200
+    assert missing.json()["assessment"] is None
+    assert missing.json()["review_manifest_sha256"] is None
     assert missing.json()["ai_explanation"] == {
         "status": "missing", "authority": "legacy_compatibility",
         "summary": None, "provenance_state": "missing",

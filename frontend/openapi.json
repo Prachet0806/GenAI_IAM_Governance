@@ -105,6 +105,31 @@
         "title": "DecisionRequest",
         "type": "object"
       },
+      "EvidenceInvalidationRequest": {
+        "properties": {
+          "detail": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Detail",
+            "type": "string"
+          },
+          "reason_code": {
+            "enum": [
+              "EVIDENCE_DEFECT",
+              "SOURCE_CORRECTION",
+              "POLICY_DOCUMENT_ERROR"
+            ],
+            "title": "Reason Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason_code",
+          "detail"
+        ],
+        "title": "EvidenceInvalidationRequest",
+        "type": "object"
+      },
       "ExceptionRequest": {
         "properties": {
           "reason": {
@@ -740,6 +765,48 @@
           }
         ],
         "summary": "List Audit Events"
+      }
+    },
+    "/audit/reviews/{review_id}": {
+      "get": {
+        "operationId": "get_audit_review_audit_reviews__review_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "review_id",
+            "required": true,
+            "schema": {
+              "title": "Review Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Audit Review"
       }
     },
     "/campaigns": {
@@ -1392,6 +1459,98 @@
         "summary": "Set Campaign State"
       }
     },
+    "/discovery-attempts": {
+      "get": {
+        "operationId": "list_discovery_attempts_discovery_attempts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "account_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 12,
+                  "minLength": 12,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Account Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Scope"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Discovery Attempts"
+      }
+    },
     "/exports": {
       "get": {
         "operationId": "list_exports_exports_get",
@@ -1551,6 +1710,7 @@
               "enum": [
                 "csv",
                 "json",
+                "evidence",
                 "manifest"
               ],
               "title": "Artifact",
@@ -2662,6 +2822,132 @@
           }
         ],
         "summary": "List Snapshots"
+      }
+    },
+    "/snapshots/{snapshot_id}/compare/{other_snapshot_id}": {
+      "get": {
+        "operationId": "compare_snapshots_snapshots__snapshot_id__compare__other_snapshot_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot_id",
+            "required": true,
+            "schema": {
+              "title": "Snapshot Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "other_snapshot_id",
+            "required": true,
+            "schema": {
+              "title": "Other Snapshot Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Compare Snapshots"
+      }
+    },
+    "/snapshots/{snapshot_id}/invalidate": {
+      "post": {
+        "operationId": "invalidate_snapshot_snapshots__snapshot_id__invalidate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot_id",
+            "required": true,
+            "schema": {
+              "title": "Snapshot Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvidenceInvalidationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Invalidate Snapshot"
       }
     },
     "/snapshots/{snapshot_id}/readiness": {

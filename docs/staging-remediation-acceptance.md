@@ -22,7 +22,7 @@ same effective permission through another path.
    Record the account ID, credential role, operator, change ticket, and planned
    policy/user pair. Give the worker only the IAM read calls it uses plus
    iam:DetachUserPolicy and/or iam:DeleteUserPolicy on the approved targets.
-2. Apply migrations through 0011_remediation_approval_declines to the staging Postgres
+2. Apply migrations through 0014_evidence_invalidations to the staging Postgres
    database. Run the Postgres CI job and confirm its migration, concurrency, and
    evidence tests passed at the exact deployed revision.
 3. Complete a source-specific AWS discovery and risk assessment. Confirm the
@@ -36,7 +36,8 @@ same effective permission through another path.
    still blocks administrator and break-glass targets.
 6. Independently review the expected preflight AWS user ID/ARN, attachment,
    policy hash/version, and action type. Record an acceptance ID tied to this
-   review and change ticket. Only then set APP_ENV=staging,
+   review and change ticket. Only then set MOCK_IAM=true, SEEDED_IAM=false,
+   APP_ENV=staging,
    STAGING_REMEDIATION_ACCEPTANCE_ID, AWS_ACCOUNT_ID, DRY_RUN=false,
    ENABLE_REMEDIATION=true, and ALLOW_LIVE_REMEDIATION=true for the run.
 7. Inspect GET /reviews/{id}/remediation and the audit export. Confirm

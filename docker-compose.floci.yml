@@ -1,0 +1,7 @@
+services:
+  floci:
+    image: floci/floci:2.5.0
+    environment:
+      FLOCI_DEFAULT_ACCOUNT_ID: "111111111111"
+    ports:
+      - "127.0.0.1:4566:4566"

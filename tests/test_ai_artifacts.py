@@ -23,7 +23,8 @@ def ai_review(tmp_path, monkeypatch):
     path = tmp_path / "ai.db"
     monkeypatch.setenv("DB_URL", f"sqlite:///{path}")
     monkeypatch.setenv("LOCAL_ONLY", "true")
-    monkeypatch.setenv("MOCK_IAM", "true")
+    monkeypatch.setenv("MOCK_IAM", "false")
+    monkeypatch.setenv("SEEDED_IAM", "true")
     monkeypatch.setenv("ENABLE_GENAI", "true")
     monkeypatch.setenv("AI_PROVIDER_DATA_APPROVED", "true")
     monkeypatch.setenv("AI_PSEUDONYM_KEY", "test-only-pseudonym-secret")
@@ -48,10 +49,18 @@ def ai_review(tmp_path, monkeypatch):
             conn, run_id, datetime.now(timezone.utc).isoformat(),
             "MOCK", ACCOUNT_A, evidence.IAM_USER_POLICY_SCOPE,
         )
+        coverage = {
+            "scope_version": evidence.IAM_USER_POLICY_SCOPE,
+            "pagination_complete": True,
+            "complete_for_declared_scope": True, "coverage": ["test"],
+        }
+        repo.record_collection_success(
+            conn, run_id, ACCOUNT_A, evidence.IAM_USER_POLICY_SCOPE,
+            datetime.now(timezone.utc).isoformat(), [user], [observed], coverage,
+        )
         assert repo.publish_discovery_snapshot(
             conn, run_id, ACCOUNT_A, evidence.IAM_USER_POLICY_SCOPE,
-            datetime.now(timezone.utc).isoformat(), [user], [observed],
-            {"complete_for_declared_scope": True, "coverage": ["test"]},
+            datetime.now(timezone.utc).isoformat(), [user], [observed], coverage,
         )
     evaluate_risk(None, None)
     campaign = generate_campaign({"account_id": ACCOUNT_A}, None)
@@ -113,6 +122,12 @@ def test_idempotent_job_validated_projection_and_decision_binding(ai_review, mon
     review_response = _auth_get(client, f"/reviews/{review_id}").json()
     assert review_response["policy_evidence_status"] == "COMPLETE"
     assert review_response["snapshot_current_eligible"] is True
+    assert review_response["assessment"]["schema_version"] == "risk-assessment-v1"
+    assert review_response["assessment"]["attachment_id"] == (
+        f"arn:aws:iam::{ACCOUNT_A}:policy/Wildcard"
+    )
+    assert review_response["review_manifest_sha256"]
+    assert review_response["source_manifest_sha256"]
     projection = review_response["ai_explanation"]
     assert projection["authority"] == "validated_artifact"
     assert projection["validated_artifact"] is True

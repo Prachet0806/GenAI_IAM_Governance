@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from common import evidence, logger, repo
+from common import evidence, logger, policy_assessment, repo
 from common.db import db
 
 
@@ -212,39 +212,104 @@ def evaluate_risk(event, context):
         if not observations:
             return {"status": "blocked", "reason": "no_published_snapshot", "roles_updated": 0}
         assessed = 0
+        verified_policies = {}
+        policy_projections = {}
         for observation in observations:
             observation_id, snapshot_id, grant_id, policy_id, policy_name, document_json = observation[:6]
-            try:
-                if observation[11] == "MISSING":
-                    risk, reason = "HIGH", "policy evidence missing; manual review required"
-                    risk_evidence = {
-                        "source": "missing_policy_evidence",
-                        "missing_reason": observation[12],
+            policy_type = (
+                "ROLE_TRUST" if observation[9] == "ROLE_TRUST"
+                else "IDENTITY_CENTER" if observation[9] == "IDENTITY_CENTER_ASSIGNMENT"
+                else "IDENTITY"
+            )
+            risk_evidence = policy_assessment.assess_document(
+                document_json, policy_type, observation[7]
+            )
+            risk = policy_assessment.legacy_risk(risk_evidence["risk_severity"])
+            reason = ", ".join(risk_evidence["reason_codes"][:3]) or "No supported concern found"
+            coverage = json.loads(observation[16])
+            missing = observation[11] == "MISSING"
+            source_partial = not coverage.get("complete_for_declared_scope")
+            grant_status = (
+                "PARTIAL" if (missing or source_partial)
+                and risk_evidence["assessment_status"] == "SUPPORTED"
+                else risk_evidence["assessment_status"]
+            )
+            grant_confidence = (
+                "MEDIUM" if (missing or source_partial)
+                and risk_evidence["risk_severity"] != "UNKNOWN"
+                else "INSUFFICIENT" if missing or source_partial
+                else risk_evidence["assessment_confidence"]
+            )
+            grant_risk = "HIGH" if missing or source_partial else risk
+            grant_evidence = {
+                "schema_version": "risk-assessment-v1",
+                "rule_version": evidence.POLICY_RULE_VERSION,
+                "risk_severity": risk_evidence["risk_severity"],
+                "assessment_status": grant_status,
+                "assessment_confidence": grant_confidence,
+                "manual_review_required": (
+                    missing or source_partial or risk_evidence["manual_review_required"]
+                ),
+                "reason_codes": list(dict.fromkeys(
+                    risk_evidence["reason_codes"]
+                    + (["POLICY_DOCUMENT_MISSING"] if missing else [])
+                )),
+                "evidence_completeness": {
+                    "collection_status": "COMPLETE",
+                    "source_coverage": (
+                        "COMPLETE" if coverage.get("complete_for_declared_scope")
+                        else "PARTIAL"
+                    ),
+                    "unassessed_surfaces": coverage.get("unassessed_surfaces", []),
+                    "document_coverage": "PARTIAL" if missing else "COMPLETE",
+                    "interpretability": grant_status,
+                    "missing_evidence_count": 1 if missing else 0,
+                    "unsupported_constructs": risk_evidence["unsupported_constructs"],
+                    "reason_codes": [observation[12]] if missing else [],
+                },
+                "snapshot_id": snapshot_id,
+                "observation_id": observation_id,
+                "grant_id": grant_id,
+                "source_id": observation[13],
+                "attachment_id": observation[14],
+                "policy_version": observation[15],
+                "policy_sha256": observation[6],
+                "statement_refs": [
+                    {
+                        **ref, "policy_sha256": observation[6],
+                        "attachment_id": observation[14],
+                        "policy_version": observation[15],
                     }
-                elif observation[9] == "ROLE_TRUST":
-                    risk, reason, risk_evidence = assess_trust_policy(
-                        json.loads(document_json), observation[7]
-                    )
-                else:
-                    risk, reason, risk_evidence = assess_policy(
-                        policy_name, json.loads(document_json)
-                    )
-            except (TypeError, ValueError, KeyError) as exc:
-                risk, reason = "HIGH", "policy analysis failed; manual review required"
-                risk_evidence = {"source": "analysis_error", "error_type": type(exc).__name__}
+                    for ref in risk_evidence["statement_refs"]
+                ],
+            }
             assessed_at = datetime.now(timezone.utc).isoformat()
+            policy_key = (snapshot_id, policy_id, observation[6], evidence.POLICY_RULE_VERSION)
+            policy_result = (
+                risk, reason, evidence.canonical_json(risk_evidence)
+            )
+            prior = verified_policies.get(policy_key)
+            if prior is not None and prior != policy_result:
+                raise RuntimeError("Same snapshot policy identity produced different risk evidence")
             repo.store_snapshot_risk(
                 conn, observation, risk, reason, risk_evidence,
                 evidence.POLICY_RULE_VERSION, assessed_at,
+                grant_evidence, grant_risk,
+                policy_verified=prior is not None,
             )
-            # Mutable role/risk rows remain compatibility projections. Reviews
-            # reference the append-only assessment for their grant observation.
-            repo.update_role_risk(conn, policy_id, risk)
-            repo.store_risk_assessment(
-                conn, policy_id, risk, reason, risk_evidence,
-                evidence.POLICY_RULE_VERSION, assessed_at,
+            verified_policies[policy_key] = policy_result
+            # Keep the final per-policy projection from scan order. The
+            # append-only grant assessment above remains per observation.
+            policy_projections[policy_id] = (
+                grant_risk, reason, risk_evidence, assessed_at,
             )
             assessed += 1
+        for policy_id, (risk_level, reason, risk_evidence, assessed_at) in policy_projections.items():
+            repo.update_role_risk(conn, policy_id, risk_level)
+            repo.store_risk_assessment(
+                conn, policy_id, risk_level, reason, risk_evidence,
+                evidence.POLICY_RULE_VERSION, assessed_at,
+            )
         repo.insert_audit_log(
             conn, str(uuid.uuid4()), datetime.now(timezone.utc),
             "INFO", "evaluate_risk", "success",

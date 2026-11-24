@@ -126,6 +126,137 @@ def source_attempt_head(conn, account_id: str, source_scope: str):
     return row[0] if row else None
 
 
+def _collection_digest(observations: list[dict]) -> str:
+    return hashlib.sha256(
+        evidence.canonical_json(
+            sorted(observations, key=lambda item: item["observation_id"])
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def record_collection_success(
+    conn, run_id: str, account_id: str, source_scope: str, collected_at: str,
+    users: list[dict], observations: list[dict], coverage: dict,
+) -> str:
+    """Persist validation independently of the later publication transaction."""
+    cur = conn.cursor()
+    db.execute(
+        cur,
+        "SELECT account_id,source_scope,status FROM discovery_runs WHERE run_id=?",
+        (run_id,),
+    )
+    run = cur.fetchone()
+    if run != (account_id, source_scope, "RUNNING"):
+        raise ValueError("Collection attempt identity or status does not match")
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("scope_version") != source_scope
+        or coverage.get("pagination_complete") is not True
+        or coverage.get("complete_for_declared_scope") is not True
+    ):
+        raise ValueError("Collection coverage is incomplete")
+    if len({user["UserId"] for user in users}) != len(users):
+        raise ValueError("Duplicate principal in collection")
+    if len({item["observation_id"] for item in observations}) != len(observations):
+        raise ValueError("Duplicate observation in collection")
+    if len({item["grant_id"] for item in observations}) != len(observations):
+        raise ValueError("Duplicate grant path in collection")
+    for item in observations:
+        if item["snapshot_id"] != run_id or item["account_id"] != account_id:
+            raise ValueError("Observation belongs to another collection")
+        document = json.loads(item["policy_document"])
+        document_sha256 = hashlib.sha256(
+            evidence.canonical_json(document).encode("utf-8")
+        ).hexdigest()
+        if document_sha256 != item["policy_sha256"]:
+            raise ValueError("Observation document hash does not match")
+    principal_count = len(users)
+    grant_count = len(observations)
+    missing_count = sum(
+        item.get("evidence_status") == "MISSING" for item in observations
+    )
+    for key, expected in (
+        ("principal_count", principal_count),
+        ("grant_count", grant_count),
+        ("missing_policy_evidence", missing_count),
+    ):
+        if key in coverage and coverage[key] != expected:
+            raise ValueError(f"Collection {key} does not match observations")
+    digest = _collection_digest(observations)
+    receipt = (
+        run_id, account_id, source_scope, collected_at, "collection-v1",
+        principal_count, grant_count, missing_count, digest,
+        evidence.canonical_json(coverage),
+    )
+    db.execute(
+        conn.cursor(),
+        """INSERT INTO collection_receipts
+        (run_id,account_id,source_scope,collected_at,validation_version,
+         principal_count,grant_count,missing_document_count,observation_sha256,coverage)
+        VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO NOTHING""",
+        receipt,
+    )
+    db.execute(
+        cur,
+        """SELECT run_id,account_id,source_scope,collected_at,validation_version,
+                  principal_count,grant_count,missing_document_count,
+                  observation_sha256,coverage
+           FROM collection_receipts WHERE run_id=?""",
+        (run_id,),
+    )
+    if cur.fetchone() != receipt:
+        raise ValueError("Existing collection receipt differs")
+    return digest
+
+
+def collection_succeeded(conn, run_id: str) -> bool:
+    cur = conn.cursor()
+    db.execute(cur, "SELECT 1 FROM collection_receipts WHERE run_id=?", (run_id,))
+    return cur.fetchone() is not None
+
+
+def discovery_attempt_outcome(conn, run_id: str) -> dict | None:
+    cur = conn.cursor()
+    db.execute(
+        cur,
+        """SELECT d.status,d.details,
+                  CASE WHEN r.run_id IS NULL THEN 0 ELSE 1 END,
+                  CASE WHEN s.snapshot_id IS NULL THEN 0 ELSE 1 END,
+                  p.snapshot_id,h.attempt_id
+           FROM discovery_runs d
+           LEFT JOIN collection_receipts r ON r.run_id=d.run_id
+           LEFT JOIN published_snapshots s ON s.snapshot_id=d.run_id
+           LEFT JOIN source_publications p
+             ON p.account_id=d.account_id AND p.source_scope=d.source_scope
+           LEFT JOIN source_attempt_heads h
+             ON h.account_id=d.account_id AND h.source_scope=d.source_scope
+           WHERE d.run_id=?""",
+        (run_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    status, details_json, has_receipt, was_published, current_id, head_id = row
+    details = json.loads(details_json) if details_json else {}
+    collection = (
+        "SUCCEEDED" if has_receipt or was_published
+        else "RUNNING" if status == "RUNNING"
+        else "FAILED" if status == "FAILED"
+        else "UNKNOWN_LEGACY"
+    )
+    publication = (
+        "CURRENT_PUBLISHED" if was_published and current_id == run_id
+        else "PREVIOUSLY_PUBLISHED" if was_published
+        else "SUPERSEDED_BEFORE_PUBLICATION"
+        if details.get("reason") == "superseded"
+        or (has_receipt and head_id is not None and head_id != run_id)
+        else "REJECTED" if has_receipt and status != "RUNNING"
+        else "NOT_PUBLISHED" if status in ("RUNNING", "FAILED")
+        else "UNKNOWN_LEGACY"
+    )
+    return {"collection": collection, "publication": publication}
+
+
 def published_snapshot(conn, account_id: str, source_scope: str):
     """Return the last successful publication even if a newer scan failed."""
     cur = conn.cursor()
@@ -142,11 +273,68 @@ def published_snapshot(conn, account_id: str, source_scope: str):
     return cur.fetchone()
 
 
+def list_evidence_invalidations(conn, snapshot_id: str) -> list[dict]:
+    cur = conn.cursor()
+    db.execute(
+        cur,
+        """SELECT invalidation_id,manifest_sha256,reason_code,detail,
+                  actor_sub,recorded_at
+           FROM evidence_invalidations WHERE snapshot_id=?
+           ORDER BY recorded_at,invalidation_id""",
+        (snapshot_id,),
+    )
+    return [
+        {
+            "invalidation_id": row[0], "manifest_sha256": row[1],
+            "reason_code": row[2], "detail": row[3],
+            "actor_sub": row[4], "recorded_at": row[5],
+        }
+        for row in cur.fetchall()
+    ]
+
+
+def record_evidence_invalidation(
+    conn, snapshot_id: str, reason_code: str, detail: str, actor_sub: str,
+) -> dict:
+    from common import evidence_manifest
+
+    if reason_code not in (
+        "EVIDENCE_DEFECT", "SOURCE_CORRECTION", "POLICY_DOCUMENT_ERROR"
+    ):
+        raise ValueError("Unsupported evidence invalidation reason")
+    if not detail.strip() or not actor_sub.strip():
+        raise ValueError("Evidence invalidation needs a reason and actor")
+    manifest = evidence_manifest.source_manifest(conn, snapshot_id)
+    if manifest is None:
+        raise ValueError("Published snapshot not found")
+    invalidation = {
+        "invalidation_id": str(uuid.uuid4()),
+        "manifest_sha256": manifest["sha256"],
+        "reason_code": reason_code,
+        "detail": detail.strip(),
+        "actor_sub": actor_sub,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    db.execute(
+        conn.cursor(),
+        """INSERT INTO evidence_invalidations
+           (invalidation_id,snapshot_id,manifest_sha256,reason_code,detail,
+            actor_sub,recorded_at) VALUES (?,?,?,?,?,?,?)""",
+        (
+            invalidation["invalidation_id"], snapshot_id,
+            invalidation["manifest_sha256"], reason_code, invalidation["detail"],
+            actor_sub, invalidation["recorded_at"],
+        ),
+    )
+    return invalidation
+
+
 def eligible_published_snapshot(
     conn,
     account_id: str | None = None,
     source_scope: str = evidence.IAM_USER_POLICY_SCOPE,
     require_aws: bool = False,
+    required_source: str | None = None,
 ):
     """Require a fresh complete publication with no newer unresolved attempt."""
     if account_id is None:
@@ -163,9 +351,17 @@ def eligible_published_snapshot(
     row = published_snapshot(conn, account_id, source_scope)
     if not row or row[2] != "COMPLETE":
         return None
-    if require_aws and row[3] != f"AWS:{source_scope}":
+    expected_source = required_source or ("AWS" if require_aws else None)
+    if expected_source and row[3] != f"{expected_source}:{source_scope}":
         return None
     if source_attempt_head(conn, account_id, source_scope) != row[0]:
+        return None
+    cur = conn.cursor()
+    db.execute(
+        cur, "SELECT 1 FROM evidence_invalidations WHERE snapshot_id=? LIMIT 1",
+        (row[0],),
+    )
+    if cur.fetchone():
         return None
     try:
         coverage = json.loads(row[4])
@@ -204,6 +400,34 @@ def publish_discovery_snapshot(
     coverage: dict,
 ) -> bool:
     """Publish one complete source view atomically with its observations."""
+    cur = conn.cursor()
+    db.execute(
+        cur, "SELECT status FROM discovery_runs WHERE run_id=?", (run_id,),
+    )
+    run_row = cur.fetchone()
+    if run_row is None or run_row[0] not in ("RUNNING", "COMPLETE"):
+        raise ValueError("Only a running or already published validated attempt can publish")
+    db.execute(
+        cur,
+        """SELECT account_id,source_scope,principal_count,grant_count,
+                  missing_document_count,observation_sha256,coverage
+           FROM collection_receipts WHERE run_id=?""",
+        (run_id,),
+    )
+    receipt = cur.fetchone()
+    if receipt != (
+        account_id, source_scope, len(users), len(observations),
+        sum(item.get("evidence_status") == "MISSING" for item in observations),
+        _collection_digest(observations), evidence.canonical_json(coverage),
+    ):
+        raise ValueError("Publication requires matching validated collection receipt")
+    if run_row[0] == "COMPLETE":
+        db.execute(
+            cur, "SELECT 1 FROM published_snapshots WHERE snapshot_id=?", (run_id,),
+        )
+        if cur.fetchone() is None:
+            raise ValueError("Completed attempt has no published snapshot")
+        return source_attempt_head(conn, account_id, source_scope) == run_id
     if source_attempt_head(conn, account_id, source_scope) != run_id:
         finish_discovery_run(
             conn,
@@ -316,8 +540,10 @@ def list_current_observations(conn, snapshot_id: str | None = None):
         f"""SELECT go.observation_id,go.snapshot_id,go.grant_id,gp.policy_id,
         go.policy_name,go.policy_document,go.policy_sha256,gp.account_id,
         gp.principal_id,gp.grant_type,go.source_name,
-        go.evidence_status,go.missing_reason
+        go.evidence_status,go.missing_reason,gp.source_id,gp.attachment_id,
+        go.policy_version,ps.coverage,ps.source_scope
         FROM source_publications sp
+        JOIN published_snapshots ps ON ps.snapshot_id=sp.snapshot_id
         JOIN grant_observations go ON go.snapshot_id=sp.snapshot_id
         JOIN grant_paths gp ON gp.grant_id=go.grant_id
         {where}
@@ -335,6 +561,9 @@ def store_snapshot_risk(
     risk_evidence: dict,
     rule_version: str,
     assessed_at: str,
+    grant_evidence: dict | None = None,
+    grant_risk_level: str | None = None,
+    policy_verified: bool = False,
 ):
     observation_id, snapshot_id, _grant_id, policy_id, _name, _document, policy_hash = observation[:7]
     policy_id_key = evidence.stable_id(
@@ -342,48 +571,52 @@ def store_snapshot_risk(
     )
     grant_id_key = evidence.stable_id("grant-risk", observation_id, rule_version)
     evidence_json = evidence.canonical_json(risk_evidence)
-    db.execute(
-        conn.cursor(),
-        """INSERT INTO policy_risk_assessments
-        (assessment_id,snapshot_id,policy_id,policy_sha256,rule_version,risk_level,
-         reason,evidence,assessed_at)
-        VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(assessment_id) DO NOTHING""",
-        (
-            policy_id_key, snapshot_id, policy_id, policy_hash, rule_version,
-            risk_level, reason, evidence_json, assessed_at,
-        ),
-    )
-    cur = conn.cursor()
-    db.execute(
-        cur,
-        "SELECT risk_level,reason,evidence FROM policy_risk_assessments WHERE assessment_id=?",
-        (policy_id_key,),
-    )
-    if cur.fetchone() != (risk_level, reason, evidence_json):
-        raise RuntimeError("Existing policy risk assessment differs for this rule version")
+    if not policy_verified:
+        db.execute(
+            conn.cursor(),
+            """INSERT INTO policy_risk_assessments
+            (assessment_id,snapshot_id,policy_id,policy_sha256,rule_version,risk_level,
+             reason,evidence,assessed_at)
+            VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(assessment_id) DO NOTHING""",
+            (
+                policy_id_key, snapshot_id, policy_id, policy_hash, rule_version,
+                risk_level, reason, evidence_json, assessed_at,
+            ),
+        )
+        cur = conn.cursor()
+        db.execute(
+            cur,
+            "SELECT risk_level,reason,evidence FROM policy_risk_assessments WHERE assessment_id=?",
+            (policy_id_key,),
+        )
+        if cur.fetchone() != (risk_level, reason, evidence_json):
+            raise RuntimeError("Existing policy risk assessment differs for this rule version")
     db.execute(
         conn.cursor(),
         """INSERT INTO grant_risk_assessments
         (assessment_id,observation_id,policy_assessment_id,rule_version,
-         risk_level,reason,assessed_at)
-        VALUES (?,?,?,?,?,?,?) ON CONFLICT(assessment_id) DO NOTHING""",
+         risk_level,reason,assessed_at,evidence)
+        VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(assessment_id) DO NOTHING""",
         (
             grant_id_key, observation_id, policy_id_key, rule_version,
-            risk_level, "Policy risk applied to this grant path; not effective access",
+            grant_risk_level or risk_level,
+            "Policy risk applied to this grant path; not effective access",
             assessed_at,
+            evidence.canonical_json(grant_evidence) if grant_evidence is not None else None,
         ),
     )
     cur = conn.cursor()
     db.execute(
         cur,
-        """SELECT policy_assessment_id,risk_level,reason
+        """SELECT policy_assessment_id,risk_level,reason,evidence
         FROM grant_risk_assessments WHERE assessment_id=?""",
         (grant_id_key,),
     )
     if cur.fetchone() != (
         policy_id_key,
-        risk_level,
+        grant_risk_level or risk_level,
         "Policy risk applied to this grant path; not effective access",
+        evidence.canonical_json(grant_evidence) if grant_evidence is not None else None,
     ):
         raise RuntimeError("Existing grant risk assessment differs for this rule version")
     return grant_id_key
@@ -401,11 +634,40 @@ def snapshot_risk_complete(conn, snapshot_id: str, rule_version: str) -> bool:
           ON pra.assessment_id=gra.policy_assessment_id
          AND pra.snapshot_id=go.snapshot_id AND pra.policy_sha256=go.policy_sha256
         WHERE go.snapshot_id=? AND
-          (gra.assessment_id IS NULL OR pra.assessment_id IS NULL
-           OR gra.risk_level<>pra.risk_level)""",
+           (gra.assessment_id IS NULL OR pra.assessment_id IS NULL)""",
         (rule_version, snapshot_id),
     )
-    return cur.fetchone()[0] == 0
+    if cur.fetchone()[0] != 0:
+        return False
+    if rule_version != evidence.POLICY_RULE_VERSION:
+        return True
+    db.execute(
+        cur,
+        """SELECT go.snapshot_id,go.observation_id,go.grant_id,
+                  gp.source_id,gp.attachment_id,go.policy_version,
+                  go.policy_sha256,gra.evidence,go.policy_document
+           FROM grant_observations go
+           JOIN grant_paths gp ON gp.grant_id=go.grant_id
+           JOIN grant_risk_assessments gra
+             ON gra.observation_id=go.observation_id AND gra.rule_version=?
+           WHERE go.snapshot_id=?""",
+        (rule_version, snapshot_id),
+    )
+    for snapshot, observation, grant, source, attachment, version, digest, payload_json, document_json in cur.fetchall():
+        if not payload_json:
+            return False
+        try:
+            payload = json.loads(payload_json)
+            document = json.loads(document_json)
+        except (TypeError, ValueError):
+            return False
+        if not _grant_assessment_matches(payload, {
+            "snapshot_id": snapshot, "observation_id": observation,
+            "grant_id": grant, "source_id": source, "attachment_id": attachment,
+            "policy_version": version, "policy_sha256": digest,
+        }, document):
+            return False
+    return True
 
 
 def list_assessed_grants(conn, snapshot_id: str, rule_version: str):
@@ -487,10 +749,12 @@ def review_evidence_binding(conn, review_id: str):
         gp.account_id,ps.source_scope,gp.grant_type,gp.policy_id,
         gp.principal_id,go.principal_arn,gp.attachment_id,
         go.policy_sha256,go.policy_version,go.evidence_status,
-        go.principal_name,go.policy_name
+        go.principal_name,go.policy_name,gp.source_id,
+        go.source_name,go.observed_at,cr.collected_at
         FROM access_reviews r
         JOIN grant_paths gp ON gp.grant_id=r.grant_id
         JOIN published_snapshots ps ON ps.snapshot_id=r.snapshot_id
+        LEFT JOIN collection_receipts cr ON cr.run_id=r.snapshot_id
         JOIN grant_observations go ON go.observation_id=r.observation_id
             AND go.grant_id=r.grant_id AND go.snapshot_id=r.snapshot_id
         JOIN grant_risk_assessments gra ON gra.assessment_id=r.risk_assessment_id
@@ -516,7 +780,60 @@ def review_evidence_binding(conn, review_id: str):
         "attachment_id": row[10], "policy_sha256": row[11],
         "policy_version": row[12], "evidence_status": row[13],
         "principal_name": row[14], "policy_name": row[15],
+        "source_id": row[16], "source_name": row[17],
+        "observed_at": str(row[18]) if row[18] else None,
+        "collected_at": str(row[19]) if row[19] else None,
     }
+
+
+def _grant_assessment_matches(payload: dict, binding: dict, policy_document: dict) -> bool:
+    if payload.get("schema_version") != "risk-assessment-v1" or not all(
+        payload.get(key) == binding[key] for key in (
+            "snapshot_id", "observation_id", "grant_id", "source_id",
+            "attachment_id", "policy_version", "policy_sha256",
+        )
+    ):
+        return False
+    statements = policy_document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    references = payload.get("statement_refs")
+    if not isinstance(statements, list) or not isinstance(references, list):
+        return False
+    return all(
+        isinstance(ref, dict)
+        and type(ref.get("statement_index")) is int
+        and 0 <= ref["statement_index"] < len(statements)
+        and all(ref.get(key) == binding[key] for key in (
+            "attachment_id", "policy_version", "policy_sha256",
+        ))
+        for ref in references
+    )
+
+
+def review_assessment_payload(conn, review_id: str) -> dict | None:
+    binding = review_evidence_binding(conn, review_id)
+    if binding is None:
+        return None
+    cur = conn.cursor()
+    db.execute(
+        cur,
+        """SELECT gra.evidence,go.policy_document FROM access_reviews r
+           JOIN grant_risk_assessments gra
+             ON gra.assessment_id=r.risk_assessment_id
+            AND gra.observation_id=r.observation_id
+           JOIN grant_observations go ON go.observation_id=r.observation_id
+             AND go.snapshot_id=r.snapshot_id AND go.grant_id=r.grant_id
+           WHERE r.review_id=?""",
+        (review_id,),
+    )
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return None
+    payload = json.loads(row[0])
+    if not _grant_assessment_matches(payload, binding, json.loads(row[1])):
+        raise RuntimeError("Grant assessment does not match pinned evidence")
+    return payload
 
 
 def is_current_grant_for_review(conn, review_id: str) -> bool:

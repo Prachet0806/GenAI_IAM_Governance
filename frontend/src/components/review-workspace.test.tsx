@@ -11,6 +11,8 @@ const review: ReviewDetail = {
   review_id: "review-1", status: "PENDING", user: "Jordan Lee", entitlement: "BillingReadOnly",
   risk_level: "HIGH", policy_document: { Version: "2012-10-17", Statement: [] },
   risk_reason: "Read access includes billing data", risk_evidence: { actions: ["billing:Get*"] },
+  assessment: null, source_manifest_sha256: null, review_manifest_sha256: null,
+  evidence_invalidations: [],
   risk_rule_version: "rules-v3", snapshot_id: "snapshot-1", grant_id: "grant-1",
   observation_id: "observation-1", risk_assessment_id: "assessment-1", grant_type: "USER_POLICY",
   grant_source: "Inline policy", policy_version: "v4", policy_sha256: "abc123",
@@ -102,5 +104,112 @@ describe("ReviewWorkspace", () => {
     renderReview();
     expect(await screen.findByText(/not assigned to this campaign's reviewer pool/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Approve grant path" })).not.toBeInTheDocument();
+  });
+
+  it("shows uncertainty instead of the legacy HIGH routing label", async () => {
+    apiFetch.mockImplementation((path: string) => {
+      if (path.startsWith("reviews/review-1/history")) return Promise.resolve({ events: [] });
+      if (path === "reviews/review-1") return Promise.resolve({
+        ...review,
+        assessment: {
+          schema_version: "risk-assessment-v1",
+          risk_severity: "UNKNOWN",
+          assessment_status: "PARTIAL",
+          assessment_confidence: "INSUFFICIENT",
+          manual_review_required: true,
+          reason_codes: ["POLICY_DOCUMENT_MISSING"],
+          evidence_completeness: {
+            collection_status: "COMPLETE", source_coverage: "COMPLETE",
+            unassessed_surfaces: [],
+            document_coverage: "PARTIAL", interpretability: "PARTIAL",
+            missing_evidence_count: 1, unsupported_constructs: [],
+            reason_codes: ["REFERENCED_POLICY_DOCUMENT_MISSING"],
+          },
+        },
+      });
+      return Promise.resolve({});
+    });
+    renderReview();
+    expect(await screen.findByText("Assessment incomplete", { selector: ".badge" })).toBeInTheDocument();
+    expect(screen.getByText(/Some policy evidence or constructs could not be evaluated/)).toBeInTheDocument();
+    expect(screen.queryByText("High risk")).not.toBeInTheDocument();
+  });
+
+  it("shows an invalidation without replacing the pinned review", async () => {
+    apiFetch.mockImplementation((path: string) => {
+      if (path.startsWith("reviews/review-1/history")) return Promise.resolve({ events: [] });
+      if (path === "reviews/review-1") return Promise.resolve({
+        ...review,
+        snapshot_current_eligible: false,
+        evidence_invalidations: [{
+          invalidation_id: "invalid-1", manifest_sha256: "hash-1",
+          reason_code: "EVIDENCE_DEFECT", detail: "Source evidence needs correction",
+          actor_sub: "admin", recorded_at: "2026-01-02T00:00:00Z",
+        }],
+      });
+      return Promise.resolve({});
+    });
+    renderReview();
+    expect(await screen.findByText(/Source evidence needs correction/)).toBeInTheDocument();
+    expect(screen.getByText("Pinned evidence was invalidated.")).toBeInTheDocument();
+    expect(screen.getByText("snapshot-1")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Approve grant path" })).toBeDisabled();
+  });
+
+  it("traces a group grant to its pinned attachment and rule statement", async () => {
+    apiFetch.mockImplementation((path: string) => {
+      if (path.startsWith("reviews/review-1/history")) return Promise.resolve({ events: [] });
+      if (path === "reviews/review-1") return Promise.resolve({
+        ...review,
+        observed_path: {
+          principal_id: "U1", principal_name: "Jordan Lee",
+          principal_arn: "arn:aws:iam::123456789012:user/jordan",
+          grant_type: "GROUP_MANAGED", source_id: "G1", source_name: "FinanceReviewers",
+          attachment_id: "arn:aws:iam::123456789012:policy/BillingReadOnly",
+          policy_id: "billing-policy", policy_name: "BillingReadOnly",
+          policy_version: "v4", policy_sha256: "abc123",
+          observed_at: "2026-01-01T00:00:00Z", collected_at: "2026-01-01T00:05:00Z",
+          observation_id: "observation-1",
+        },
+        assessment: {
+          schema_version: "risk-assessment-v1", risk_severity: "HIGH",
+          assessment_status: "SUPPORTED", assessment_confidence: "HIGH",
+          manual_review_required: true, reason_codes: ["SENSITIVE_ACTION"],
+          statement_refs: [{ statement_index: 0, sid: "BillingRead", effect: "Allow",
+            matched_actions: ["iam:PassRole"], reason_codes: ["SENSITIVE_ACTION"],
+            policy_sha256: "abc123", attachment_id: "billing-policy", policy_version: "v4" }],
+          evidence_completeness: { collection_status: "COMPLETE", source_coverage: "COMPLETE",
+            unassessed_surfaces: [], document_coverage: "COMPLETE", interpretability: "SUPPORTED",
+            missing_evidence_count: 0, unsupported_constructs: [], reason_codes: [] },
+        },
+        policy_document: { Version: "2012-10-17", Statement: [
+          { Sid: "BillingRead", Effect: "Allow", Action: "iam:PassRole", Resource: "*" },
+        ] },
+      });
+      return Promise.resolve({});
+    });
+    renderReview();
+    const path = await screen.findByRole("list", { name: "Observed grant path" });
+    expect(path).toHaveTextContent("FinanceReviewers");
+    expect(path).toHaveTextContent("arn:aws:iam::123456789012:policy/BillingReadOnly");
+    fireEvent.click(screen.getByText(/Inspect frozen policy statements/));
+    expect(screen.getByText(/Rule finding for this statement/)).toBeInTheDocument();
+    expect(screen.getByText(/Exact frozen statement JSON/)).toBeInTheDocument();
+  });
+
+  it("renders an older review response without the new evidence annotations", async () => {
+    apiFetch.mockImplementation((path: string) => {
+      if (path.startsWith("reviews/review-1/history")) return Promise.resolve({ events: [] });
+      if (path === "reviews/review-1") {
+        const { assessment, source_manifest_sha256, review_manifest_sha256, evidence_invalidations, ...olderReview } = review;
+        void assessment; void source_manifest_sha256; void review_manifest_sha256; void evidence_invalidations;
+        return Promise.resolve(olderReview);
+      }
+      return Promise.resolve({});
+    });
+    renderReview();
+    expect(await screen.findByText("BillingReadOnly")).toBeInTheDocument();
+    expect(screen.getByText("High legacy triage", { selector: ".badge" })).toBeInTheDocument();
+    expect(screen.queryByText("Pinned evidence was invalidated.")).not.toBeInTheDocument();
   });
 });

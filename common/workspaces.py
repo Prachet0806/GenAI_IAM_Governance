@@ -3,7 +3,7 @@
 import json
 from datetime import datetime, timezone
 
-from common import config, evidence, repo
+from common import config, evidence, evidence_manifest, repo, snapshot_history, workflow
 from common.db import db
 
 
@@ -208,6 +208,9 @@ def snapshot_readiness(conn, snapshot_id: str, scopes: list[str] | None):
     if not eligible or eligible["snapshot_id"] != snapshot_id:
         if not any(blocker["code"] == "NEWER_DISCOVERY_ATTEMPT" for blocker in blockers):
             blockers.append({"code": "SNAPSHOT_NOT_ELIGIBLE", "message": "The snapshot fails freshness or publication eligibility checks."})
+    metadata = snapshot_history.snapshot_metadata(conn, snapshot_id, scopes)
+    if metadata["invalidations"]:
+        blockers.append({"code": "EVIDENCE_INVALIDATED", "message": "This published evidence was invalidated and must not start a new campaign."})
     risk_complete = repo.snapshot_risk_complete(conn, snapshot_id, evidence.POLICY_RULE_VERSION)
     if not risk_complete:
         blockers.append({"code": "RISK_ASSESSMENT_INCOMPLETE", "message": "Risk assessment is not complete for every grant in this snapshot."})
@@ -223,9 +226,93 @@ def snapshot_readiness(conn, snapshot_id: str, scopes: list[str] | None):
         "discovery_status": row[6], "discovery_source": row[7], "errors": row[8],
         "latest_attempt_id": row[9], "published_snapshot_id": row[10],
         "latest_attempt_status": row[11],
+        "latest_attempt_outcome": (
+            repo.discovery_attempt_outcome(conn, row[9]) if row[9] else None
+        ),
+        "source_manifest_sha256": metadata["manifest_sha256"],
+        "observation_window": metadata["observation_window"],
+        "evidence_invalidations": metadata["invalidations"],
         "risk_assessment_complete": risk_complete, "reviewable_grants": grant_count,
         "existing_campaign_id": active, "eligible_for_campaign": not blockers,
         "blockers": blockers,
+    }
+
+
+def audit_review_evidence(
+    conn, review_id: str, scopes: list[str] | None,
+) -> dict | None:
+    """Reconstruct one authorized historical review from its frozen evidence."""
+    values: list = [review_id]
+    scope_sql = _scope_filter("c.account_id", scopes, values)
+    where = "r.review_id=?" + (f" AND {scope_sql}" if scope_sql else "")
+    cur = conn.cursor()
+    db.execute(
+        cur,
+        f"""SELECT r.review_id,r.campaign_id,c.name,c.account_id,c.source_scope,
+                   r.status,r.reviewer_sub,r.reviewer_comment,r.created_at,
+                   r.reviewed_at,r.snapshot_id,r.grant_id,r.observation_id,
+                   r.risk_assessment_id,COALESCE(go.principal_name,u.user_name),
+                   COALESCE(go.policy_name,rol.role_name),
+                   COALESCE(go.policy_document,rol.policy_document),
+                   go.observed_at,go.evidence_status,go.missing_reason,
+                   go.policy_version,go.policy_sha256,ps.published_at,ps.coverage,
+                   CASE WHEN r.observation_id IS NULL THEN rol.risk_level
+                        ELSE gra.risk_level END,
+                   CASE WHEN r.observation_id IS NULL THEN ra.rule_version
+                        ELSE pra.rule_version END
+            FROM access_reviews r JOIN campaigns c ON c.campaign_id=r.campaign_id
+            JOIN users u ON u.user_id=r.user_id JOIN roles rol ON rol.role_id=r.role_id
+            LEFT JOIN grant_observations go ON go.observation_id=r.observation_id
+              AND go.snapshot_id=r.snapshot_id AND go.grant_id=r.grant_id
+            LEFT JOIN published_snapshots ps ON ps.snapshot_id=r.snapshot_id
+            LEFT JOIN grant_risk_assessments gra ON gra.assessment_id=r.risk_assessment_id
+            LEFT JOIN policy_risk_assessments pra ON pra.assessment_id=gra.policy_assessment_id
+            LEFT JOIN risk_assessments ra ON ra.role_id=r.role_id
+            WHERE {where}""",
+        values,
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    source = evidence_manifest.source_manifest(conn, row[10]) if row[10] else None
+    review = evidence_manifest.review_manifest(conn, review_id, source=source)
+    assessment = repo.review_assessment_payload(conn, review_id)
+    current = (
+        repo.eligible_published_snapshot(conn, row[3], row[4])
+        if source and row[3] and row[4] else None
+    )
+    return {
+        "review_id": row[0], "campaign_id": row[1], "campaign_name": row[2],
+        "account_id": row[3], "source_scope": row[4],
+        "status": row[5], "reviewer_sub": row[6], "reviewer_comment": row[7],
+        "review_created_at": str(row[8]),
+        "decision_recorded_at": str(row[9]) if row[9] else None,
+        "snapshot_id": row[10], "grant_id": row[11],
+        "observation_id": row[12], "risk_assessment_id": row[13],
+        "principal_name": row[14], "policy_name": row[15],
+        "policy_document": json.loads(row[16]) if row[16] else None,
+        "observed_at": str(row[17]) if row[17] else None,
+        "policy_evidence_status": row[18] or "UNKNOWN_LEGACY",
+        "missing_policy_reason": row[19], "policy_version": row[20],
+        "policy_sha256": row[21],
+        "snapshot_published_at": str(row[22]) if row[22] else None,
+        "source_coverage": json.loads(row[23]) if row[23] else None,
+        "risk_level": row[24], "risk_rule_version": row[25],
+        "review_scope": "GRANT_PATH" if row[11] else "LEGACY_UNKNOWN_PATH",
+        "principal_access_status": "not_evaluated" if row[11] else "unknown",
+        "observed_path": repo.review_evidence_binding(conn, review_id),
+        "assessment": assessment,
+        "source_manifest": source,
+        "review_manifest": review,
+        "evidence_invalidations": (
+            repo.list_evidence_invalidations(conn, row[10]) if row[10] else []
+        ),
+        "current_snapshot_eligible": (
+            bool(current and current["snapshot_id"] == row[10])
+            if source else None
+        ),
+        "decision_history": workflow.review_history(conn, review_id),
+        "remediation_history": repo.remediation_history(conn, review_id),
     }
 
 
@@ -263,7 +350,10 @@ def remediation_eligibility(conn, review_id: str, approver_sub: str):
             blockers.append({"code": "UNSUPPORTED_GRANT_TYPE", "message": "This grant type is not supported by the remediation worker."})
         if binding["evidence_status"] != "COMPLETE" or not binding["principal_arn"]:
             blockers.append({"code": "INCOMPLETE_EVIDENCE", "message": "Complete principal and grant evidence is required."})
-        current = repo.eligible_published_snapshot(conn, binding["account_id"], binding["source_scope"], require_aws=True)
+        current = repo.eligible_published_snapshot(
+            conn, binding["account_id"], binding["source_scope"],
+            required_source=config.remediation_source_mode(),
+        )
         if not current or current["snapshot_id"] != binding["snapshot_id"]:
             blockers.append({"code": "SNAPSHOT_NOT_CURRENT", "message": "The bound AWS snapshot is no longer eligible."})
         if not repo.is_current_grant_for_review(conn, review_id):

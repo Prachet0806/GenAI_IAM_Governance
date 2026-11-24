@@ -12,7 +12,8 @@ if str(ROOT) not in sys.path:
 def _seed_db(tmp_path, monkeypatch, *, source="MOCK"):
     db_file = tmp_path / "review_test.db"
     monkeypatch.setenv("DB_URL", f"sqlite:///{db_file}")
-    monkeypatch.setenv("MOCK_IAM", "true")
+    monkeypatch.setenv("MOCK_IAM", "false")
+    monkeypatch.setenv("SEEDED_IAM", "true")
     from scripts import migrate
 
     migrate.apply_sqlite()
@@ -29,7 +30,8 @@ def _seed_db(tmp_path, monkeypatch, *, source="MOCK"):
     }
     policies = [
         {"PolicyArn": role_id, "PolicyName": name,
-         "Document": {"Statement": [{"Effect": "Allow", "Action": action,
+         "Document": {"Version": "2012-10-17",
+                      "Statement": [{"Effect": "Allow", "Action": action,
                                       "Resource": resource}]},
          "GrantType": "DIRECT_MANAGED", "SourceId": "U1",
          "SourceName": user["UserName"], "AttachmentId": role_id}
@@ -45,9 +47,16 @@ def _seed_db(tmp_path, monkeypatch, *, source="MOCK"):
     with db.get_connection() as conn:
         now = datetime.now(timezone.utc).isoformat()
         repo.start_discovery_attempt(conn, "SNAP1", now, source, account, scope)
+        coverage = {
+            "scope_version": scope, "pagination_complete": True,
+            "complete_for_declared_scope": True,
+        }
+        repo.record_collection_success(
+            conn, "SNAP1", account, scope, now, [user], observations, coverage,
+        )
         repo.publish_discovery_snapshot(
             conn, "SNAP1", account, scope, now, [user], observations,
-            {"complete_for_declared_scope": True},
+            coverage,
         )
     evaluate_risk(None, None)
     with db.get_connection() as conn:

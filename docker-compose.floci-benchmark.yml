@@ -1,0 +1,24 @@
+name: iam-floci-benchmark
+
+services:
+  floci:
+    image: floci/floci:2.5.0
+    environment:
+      FLOCI_DEFAULT_ACCOUNT_ID: "111111111111"
+      FLOCI_STORAGE_MODE: memory
+    ports:
+      - "127.0.0.1:4566:4566"
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: iam_bench
+      POSTGRES_USER: iam_bench
+      POSTGRES_PASSWORD: iam_bench
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iam_bench -d iam_bench"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

@@ -209,6 +209,12 @@ tbody tr:hover { background: #fbfdfd; }
 .blocker-list li { display: flex; align-items: flex-start; gap: 10px; padding: 12px; border: 1px solid #f0dfb7; border-radius: 8px; background: #fffaf0; }
 .blocker-list p { margin: 3px 0 0; color: #6a5a37; }
 .policy-summary { display: grid; gap: 12px; margin-top: 14px; }
+.grant-path { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 0; margin: 0 0 20px; list-style: none; }
+.grant-path li { min-width: 0; padding: 12px; border: 1px solid var(--line); border-top: 3px solid var(--teal); border-radius: 7px; background: #f8fbfb; }
+.grant-path span, .grant-path strong, .grant-path small { display: block; overflow-wrap: anywhere; }
+.grant-path span { color: var(--muted); font-size: 11px; }
+.grant-path strong { margin: 4px 0; font-size: 13px; }
+.grant-path small { color: var(--muted); font-size: 11px; }
 .policy-statement { border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
 .policy-statement-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .policy-effect { padding: 3px 8px; border-radius: 10px; background: #e6f3ec; color: #176747; font-size: 11px; font-weight: 650; }
@@ -230,6 +236,7 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--teal); }
   .shell { grid-template-columns: 205px minmax(0,1fr); }
   .cards { grid-template-columns: repeat(2, minmax(0,1fr)); }
   .detail-grid { grid-template-columns: 1fr; }
+  .grant-path { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 680px) {
   .shell { display: block; }
@@ -243,6 +250,7 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--teal); }
   .cards { gap: 9px; }
   .metric { padding: 14px; }
   .metric-value { font-size: 22px; }
+  .grant-path { grid-template-columns: 1fr; }
   .filters { padding: 13px; }
   .field, .field.grow { min-width: calc(50% - 6px); flex: 1 1 calc(50% - 6px); }
   .evidence-list { grid-template-columns: 1fr; gap: 13px; }

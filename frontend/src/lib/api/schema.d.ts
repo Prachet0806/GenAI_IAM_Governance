@@ -123,6 +123,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/audit/reviews/{review_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Audit Review */
+        get: operations["get_audit_review_audit_reviews__review_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/campaigns": {
         parameters: {
             query?: never;
@@ -273,6 +290,23 @@ export interface paths {
         put?: never;
         /** Set Campaign State */
         post: operations["set_campaign_state_campaigns__campaign_id__state_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/discovery-attempts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Discovery Attempts */
+        get: operations["list_discovery_attempts_discovery_attempts_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -688,6 +722,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/snapshots/{snapshot_id}/compare/{other_snapshot_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Compare Snapshots */
+        get: operations["compare_snapshots_snapshots__snapshot_id__compare__other_snapshot_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/snapshots/{snapshot_id}/invalidate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Invalidate Snapshot */
+        post: operations["invalidate_snapshot_snapshots__snapshot_id__invalidate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/snapshots/{snapshot_id}/readiness": {
         parameters: {
             query?: never;
@@ -768,6 +836,16 @@ export interface components {
              * @enum {string}
              */
             decision: "APPROVED" | "REVOKED";
+        };
+        /** EvidenceInvalidationRequest */
+        EvidenceInvalidationRequest: {
+            /** Detail */
+            detail: string;
+            /**
+             * Reason Code
+             * @enum {string}
+             */
+            reason_code: "EVIDENCE_DEFECT" | "SOURCE_CORRECTION" | "POLICY_DOCUMENT_ERROR";
         };
         /** ExceptionRequest */
         ExceptionRequest: {
@@ -1021,6 +1099,37 @@ export interface operations {
             };
             header?: never;
             path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_audit_review_audit_reviews__review_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                review_id: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
@@ -1446,6 +1555,40 @@ export interface operations {
             };
         };
     };
+    list_discovery_attempts_discovery_attempts_get: {
+        parameters: {
+            query?: {
+                account_id?: string | null;
+                source_scope?: string | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_exports_exports_get: {
         parameters: {
             query?: {
@@ -1545,7 +1688,7 @@ export interface operations {
     download_audit_export_exports__export_id__download_get: {
         parameters: {
             query?: {
-                artifact?: "csv" | "json" | "manifest";
+                artifact?: "csv" | "json" | "evidence" | "manifest";
             };
             header?: never;
             path: {
@@ -2197,6 +2340,76 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    compare_snapshots_snapshots__snapshot_id__compare__other_snapshot_id__get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                snapshot_id: string;
+                other_snapshot_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    invalidate_snapshot_snapshots__snapshot_id__invalidate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                snapshot_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceInvalidationRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
                 headers: {
                     [name: string]: unknown;
                 };

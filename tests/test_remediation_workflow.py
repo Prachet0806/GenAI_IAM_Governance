@@ -73,7 +73,7 @@ def prepared_review(tmp_path, monkeypatch):
             assert approval["action_type"] == repo.REMEDIATION_ACTIONS[grant_type]
             with db.get_connection() as conn:
                 assert repo.is_remediation_approved(conn, review_id, snapshot_id)
-        monkeypatch.setenv("MOCK_IAM", "false")
+        monkeypatch.setenv("MOCK_IAM", "true")
         monkeypatch.setenv("DRY_RUN", "false")
         monkeypatch.setenv("ENABLE_REMEDIATION", "true")
         monkeypatch.setenv("ALLOW_LIVE_REMEDIATION", "true")
@@ -460,3 +460,18 @@ def test_live_action_requires_staging_acceptance_and_production_stays_closed(
     assert preview["dry_run"] is True
     assert preview["total_pending"] == 1
     assert len(preview["preview"]) == 1
+
+
+def test_floci_cannot_execute_an_aws_sourced_review(prepared_review, monkeypatch):
+    prepared_review()
+    monkeypatch.setenv("MOCK_IAM", "false")
+    monkeypatch.setenv("SEEDED_IAM", "false")
+    monkeypatch.setenv("APP_ENV", "emulator")
+    monkeypatch.setenv("FLOCI_ACCOUNT_ID", ACCOUNT_A)
+    monkeypatch.setenv("ALLOW_LIVE_REMEDIATION", "false")
+    monkeypatch.setenv("ALLOW_EMULATOR_MUTATION", "true")
+    monkeypatch.setattr(remediation.aws_clients, "assert_floci_ready", lambda: {})
+    monkeypatch.setattr(remediation, "_get_iam_client", lambda: pytest.fail("IAM client must not be created"))
+    outcome = remediation.remediate_access(None, None)
+    assert outcome["remediated"] == 0
+    assert outcome["skipped"] == 1

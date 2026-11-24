@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Floci IAM benchmark fixture manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile", "seed", "namespace", "account_id", "source_scope", "managed_policies", "groups", "users", "expected_grants", "counts"],
+  "properties": {
+    "schema_version": {"const": "floci-benchmark-v1"},
+    "profile": {"type": "string"},
+    "seed": {"type": "integer", "minimum": 0},
+    "namespace": {"type": "string", "pattern": "^bench-[a-z0-9-]+$"},
+    "account_id": {"type": "string", "pattern": "^[0-9]{12}$"},
+    "source_scope": {"type": "string"},
+    "managed_policies": {"type": "object"},
+    "groups": {"type": "object"},
+    "users": {"type": "object"},
+    "expected_grants": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {"type": "string"}, {"enum": ["DIRECT_MANAGED", "DIRECT_INLINE", "GROUP_MANAGED", "GROUP_INLINE"]},
+          {"type": "string"}, {"type": "string"}
+        ],
+        "minItems": 4,
+        "maxItems": 4
+      }
+    },
+    "counts": {
+      "type": "object",
+      "required": ["users", "groups", "roles", "managed_policies", "inline_policies", "memberships", "attachments", "grant_paths", "observations"],
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    }
+  }
+}

@@ -1,4 +1,12 @@
 services:
+  floci:
+    image: floci/floci:2.5.0
+    environment:
+      FLOCI_DEFAULT_ACCOUNT_ID: "111111111111"
+    ports:
+      - "127.0.0.1:4566:4566"
+    restart: unless-stopped
+
   postgres:
     image: postgres:17
     environment:
@@ -34,8 +42,16 @@ services:
       APP_ENV: ${APP_ENV:-development}
       DB_URL: postgresql://iam_governance:${POSTGRES_PASSWORD}@postgres:5432/iam_governance
       LOCAL_ONLY: "false"
-      MOCK_IAM: "true"
-      DRY_RUN: "true"
+      MOCK_IAM: "false"
+      SEEDED_IAM: "false"
+      FLOCI_ENDPOINT_URL: http://floci:4566
+      FLOCI_ACCOUNT_ID: "111111111111"
+      AWS_ACCOUNT_ID: "111111111111"
+      DRY_RUN: ${DRY_RUN:-true}
+      ENABLE_REMEDIATION: ${ENABLE_REMEDIATION:-false}
+      ALLOW_EMULATOR_MUTATION: ${ALLOW_EMULATOR_MUTATION:-false}
+      ALLOW_LIVE_REMEDIATION: "false"
+      REMEDIATION_ALLOWLIST: ${REMEDIATION_ALLOWLIST:-}
       ENABLE_GENAI: "false"
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
       OIDC_ISSUER: ${OIDC_ISSUER:?Set OIDC_ISSUER in .env}
@@ -54,6 +70,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      floci:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
       interval: 10s

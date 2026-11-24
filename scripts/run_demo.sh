@@ -8,6 +8,7 @@ set -euo pipefail
 
 DB_URL=${DB_URL:-"sqlite:///iam_governance.db"}
 MOCK_IAM=${MOCK_IAM:-false}
+SEEDED_IAM=${SEEDED_IAM:-false}
 AWS_REGION_VAL=${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}
 
 # Ensure Python can import local packages
@@ -18,21 +19,23 @@ echo "STARTING CLOUD IDENTITY GOVERNANCE ENGINE DEMO"
 echo "=================================================="
 
 # Portable lowercase (no ${VAR,,} bash4-only)
-mock_lower=$(printf '%s' "$MOCK_IAM" | tr '[:upper:]' '[:lower:]')
+seeded_lower=$(printf '%s' "$SEEDED_IAM" | tr '[:upper:]' '[:lower:]')
 
-# Fail fast on missing AWS credentials unless running in mock mode
-if [ "$mock_lower" != "true" ]; then
-    if ! command -v aws >/dev/null 2>&1; then
-        echo "aws CLI not found. Install AWS CLI or set MOCK_IAM=true."
-        exit 1
-    fi
-    if ! aws sts get-caller-identity --no-cli-pager >/dev/null 2>&1; then
-        echo "AWS credentials not resolved by CLI. Set AWS_PROFILE or env creds."
-        exit 1
-    fi
-else
-    echo "MOCK_IAM=true — using seeded mock IAM data (no AWS calls)."
-fi
+export MOCK_IAM SEEDED_IAM
+python3 - <<'PY'
+from common import aws_clients, config
+mode = config.iam_source_mode()
+if mode == "MOCK":
+    print("SEEDED_IAM=true: using the deterministic local dataset")
+else:
+    if mode == "FLOCI":
+        aws_clients.assert_floci_ready()
+    expected = config.get_source_account_id()
+    actual = aws_clients.client("sts").get_caller_identity()["Account"]
+    if actual != expected:
+        raise SystemExit(f"STS account {actual} does not match configured account {expected}")
+    print(f"{mode} source ready for account {expected}")
+PY
 
 # --------------------------------------------------
 # 2. Initialize Database Schema
@@ -48,7 +51,7 @@ printf '\n[2/7] Running Identity Discovery (AWS IAM)...\n'
 export AWS_DEFAULT_REGION="$AWS_REGION_VAL"
 export AWS_REGION="$AWS_REGION_VAL"
 export DB_URL
-export MOCK_IAM
+export MOCK_IAM SEEDED_IAM
 python3 lambdas/identity_discovery/handler.py
 
 # --------------------------------------------------
@@ -98,7 +101,7 @@ PY
 # INTERMISSION: Reviewer decisions via CLI (replaces hidden SQL)
 # --------------------------------------------------
 printf '\nSimulating human access review via review.py...\n'
-if [ "$mock_lower" = "true" ]; then
+if [ "$seeded_lower" = "true" ]; then
   DB_URL="$DB_URL" python3 scripts/review.py auto-demo
   echo " Demo review decisions recorded."
 else

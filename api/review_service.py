@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from common import ai_artifacts, auth, config, repo, workflow, workspaces
+from common import ai_artifacts, auth, config, evidence_manifest, repo, snapshot_history, workflow, workspaces
 from common.db import db
 
 @asynccontextmanager
@@ -76,6 +76,13 @@ class RemediationApprovalRequest(BaseModel):
 class ExportRequest(BaseModel):
     campaign_id: str | None = Field(default=None, max_length=128)
     account_id: str | None = Field(default=None, min_length=12, max_length=12)
+
+
+class EvidenceInvalidationRequest(BaseModel):
+    reason_code: Literal[
+        "EVIDENCE_DEFECT", "SOURCE_CORRECTION", "POLICY_DOCUMENT_ERROR"
+    ]
+    detail: str = Field(min_length=1, max_length=4000)
 
 
 @app.middleware("http")
@@ -368,6 +375,49 @@ def list_snapshots(
         )
 
 
+@app.get("/discovery-attempts")
+def list_discovery_attempts(
+    account_id: str | None = Query(default=None, min_length=12, max_length=12),
+    source_scope: str | None = Query(default=None, min_length=1, max_length=160),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    claims: dict = Depends(current_reviewer),
+):
+    require_campaign_admin(claims)
+    if account_id:
+        require_account_scope(claims, account_id)
+    with db.get_connection() as conn:
+        return snapshot_history.list_attempts(
+            conn, auth.identity_summary(claims)["account_scopes"],
+            account_id=account_id, source_scope=source_scope,
+            limit=limit, offset=offset,
+        )
+
+
+@app.get("/snapshots/{snapshot_id}/compare/{other_snapshot_id}")
+def compare_snapshots(
+    snapshot_id: str, other_snapshot_id: str,
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    claims: dict = Depends(current_reviewer),
+):
+    require_campaign_admin(claims)
+    with db.get_connection() as conn:
+        try:
+            result = snapshot_history.compare_snapshots(
+                conn, snapshot_id, other_snapshot_id,
+                auth.identity_summary(claims)["account_scopes"],
+                limit=limit, offset=offset,
+            )
+        except snapshot_history.ComparisonTooLarge as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="Snapshot pair not found")
+        return result
+
+
 @app.get("/snapshots/{snapshot_id}/readiness")
 def get_snapshot_readiness(snapshot_id: str, claims: dict = Depends(current_reviewer)):
     require_campaign_admin(claims)
@@ -378,6 +428,28 @@ def get_snapshot_readiness(snapshot_id: str, claims: dict = Depends(current_revi
         if not readiness:
             raise HTTPException(status_code=404, detail="Snapshot not found")
         return readiness
+
+
+@app.post("/snapshots/{snapshot_id}/invalidate", status_code=201)
+def invalidate_snapshot(
+    snapshot_id: str, request: EvidenceInvalidationRequest,
+    claims: dict = Depends(current_reviewer),
+):
+    require_campaign_admin(claims)
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        db.execute(
+            cur, "SELECT account_id FROM published_snapshots WHERE snapshot_id=?",
+            (snapshot_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        require_account_scope(claims, row[0])
+        repo.lock_inventory_remediation(conn)
+        return repo.record_evidence_invalidation(
+            conn, snapshot_id, request.reason_code, request.detail, claims["sub"],
+        )
 
 
 @app.post("/campaigns", status_code=201)
@@ -426,6 +498,9 @@ def _review_detail_payload(conn, review_id: str, review_state: dict, claims: dic
     row = repo.fetch_review_ai_context(conn, review_id)
     if not row:
         raise HTTPException(status_code=404, detail="Review not found")
+    assessment = repo.review_assessment_payload(conn, review_id)
+    pinned_manifest = evidence_manifest.review_manifest(conn, review_id)
+    binding = repo.review_evidence_binding(conn, review_id)
     if not auth.has_group(claims, os.getenv("REVIEWER_GROUP", "")):
         decision_reason = "REVIEWER_GROUP_REQUIRED"
     elif not repo.is_campaign_reviewer(
@@ -445,6 +520,24 @@ def _review_detail_payload(conn, review_id: str, review_state: dict, claims: dic
             "policy_document": json.loads(row[7]) if row[7] else None,
             "risk_reason": row[8],
             "risk_evidence": json.loads(row[9]) if row[9] else None,
+            "assessment": assessment,
+            "observed_path": ({
+                key: binding[key] for key in (
+                    "principal_id", "principal_name", "principal_arn",
+                    "grant_type", "source_id", "source_name",
+                    "attachment_id", "policy_id", "policy_name",
+                    "policy_version", "policy_sha256", "observed_at",
+                    "collected_at", "observation_id",
+                )
+            } if binding else None),
+            "source_manifest_sha256": (
+                pinned_manifest["manifest"]["source_manifest_sha256"]
+                if pinned_manifest else None
+            ),
+            "review_manifest_sha256": pinned_manifest["sha256"] if pinned_manifest else None,
+            "evidence_invalidations": (
+                repo.list_evidence_invalidations(conn, row[11]) if row[11] else []
+            ),
             "risk_rule_version": row[10],
             "snapshot_id": row[11],
             "grant_id": row[12],
@@ -996,7 +1089,8 @@ def approve_remediation(
             )
         require_account_scope(claims, binding["account_id"])
         snapshot = repo.eligible_published_snapshot(
-            conn, binding["account_id"], binding["source_scope"], require_aws=True
+            conn, binding["account_id"], binding["source_scope"],
+            required_source=config.remediation_source_mode(),
         )
         if (
             not snapshot
@@ -1213,6 +1307,20 @@ def _audit_reader_scope(claims: dict):
     return auth.identity_summary(claims)["account_scopes"], role
 
 
+@app.get("/audit/reviews/{review_id}")
+def get_audit_review(
+    review_id: str, claims: dict = Depends(current_reviewer),
+):
+    require_auditor_or_campaign_admin(claims)
+    with db.get_connection() as conn:
+        result = workspaces.audit_review_evidence(
+            conn, review_id, auth.identity_summary(claims)["account_scopes"],
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail="Review not found")
+        return result
+
+
 @app.get("/audit/events")
 def list_audit_events(
     campaign_id: str | None = Query(default=None, max_length=128),
@@ -1284,25 +1392,32 @@ def _export_record(conn, export_id: str, claims: dict):
 def _read_export_bytes(record: dict, artifact: str) -> bytes:
     details = record["details"]
     run_id = details["export_run_id"]
-    if artifact not in {"csv", "json", "manifest"}:
+    if artifact not in {"csv", "json", "evidence", "manifest"}:
         raise HTTPException(status_code=422, detail="Unsupported export artifact")
     s3_location = details.get("s3_location")
     if s3_location:
         parsed = urlparse(s3_location)
         bucket = parsed.netloc
         prefix = parsed.path.lstrip("/")
-        suffix = "manifest.json" if artifact == "manifest" else f"access_certification.{artifact}"
+        suffix = (
+            "manifest.json" if artifact == "manifest"
+            else "evidence.json" if artifact == "evidence"
+            else f"access_certification.{artifact}"
+        )
         try:
-            import boto3
-            response = boto3.client("s3", region_name=config.get_aws_region()).get_object(
+            from common import aws_clients
+            response = aws_clients.client("s3").get_object(
                 Bucket=bucket, Key=f"{prefix}/{suffix}"
             )
             return response["Body"].read()
         except Exception:
             raise HTTPException(status_code=503, detail="The authorized export artifact is unavailable") from None
     reports_dir = Path(__file__).resolve().parents[1] / "reports"
-    pattern = (f"access_certification_*_{run_id}.manifest.json" if artifact == "manifest"
-               else f"access_certification_*_{run_id}.{artifact}")
+    pattern = (
+        f"access_certification_*_{run_id}.manifest.json" if artifact == "manifest"
+        else f"access_certification_*_{run_id}.evidence.json" if artifact == "evidence"
+        else f"access_certification_*_{run_id}.{artifact}"
+    )
     match = next(iter(reports_dir.glob(pattern)), None)
     if not match or match.resolve().parent != reports_dir.resolve():
         raise HTTPException(status_code=404, detail="Export artifact not found")
@@ -1340,6 +1455,7 @@ def list_exports(
                 "record_count": details.get("record_count", 0),
                 "csv_sha256": details.get("csv_sha256"),
                 "json_sha256": details.get("json_sha256"),
+                "evidence_sha256": details.get("evidence_sha256"),
                 "manifest_sha256": details.get("manifest_sha256"),
             })
         return {"exports": visible[offset:offset + limit], "limit": limit,
@@ -1373,6 +1489,7 @@ def request_audit_export(request: ExportRequest, claims: dict = Depends(current_
     return {"export_id": result["export_run_id"], "status": "complete",
             "created_at": result["generated_at"], "record_count": result["record_count"],
             "csv_sha256": result["csv_sha256"], "json_sha256": result["json_sha256"],
+            "evidence_sha256": result["evidence_sha256"],
             "manifest_sha256": result["manifest_sha256"]}
 
 
@@ -1386,6 +1503,7 @@ def get_audit_export(export_id: str, claims: dict = Depends(current_reviewer)):
                 "created_at": record["created_at"], "record_count": details.get("record_count"),
                 "csv_sha256": details.get("csv_sha256"),
                 "json_sha256": details.get("json_sha256"),
+                "evidence_sha256": details.get("evidence_sha256"),
                 "manifest_sha256": details.get("manifest_sha256"),
                 "campaign_id": details.get("campaign_id")}
 
@@ -1402,7 +1520,9 @@ def verify_audit_export(export_id: str, claims: dict = Depends(current_reviewer)
         except json.JSONDecodeError:
             raise HTTPException(status_code=409, detail="Export manifest is invalid") from None
         checked = {}
-        for artifact in ("csv", "json"):
+        for artifact in ("csv", "json", "evidence"):
+            if artifact == "evidence" and artifact not in manifest.get("artifacts", {}):
+                continue
             data = _read_export_bytes(record, artifact)
             actual = hashlib.sha256(data).hexdigest()
             expected = manifest.get("artifacts", {}).get(artifact, {}).get("sha256")
@@ -1417,7 +1537,7 @@ def verify_audit_export(export_id: str, claims: dict = Depends(current_reviewer)
 @app.get("/exports/{export_id}/download")
 def download_audit_export(
     export_id: str,
-    artifact: Literal["csv", "json", "manifest"] = "csv",
+    artifact: Literal["csv", "json", "evidence", "manifest"] = "csv",
     claims: dict = Depends(current_reviewer),
 ):
     _audit_reader_scope(claims)
@@ -1431,8 +1551,10 @@ def download_audit_export(
             details={"actor_sub": claims["sub"], "artifact": artifact},
         )
     media_type = {"csv": "text/csv", "json": "application/json",
+                  "evidence": "application/json",
                   "manifest": "application/json"}[artifact]
-    filename = f"access_certification_{export_id}.{artifact if artifact != 'manifest' else 'manifest.json'}"
+    suffix = "manifest.json" if artifact == "manifest" else "evidence.json" if artifact == "evidence" else artifact
+    filename = f"access_certification_{export_id}.{suffix}"
     return Response(content=data, media_type=media_type,
                     headers={"Content-Disposition": f'attachment; filename="{filename}"',
                              "Cache-Control": "no-store"})
@@ -1459,7 +1581,8 @@ def operations_integrations(claims: dict = Depends(current_reviewer)):
     return {
         "oidc": {"configured": bool(os.getenv("OIDC_ISSUER") and os.getenv("OIDC_AUDIENCE") and os.getenv("OIDC_JWKS_URL"))},
         "aws": {"credential_source_configured": bool(os.getenv("AWS_ROLE_ARN") or os.getenv("AWS_PROFILE") or os.getenv("AWS_ACCESS_KEY_ID")),
-                "mock_mode": config.is_mock_iam(), "region_configured": bool(os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")),
+                "source_mode": config.iam_source_mode(),
+                "mock_mode": config.is_seeded_iam(), "region_configured": bool(os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")),
                 "connectivity": "not_checked"},
         "genai": {"enabled": config.is_genai_enabled(), "provider_data_approved": os.getenv("AI_PROVIDER_DATA_APPROVED", "").lower() == "true"},
         "audit_storage": {"s3_bucket_configured": bool(os.getenv("AUDIT_S3_BUCKET")),

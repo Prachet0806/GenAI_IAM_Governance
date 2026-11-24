@@ -1,22 +1,19 @@
 # lambdas/identity_discovery/handler.py
-import json
 import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import boto3
-
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from common import config, evidence, logger, repo
+from common import aws_clients, config, evidence, logger, policy_assessment, repo
 from common.db import db
 
 
 def _is_mock() -> bool:
-    return config.is_mock_iam()
+    return config.is_seeded_iam()
 
 
 def _mock_identities():
@@ -129,17 +126,12 @@ def _mock_identities():
 def _iam_client():
     from botocore.config import Config as BotoConfig
 
-    kwargs = {"region_name": config.get_aws_region()}
     client_config = BotoConfig(
         connect_timeout=5,
         read_timeout=20,
         retries={"mode": "standard", "max_attempts": 5},
     )
-    profile = config.get_aws_profile()
-    if profile:
-        session = boto3.Session(profile_name=profile, region_name=kwargs["region_name"])
-        return session.client("iam", config=client_config)
-    return boto3.client("iam", region_name=kwargs["region_name"], config=client_config)
+    return aws_clients.client("iam", client_config=client_config)
 
 
 def _list_all_attached_policies(
@@ -180,7 +172,7 @@ def _list_all(iam_client, operation: str, result_key: str, **kwargs):
     ]
 
 
-def _inline_policy(iam_client, operation: str, getter: str, principal: str):
+def _inline_policy(iam_client, operation: str, principal: str, getter: str):
     names = _list_all(iam_client, operation, "PolicyNames", **{principal: getter})
     items = []
     for name in names:
@@ -194,7 +186,7 @@ def _inline_policy(iam_client, operation: str, getter: str, principal: str):
         if isinstance(document, str):
             from urllib.parse import unquote
 
-            document = json.loads(unquote(document))
+            document = policy_assessment.decode_policy_json(unquote(document))
         if not isinstance(document, dict):
             raise RuntimeError("Inline IAM policy document is missing or invalid")
         items.append(
@@ -261,13 +253,18 @@ def _get_policy_document(iam_client, policy_arn: str):
     version = iam_client.get_policy_version(
         PolicyArn=policy_arn, VersionId=version_id
     ).get("PolicyVersion", {})
+    if version.get("VersionId", version_id) != version_id:
+        raise RuntimeError("Managed policy returned a different version")
     document = version.get("Document")
     if isinstance(document, str):
         from urllib.parse import unquote
 
-        document = json.loads(unquote(document))
+        document = policy_assessment.decode_policy_json(unquote(document))
     if not isinstance(document, dict):
         raise RuntimeError("Managed policy document is missing or invalid")
+    current = iam_client.get_policy(PolicyArn=policy_arn).get("Policy", {})
+    if current.get("DefaultVersionId") != version_id:
+        raise RuntimeError("Managed policy default version changed during collection")
     return document, version_id
 
 
@@ -276,11 +273,9 @@ def _source_account_id() -> str:
         return evidence.account_from_arn(_mock_identities()[0]["Arn"])
     from botocore.config import Config as BotoConfig
 
-    profile = config.get_aws_profile()
-    session = boto3.Session(profile_name=profile, region_name=config.get_aws_region())
-    sts = session.client(
+    sts = aws_clients.client(
         "sts",
-        config=BotoConfig(connect_timeout=5, read_timeout=10, retries={"max_attempts": 3}),
+        client_config=BotoConfig(connect_timeout=5, read_timeout=10, retries={"max_attempts": 3}),
     )
     account_id = sts.get_caller_identity()["Account"]
     if not str(account_id).isdigit() or len(str(account_id)) != 12:
@@ -296,6 +291,8 @@ def _iter_identities():
         iam_client = _iam_client()
         paginator = iam_client.get_paginator("list_users")
         for page in paginator.paginate():
+            if page.get("IsTruncated") and not page.get("Marker"):
+                raise RuntimeError("IAM ListUsers page is truncated without a continuation marker")
             for user in page["Users"]:
                 policies = _user_entitlements(iam_client, user)
                 yield {**user, "Policies": policies}
@@ -305,11 +302,11 @@ def discover_identities(event, context):
     logger.log("discover_identities", "start", "Starting Identity Discovery")
     run_id = str(uuid.uuid4())
     started = datetime.now(timezone.utc).isoformat()
-    mode = "MOCK" if _is_mock() else "AWS"
+    mode = config.iam_source_mode()
     scope = evidence.IAM_USER_POLICY_SCOPE
     account_id = (
         evidence.account_from_arn(_mock_identities()[0]["Arn"])
-        if _is_mock() else config.get_aws_account_id()
+        if _is_mock() else config.get_source_account_id()
     )
     with db.get_connection() as conn:
         # Register the RUNNING snapshot under the shared lock. If remediation is
@@ -320,6 +317,8 @@ def discover_identities(event, context):
     discovered_users = []
     observations = []
     try:
+        if mode == "FLOCI":
+            aws_clients.assert_floci_ready()
         if not _is_mock() and _source_account_id() != account_id:
             raise RuntimeError("AWS credentials do not match AWS_ACCOUNT_ID")
         # Do network pagination and policy retrieval without holding a database
@@ -359,29 +358,52 @@ def discover_identities(event, context):
             repo.lock_inventory_remediation(conn)
             coverage = {
                 "scope_version": scope,
+                "source_kind": mode,
+                "pagination_complete": True,
                 "complete_for_declared_scope": True,
                 "coverage": [
                     "iam_users", "user_attached_managed_policies",
                     "user_inline_policies", "group_membership",
                     "group_attached_managed_policies", "group_inline_policies",
                 ],
+                "unassessed_surfaces": [
+                    "role_trust_policies", "identity_center_group_membership",
+                    "resource_policies", "permission_boundaries",
+                    "service_control_policies", "resource_control_policies",
+                    "session_policies", "effective_permissions",
+                ],
+                "principal_count": len(discovered_users),
+                "grant_count": len(observations),
+                "missing_policy_evidence": sum(
+                    item["evidence_status"] == "MISSING" for item in observations
+                ),
             }
+            collected_at = datetime.now(timezone.utc).isoformat()
+            repo.record_collection_success(
+                conn, run_id, account_id, scope, collected_at,
+                discovered_users, observations, coverage,
+            )
+        with db.get_connection() as conn:
+            repo.lock_inventory_remediation(conn)
             published = repo.publish_discovery_snapshot(
                 conn, run_id, account_id, scope,
-                datetime.now(timezone.utc).isoformat(),
+                collected_at,
                 discovered_users, observations, coverage,
             )
             status = "COMPLETE" if published else "INCOMPLETE"
     except Exception as e:
         with db.get_connection() as conn:
+            collection_complete = repo.collection_succeeded(conn, run_id)
             repo.finish_discovery_run(
                 conn,
                 run_id,
                 datetime.now(timezone.utc).isoformat(),
-                "FAILED",
+                "INCOMPLETE" if collection_complete else "FAILED",
                 user_count,
                 errors + 1,
-                {"error_type": type(e).__name__, "account_id": account_id, "source_scope": scope},
+                {"error_type": type(e).__name__, "account_id": account_id,
+                 "source_scope": scope,
+                 "reason": "publication_failed" if collection_complete else "collection_failed"},
             )
         logger.log(
             "discover_identities",

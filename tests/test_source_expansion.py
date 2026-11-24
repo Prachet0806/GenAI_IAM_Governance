@@ -167,13 +167,53 @@ def test_failed_new_source_attempt_preserves_old_snapshot_but_blocks_new_campaig
         assert repo.eligible_published_snapshot(conn, ACCOUNT, evidence.IAM_ROLE_POLICY_SCOPE) is None
 
 
+def test_same_policy_identity_with_changed_document_keeps_distinct_assessments(source_db):
+    policy_arn = f"arn:aws:iam::{ACCOUNT}:policy/SharedReader"
+    principals = []
+    for index, document in enumerate(({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
+                       "Resource": "arn:aws:s3:::private-bucket/key"}],
+    }, {
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "iam:*", "Resource": "*"}],
+    }), start=1):
+        name = f"user-{index}"
+        principals.append({
+            "UserId": f"U{index}", "UserName": name,
+            "Arn": f"arn:aws:iam::{ACCOUNT}:user/{name}",
+            "CreateDate": datetime.now(timezone.utc),
+            "Policies": [{
+                "PolicyArn": policy_arn, "PolicyName": "SharedReader",
+                "Document": document, "GrantType": "DIRECT_MANAGED",
+                "SourceId": f"U{index}", "AttachmentId": policy_arn,
+            }],
+        })
+    result = publish_source(
+        ACCOUNT, evidence.IAM_USER_POLICY_SCOPE, principals,
+        covered=["iam_users"], unassessed=[],
+    )
+    assert result["status"] == "COMPLETE"
+    assert evaluate_risk(None, None)["grant_observations_assessed"] == 2
+    with db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM policy_risk_assessments").fetchone() == (2,)
+        assert conn.execute("SELECT COUNT(*) FROM grant_risk_assessments").fetchone() == (2,)
+        assert conn.execute("""SELECT go.principal_name,gra.risk_level
+            FROM grant_observations go
+            JOIN grant_risk_assessments gra ON gra.observation_id=go.observation_id
+            ORDER BY go.principal_name""").fetchall() == [
+            ("user-1", "LOW"), ("user-2", "HIGH"),
+        ]
+    assert generate_campaign({"account_id": ACCOUNT}, None)["reviews_created"] == 2
+
+
 def test_role_sts_failure_is_recorded_under_configured_source(source_db, monkeypatch):
     principal = role_principal(_RoleIam(), _role())
     first = publish_source(
         ACCOUNT, evidence.IAM_ROLE_POLICY_SCOPE, [principal], source="AWS",
         covered=["role_policies"], unassessed=[],
     )
-    monkeypatch.setenv("MOCK_IAM", "false")
+    monkeypatch.setenv("MOCK_IAM", "true")
     monkeypatch.setenv("AWS_ACCOUNT_ID", ACCOUNT)
     monkeypatch.setattr(role_discovery, "_source_account_id",
                         lambda: (_ for _ in ()).throw(RuntimeError("STS unavailable")))
@@ -196,7 +236,7 @@ def test_user_sts_failure_is_recorded_under_configured_source(source_db, monkeyp
         ACCOUNT, evidence.IAM_USER_POLICY_SCOPE, [user], source="AWS",
         covered=["iam_users"], unassessed=[],
     )
-    monkeypatch.setenv("MOCK_IAM", "false")
+    monkeypatch.setenv("MOCK_IAM", "true")
     monkeypatch.setenv("AWS_ACCOUNT_ID", ACCOUNT)
     monkeypatch.setattr(user_discovery, "_source_account_id",
                         lambda: (_ for _ in ()).throw(RuntimeError("STS unavailable")))

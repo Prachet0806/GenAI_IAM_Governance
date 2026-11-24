@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 IAM_USER_POLICY_SCOPE = "iam-users-direct-and-group-managed-and-inline-policies-v2"
 IAM_ROLE_POLICY_SCOPE = "iam-role-policies-and-trust-v1"
 IDENTITY_CENTER_SCOPE = "identity-center-account-assignments-v1"
-POLICY_RULE_VERSION = "policy-risk-v5"
+POLICY_RULE_VERSION = "policy-risk-v6"
 
 
 def canonical_json(value) -> str:

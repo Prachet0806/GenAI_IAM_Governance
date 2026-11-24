@@ -101,9 +101,9 @@ def cmd_decide(args) -> int:
             "[red]production decisions are disabled until an authenticated review service is integrated[/red]"
         )
         return 2
-    if not config.is_mock_iam():
+    if not config.is_seeded_iam():
         _console().print(
-            "[red]unauthenticated CLI decisions are restricted to MOCK_IAM=true demo data[/red]"
+            "[red]unauthenticated CLI decisions require SEEDED_IAM=true demo data[/red]"
         )
         return 2
     reviewer = args.reviewer or "local-demo"
@@ -223,8 +223,8 @@ def cmd_auto_demo(args) -> int:
     if os.getenv("APP_ENV", "development").lower() == "production":
         _console().print("[red]auto-demo is disabled in production[/red]")
         return 2
-    if not config.is_mock_iam():
-        _console().print("[red]auto-demo requires MOCK_IAM=true[/red]")
+    if not config.is_seeded_iam():
+        _console().print("[red]auto-demo requires SEEDED_IAM=true[/red]")
         return 2
     with db.get_connection() as conn:
         cur = conn.cursor()
