@@ -21,6 +21,7 @@ const review: ReviewDetail = {
   snapshot_published_at: "2026-01-01T00:00:00Z", snapshot_current_eligible: true,
   review_scope: "GRANT_PATH", principal_access_status: "not_evaluated",
   ai_explanation: { status: "not_available", summary: null }, assigned_reviewer_sub: "oidc|reviewer",
+  review_qa_enabled: false,
   can_decide: true, can_decide_reason: null,
   due_at: null, exception_state: "NONE", campaign_state: "OPEN",
 };
@@ -211,5 +212,25 @@ describe("ReviewWorkspace", () => {
     expect(await screen.findByText("BillingReadOnly")).toBeInTheDocument();
     expect(screen.getByText("High legacy triage", { selector: ".badge" })).toBeInTheDocument();
     expect(screen.queryByText("Pinned evidence was invalidated.")).not.toBeInTheDocument();
+  });
+
+  it("shows the gated pinned question set and its citations", async () => {
+    apiFetch.mockImplementation((path: string) => {
+      if (path.startsWith("reviews/review-1/history")) return Promise.resolve({ events: [] });
+      if (path === "reviews/review-1") return Promise.resolve({ ...review, review_qa_enabled: true });
+      if (path === "reviews/review-1/ai/questions") return Promise.resolve({
+        status: "ANSWERED", intent: "ATTACHMENT", answer: "The pinned observation records a direct path.",
+        limitations: "Effective access was not evaluated.", current_snapshot_eligible: true,
+        evidence: { retrieved: ["observation-1"], considered: ["observation-1"], cited: ["observation-1"], unavailable: [] },
+      });
+      return Promise.resolve({});
+    });
+    renderReview();
+    fireEvent.click(await screen.findByRole("button", { name: "How was this policy attached?" }));
+    expect(await screen.findByText("The pinned observation records a direct path.")).toBeInTheDocument();
+    expect(screen.getByText("observation-1", { selector: ".badge" })).toBeInTheDocument();
+    expect(apiFetch).toHaveBeenCalledWith("reviews/review-1/ai/questions", expect.objectContaining({
+      method: "POST", body: JSON.stringify({ intent: "ATTACHMENT" }),
+    }));
   });
 });

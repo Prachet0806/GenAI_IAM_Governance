@@ -552,6 +552,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/reviews/{review_id}/ai/questions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Answer Review Question */
+        post: operations["answer_review_question_reviews__review_id__ai_questions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/reviews/{review_id}/assignment": {
         parameters: {
             query?: never;
@@ -873,6 +890,11 @@ export interface components {
             decision: "APPROVED" | "DECLINED";
             /** Reason */
             reason: string;
+        };
+        /** ReviewQuestionRequest */
+        ReviewQuestionRequest: {
+            /** Intent */
+            intent: string;
         };
         /** ReviewerAssignmentRequest */
         ReviewerAssignmentRequest: {
@@ -1997,6 +2019,41 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    answer_review_question_reviews__review_id__ai_questions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                review_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReviewQuestionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };

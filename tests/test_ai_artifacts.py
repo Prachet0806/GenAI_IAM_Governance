@@ -1,14 +1,17 @@
 """Durable AI jobs, validated citations, and migrated reviewer consumers."""
 
 import json
+import os
 import sqlite3
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 from api.review_service import app
 from common import ai_artifacts, auth, evidence, repo
+from common.ai import provider_controls
 from common.db import db
 from lambdas.ai_explanation import handler as ai_worker
 from lambdas.generate_reviews.handler import generate_campaign
@@ -27,6 +30,16 @@ def ai_review(tmp_path, monkeypatch):
     monkeypatch.setenv("SEEDED_IAM", "true")
     monkeypatch.setenv("ENABLE_GENAI", "true")
     monkeypatch.setenv("AI_PROVIDER_DATA_APPROVED", "true")
+    monkeypatch.setenv("AI_PROVIDER_REGION", "global")
+    monkeypatch.setenv("AI_PROVIDER_APPROVAL_JSON", json.dumps({
+        "approval_version": "test-v1", "approved_by": "test-operator",
+        "provider": provider_controls.PROVIDER, "model": "gemini-3.8-flash",
+        "region": "global", "prompt_sha256": provider_controls.prompt_sha256(provider_controls.PROMPT_PREFIX),
+        "input_classes": sorted(provider_controls.INPUT_CLASSES),
+        "approved_account_ids": [ACCOUNT_A, "111111111111"],
+        "terms_sha256": "a" * 64, "retention_sha256": "b" * 64,
+        "approved_until": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+    }))
     monkeypatch.setenv("AI_PSEUDONYM_KEY", "test-only-pseudonym-secret")
     monkeypatch.setenv("GOOGLE_API_KEY", "test-only-provider-key")
     monkeypatch.setenv("REVIEWER_GROUP", "reviewers")
@@ -106,6 +119,46 @@ class _SuccessfulClient:
         return response
 
 
+def test_idempotency_collision_rejects_changed_input(ai_review, monkeypatch):
+    review_id, _, _ = ai_review
+    with db.get_connection() as conn:
+        first = ai_artifacts.enqueue_review(conn, review_id, pseudonym_key="test-only-pseudonym-secret")
+        original = ai_artifacts.build_context
+        def altered(connection, selected_review_id, *, pseudonym_key=None):
+            value = original(connection, selected_review_id, pseudonym_key=pseudonym_key)
+            return {**value, "risk_reason": "different frozen input"}
+        monkeypatch.setattr(ai_artifacts, "build_context", altered)
+        with pytest.raises(RuntimeError, match="different frozen input"):
+            ai_artifacts.enqueue_review(conn, review_id, pseudonym_key="test-only-pseudonym-secret")
+        assert conn.execute("SELECT COUNT(*) FROM ai_jobs WHERE job_id=?", (first["job_id"],)).fetchone()[0] == 1
+
+
+def test_old_artifact_writer_remains_readable_after_additive_migration(ai_review):
+    review_id, _, _ = ai_review
+    with db.get_connection() as conn:
+        job = ai_artifacts.enqueue_review(conn, review_id, pseudonym_key="test-only-pseudonym-secret")
+        context = ai_artifacts.build_context(conn, review_id, pseudonym_key="test-only-pseudonym-secret")
+        output = ai_artifacts.fallback_output(context)
+        output_json = ai_artifacts._canonical(output)
+        conn.execute("""INSERT INTO ai_artifacts
+            (artifact_id,job_id,task_type,review_id,snapshot_id,observation_id,
+             risk_assessment_id,source,validation_status,provider,model,
+             prompt_version,schema_version,input_sha256,output_sha256,output_json,
+             evidence_refs,latency_ms,created_at)
+            SELECT ?,job_id,task_type,review_id,snapshot_id,observation_id,
+                   risk_assessment_id,'MODEL','VALIDATED','google','legacy-model',
+                   prompt_version,schema_version,input_sha256,?,?,?,?,?
+            FROM ai_jobs WHERE job_id=?""", (
+            str(uuid.uuid4()), ai_artifacts._hash(output_json), output_json,
+            ai_artifacts._canonical(output["citations"]), 1,
+            datetime.now(timezone.utc).isoformat(), job["job_id"],
+        ))
+        old = ai_artifacts.projection(conn, review_id)
+        assert old["validated_artifact"] is True
+        assert old["provider_provenance_state"] == "legacy_missing"
+        assert old["approval_version"] is None
+
+
 def test_idempotent_job_validated_projection_and_decision_binding(ai_review, monkeypatch, tmp_path):
     review_id, path, client = ai_review
     fake = _SuccessfulClient()
@@ -131,6 +184,11 @@ def test_idempotent_job_validated_projection_and_decision_binding(ai_review, mon
     projection = review_response["ai_explanation"]
     assert projection["authority"] == "validated_artifact"
     assert projection["validated_artifact"] is True
+    assert projection["provider_provenance_state"] == "recorded"
+    assert projection["approval_version"] == "test-v1"
+    assert projection["provider_region"] == "global"
+    assert len(projection["prompt_sha256"]) == 64
+    assert len(projection["provider_input_sha256"]) == 64
     assert projection["citations"][0]["kind"] == "grant_risk_assessment"
     assert _auth_get(client, f"/ai/jobs/{queued.json()['job_id']}").json()["status"] == "SUCCEEDED"
     assert _auth_get(client, f"/ai/jobs/{queued.json()['job_id']}", token="outsider").status_code == 403
@@ -147,6 +205,9 @@ def test_idempotent_job_validated_projection_and_decision_binding(ai_review, mon
     exported = export_audit_report()
     records = json.loads((tmp_path / exported["json"]).read_text(encoding="utf-8"))
     assert records[0]["ai_artifact_id"] == projection["artifact_id"]
+    assert records[0]["ai_provider_provenance_state"] == "recorded"
+    assert records[0]["ai_approval_version"] == "test-v1"
+    assert records[0]["ai_provider_input_sha256"] == projection["provider_input_sha256"]
     assert records[0]["decision_events"][0]["ai_artifact_id"] == projection["artifact_id"]
     assert records[0]["decision_events"][0]["reviewer_comment"] == ""
     assert records[0]["decision_events"][0]["decision_origin"] == "OIDC_API"
@@ -166,6 +227,7 @@ def test_invalid_citation_retries_then_publishes_labelled_fallback(ai_review, mo
             conn.execute("UPDATE ai_jobs SET run_after='2000-01-01T00:00:00+00:00' WHERE status='PENDING'")
     explanation = _auth_get(client, f"/reviews/{review_id}").json()["ai_explanation"]
     assert explanation["source"] == "FALLBACK"
+    assert explanation["provider_provenance_state"] == "not_applicable"
     assert explanation["authority"] == "validated_artifact"
     assert _auth_get(client, "/ai/metrics").status_code == 403
     monkeypatch.setenv("CAMPAIGN_ADMIN_GROUP", "reviewers")
@@ -275,6 +337,10 @@ def test_model_change_creates_new_job_and_pins_model(ai_review, monkeypatch):
     assert ai_worker.handler({"review_id": review_id}, None)["status"] == "SUCCEEDED"
     first = _auth_get(client, f"/reviews/{review_id}").json()["ai_explanation"]
     monkeypatch.setenv("GENAI_MODEL", "next-model")
+    changed_approval = json.loads(os.environ["AI_PROVIDER_APPROVAL_JSON"])
+    changed_approval["model"] = "next-model"
+    changed_approval["approval_version"] = "test-v2"
+    monkeypatch.setenv("AI_PROVIDER_APPROVAL_JSON", json.dumps(changed_approval))
     assert ai_worker.handler({"review_id": review_id}, None)["status"] == "SUCCEEDED"
     latest = _auth_get(client, f"/reviews/{review_id}").json()["ai_explanation"]
     assert latest["model"] == "next-model"

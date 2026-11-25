@@ -1,29 +1,21 @@
-# Release 1 product validation
+# Product validation protocol
 
-Status: **protocol ready; no customer sessions or buyer commitments recorded**. Local automated tests and mock browser journeys do not satisfy this gate.
+Status: no customer sessions, buyer commitments, approved provider evaluation, or reviewer pilot are recorded. Local tests and mocked browser journeys cannot pass these gates.
 
-## Participants and baseline
+## Release 1: deterministic workflow
 
-Recruit at least one IAM administrator, one person who actually certifies access, one audit consumer, and the budget owner or procurement sponsor. Record their organization type, account count, IAM review cadence, grant-path volume, incumbent workflow, and the person who owns errors. Obtain permission to observe the session and use representative, non-secret policy examples.
+Recruit an IAM administrator, actual access reviewer, audit consumer, and budget owner. Record organization/account scale, review cadence and volume, incumbent workflow, error owner, procurement and data constraints. Obtain permission to observe representative non-secret examples. Before showing the prototype, measure the same cases in their existing workflow: time, wrong principal/policy conclusions, missed uncertainty, escalation quality, and evidence-assembly effort.
 
-Before showing the prototype, have each participant complete or explain the same review in their current workflow. Record task time, wrong-principal or wrong-policy conclusions, missed uncertainty, escalation quality, and time spent collecting evidence. Ask which part is expensive enough to pay to reduce.
+| Participant | Observed task | Correct outcome |
+| --- | --- | --- |
+| Administrator | Inspect complete, failed-later, and invalidated scans; compare same-account/scope published snapshots. | Separate collection, publication, coverage, age and current eligibility; identify added/removed/changed observed paths. |
+| Reviewer | Decide or escalate direct, group-derived, missing-document and stale/invalidated paths with AI off. | Identify principal/source/attachment, frozen version and statement, rule reason, unknown effective access, and appropriate escalation. |
+| Auditor | Reconstruct a decision from pinned manifests, observation, assessment, comment and invalidation; verify CSV/JSON/evidence/manifest artifacts. | Independently trace history and identify legacy proof that is unavailable. |
 
-## Observed tasks
+For each task record completion, elapsed time, errors, missed evidence, escalation, navigation friction, and the participant's explanation of what the product proves. A quick wrong decision fails. Ask the buyer about current cost, recurring volume, alternatives (including AWS-native and spreadsheet flows), integrations, residency, deployment, security review, and a concrete pilot owner/data/date/success criterion. Keep one dated, redacted result per organization with scenario IDs, baseline/prototype comparison and evidence links; mark each observation, participant claim, or inference.
 
-1. **Administrator:** inspect a complete scan, a failed later attempt, and an invalidated publication. Explain separately what was collected, what was published, the declared coverage, the observation window, and whether a campaign can start. Compare two published snapshots of the same account and source scope and identify one added, removed, and changed observed grant path.
-2. **Reviewer:** decide or escalate a direct policy path, a group-derived path, a missing-document path, and a stale/invalidated path. Identify principal, source relationship, attachment, frozen policy version, matched statement, rule reason, and what effective access remains unknown. Use the product with AI disabled.
-3. **Auditor:** start from a recorded decision, reconstruct the pinned source/review manifests, frozen observation and assessment, decision/comment and invalidation history, then independently verify and inspect the CSV, JSON, evidence, and manifest export artifacts. Identify a legacy review whose proof is unavailable.
+Release 1 needs correct role journeys with authorized access in managed AWS/OIDC staging, PostgreSQL and hosted CI at the release commit, and documented buyer interest in recurring value. Record an owner-approved go/no-go decision and unresolved defects before claiming shipment.
 
-For each task record completion, elapsed time, wrong conclusions, missed evidence, appropriate escalations, navigation friction, and the participant's own explanation of what the product proves. Treat a fast but wrong decision as a failure. Compare results with the baseline workflow on the same cases.
+## Release 2: reviewer study
 
-## Buying and operating questions
-
-Ask the budget owner for the current review cost, recurring review volume, procurement/security constraints, data residency and provider restrictions, required integrations, preferred deployment model, and a concrete pilot commitment (owner, data, start date, success criterion). Compare the deterministic evidence screen against the current AWS-native or spreadsheet workflow and, only after that, a conversational explanation concept. Record the stated alternative and reason for choosing or rejecting this product.
-
-## Result record
-
-Create one dated result per organization with: participant roles, scenario IDs, baseline and prototype times, errors, escalations, missing features, deployment constraints, buyer response, and evidence link. Redact names and account identifiers. Mark each result `observed`, `participant claim`, or `inference`; never substitute an internal demo for an external observation.
-
-## Release decision
-
-Release 1 requires the role tasks to succeed with correct uncertainty and authorized access in a managed AWS/OIDC staging environment, plus PostgreSQL and hosted CI at the target commit. The product claim requires documented buyer interest and recurring operating value. Record a go/no-go decision with unresolved failures and owner before claiming Release 1 shipped or funding Release 2 AI expansion.
+Predeclare a minimum improvement in **time to a correct, defensible review** and stop conditions for wrong path/principal/source, false reassurance, missed uncertainty, or privacy breach. Use realistic direct/group/trust/Identity Center/missing/stale bundles. Counterbalance deterministic UI versus UI plus explanation/Q&A across reviewers; an independent adjudicator scores source/path identification, uncertainty, escalation, corrections, and decision quality only when business need is known. Measure adoption, trust calibration, provider cost, and buyer feedback. Freeze case selection, reviewer count, effect estimate, variance and power calculation before full recruitment; a model-case count is not a human-study sample. See [AI governance](ai-governance.md) for the separate provider quality and safety gate.

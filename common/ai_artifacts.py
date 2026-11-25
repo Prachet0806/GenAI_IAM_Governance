@@ -11,7 +11,7 @@ from common import config, evidence, repo
 from common.db import db
 
 TASK = "REVIEW_EXPLANATION"
-PROMPT_VERSION = "review-explanation-v4"
+PROMPT_VERSION = "review-explanation-v5"
 SCHEMA_VERSION = "review-explanation-output-v1"
 
 
@@ -60,6 +60,7 @@ def build_context(conn, review_id: str, *, pseudonym_key: str | None = None):
     context = {
         "task": TASK,
         "subject_ref": subject_ref,
+        "source_account_id": binding["account_id"],
         "snapshot_id": binding["snapshot_id"],
         "observation_id": binding["observation_id"],
         "risk_assessment_id": binding["risk_assessment_id"],
@@ -115,10 +116,12 @@ def enqueue_review(
     cur = conn.cursor()
     db.execute(
         cur,
-        "SELECT job_id,status,generation,provider_model FROM ai_jobs WHERE idempotency_key=?",
+        "SELECT job_id,status,generation,provider_model,input_sha256 FROM ai_jobs WHERE idempotency_key=?",
         (key,),
     )
     row = cur.fetchone()
+    if row[4] != input_hash:
+        raise RuntimeError("AI idempotency key resolved to different frozen input")
     return {"job_id": row[0], "status": row[1], "generation": row[2],
             "provider_model": row[3], "idempotency_key": key}
 
@@ -210,7 +213,7 @@ def claim_job(conn, *, job_id: str | None = None, lease_seconds: int = 120):
         cur,
         """SELECT job_id,review_id,snapshot_id,observation_id,risk_assessment_id,
                   input_sha256,attempt_count,max_attempts,lease_token,
-                  provider_model,generation
+                  provider_model,generation,prompt_version
            FROM ai_jobs WHERE job_id=?""",
         (candidate[0],),
     )
@@ -218,8 +221,35 @@ def claim_job(conn, *, job_id: str | None = None, lease_seconds: int = 120):
     return dict(zip(
         ("job_id", "review_id", "snapshot_id", "observation_id",
          "risk_assessment_id", "input_sha256", "attempt_count",
-         "max_attempts", "lease_token", "provider_model", "generation"), row,
+         "max_attempts", "lease_token", "provider_model", "generation",
+         "prompt_version"), row,
     ))
+
+
+def retire_job(conn, job: dict, *, error_code: str) -> bool:
+    """Fence and fail an in-flight job whose prompt version can no longer run."""
+    cur = conn.cursor()
+    db.execute(cur, """UPDATE ai_jobs SET status='FAILED',last_error_code=?,
+        lease_token=NULL,lease_expires_at=NULL,updated_at=?
+        WHERE job_id=? AND status='RUNNING' AND lease_token=? AND lease_expires_at>?""",
+        (error_code, _now(), job["job_id"], job["lease_token"], _now()))
+    if cur.rowcount == 1:
+        _attempt(conn, job, "FAILED", 0, error_code)
+        return True
+    return False
+
+
+def provider_circuit_open(
+    conn, model: str, *, window_seconds: int = 600, failure_threshold: int = 5,
+) -> bool:
+    """Conservatively stop calls after repeated recent provider transport failures."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+    cur = conn.cursor()
+    db.execute(cur, """SELECT COUNT(*) FROM ai_attempts a
+        JOIN ai_jobs j ON j.job_id=a.job_id
+        WHERE j.provider_model=? AND a.created_at>=?
+          AND a.error_code='provider_unavailable'""", (model, cutoff))
+    return cur.fetchone()[0] >= failure_threshold
 
 
 def validate_output(value, allowed_ids: list[str]):
@@ -270,11 +300,30 @@ def complete_job(
     conn, job: dict, output: dict, *, source: str, provider: str | None,
     model: str | None, latency_ms: int, input_tokens: int | None = None,
     output_tokens: int | None = None, error_code: str | None = None,
+    provider_provenance: dict | None = None,
 ):
     output = validate_output(
         output, [job["snapshot_id"], job["observation_id"], job["risk_assessment_id"]]
     )
     output_json = _canonical(output)
+    if source == "MODEL":
+        if (not isinstance(provider_provenance, dict)
+                or set(provider_provenance) != {
+                    "approval_version", "provider_region", "prompt_sha256",
+                    "provider_input_sha256", "input_classes",
+                }
+                or not isinstance(provider_provenance["approval_version"], str)
+                or not provider_provenance["approval_version"]
+                or provider_provenance["provider_region"] != "global"
+                or any(not isinstance(provider_provenance[key], str)
+                       or not re.fullmatch(r"[0-9a-f]{64}", provider_provenance[key])
+                       for key in ("prompt_sha256", "provider_input_sha256"))
+                or provider_provenance["input_classes"] != [
+                    "EVIDENCE_REFERENCES", "RULE_TRIAGE"
+                ]):
+            raise ValueError("Model artifact lacks approved provider provenance")
+    elif provider_provenance is not None:
+        raise ValueError("Fallback must not claim provider provenance")
     status = "SUCCEEDED" if source == "MODEL" else "FALLBACK"
     cur = conn.cursor()
     review_lock = " FOR UPDATE" if not db._is_sqlite_now() else ""
@@ -304,14 +353,22 @@ def complete_job(
            (artifact_id,job_id,task_type,review_id,snapshot_id,observation_id,
             risk_assessment_id,source,validation_status,provider,model,
             prompt_version,schema_version,input_sha256,output_sha256,output_json,
-            evidence_refs,latency_ms,input_tokens,output_tokens,cost_usd,created_at)
+            evidence_refs,latency_ms,input_tokens,output_tokens,cost_usd,created_at,
+            approval_version,provider_region,prompt_sha256,provider_input_sha256,
+            input_classes)
            SELECT ?,job_id,task_type,review_id,snapshot_id,observation_id,
                   risk_assessment_id,?,'VALIDATED',?,?,prompt_version,
-                  schema_version,input_sha256,?,?,?,?,?,?,NULL,?
+                  schema_version,input_sha256,?,?,?,?,?,?,NULL,?,?,?,?,?,?
            FROM ai_jobs WHERE job_id=?""",
         (str(uuid.uuid4()), source, provider, model, _hash(output_json),
          output_json, _canonical(output["citations"]), latency_ms,
-         input_tokens, output_tokens, _now(), job["job_id"]),
+         input_tokens, output_tokens, _now(),
+         provider_provenance["approval_version"] if provider_provenance else None,
+         provider_provenance["provider_region"] if provider_provenance else None,
+         provider_provenance["prompt_sha256"] if provider_provenance else None,
+         provider_provenance["provider_input_sha256"] if provider_provenance else None,
+         _canonical(provider_provenance["input_classes"]) if provider_provenance else None,
+         job["job_id"]),
     )
     _attempt(
         conn, job, "MODEL_SUCCESS" if source == "MODEL" else "FALLBACK",
@@ -357,7 +414,9 @@ def projection(conn, review_id: str):
         cur,
         """SELECT artifact_id,source,provider,model,prompt_version,schema_version,
                   input_sha256,output_sha256,output_json,evidence_refs,created_at,
-                  snapshot_id,observation_id,risk_assessment_id
+                  snapshot_id,observation_id,risk_assessment_id,
+                  approval_version,provider_region,prompt_sha256,
+                  provider_input_sha256,input_classes
            FROM ai_artifacts WHERE review_id=? AND validation_status='VALIDATED'
            ORDER BY created_at DESC,artifact_id DESC LIMIT 20""",
         (review_id,),
@@ -368,7 +427,10 @@ def projection(conn, review_id: str):
     binding = repo.review_evidence_binding(conn, review_id)
     for row in artifacts:
         try:
-            artifact_id, source, provider, model, prompt, schema, input_hash, output_hash, output_json, refs, created, snapshot, observation, assessment = row
+            (artifact_id, source, provider, model, prompt, schema, input_hash,
+             output_hash, output_json, refs, created, snapshot, observation,
+             assessment, approval_version, provider_region, prompt_sha256,
+             provider_input_sha256, input_classes) = row
             if not binding or (snapshot, observation, assessment) != (
                 binding["snapshot_id"], binding["observation_id"], binding["risk_assessment_id"]
             ) or _hash(output_json) != output_hash:
@@ -376,6 +438,23 @@ def projection(conn, review_id: str):
             value = validate_output(json.loads(output_json), [snapshot, observation, assessment])
             if value["citations"] != json.loads(refs):
                 continue
+            provenance_values = (
+                approval_version, provider_region, prompt_sha256,
+                provider_input_sha256, input_classes,
+            )
+            if any(provenance_values) and not all(provenance_values):
+                continue
+            if all(provenance_values):
+                if (source != "MODEL" or provider_region != "global"
+                        or not re.fullmatch(r"[0-9a-f]{64}", prompt_sha256)
+                        or not re.fullmatch(r"[0-9a-f]{64}", provider_input_sha256)
+                        or json.loads(input_classes) != ["EVIDENCE_REFERENCES", "RULE_TRIAGE"]):
+                    continue
+            provenance_state = (
+                "recorded" if all(provenance_values)
+                else "not_applicable" if source == "FALLBACK"
+                else "legacy_missing"
+            )
             return {
                 "status": "available", "authority": "validated_artifact",
                 "validated_artifact": True, "artifact_id": artifact_id,
@@ -384,6 +463,12 @@ def projection(conn, review_id: str):
                 "source": source, "provider": provider, "model": model,
                 "prompt_version": prompt, "schema_version": schema,
                 "input_sha256": input_hash, "output_sha256": output_hash,
+                "provider_provenance_state": provenance_state,
+                "approval_version": approval_version,
+                "provider_region": provider_region,
+                "prompt_sha256": prompt_sha256,
+                "provider_input_sha256": provider_input_sha256,
+                "input_classes": json.loads(input_classes) if input_classes else None,
                 "generated_at": str(created),
             }
         except (ValueError, TypeError, KeyError, json.JSONDecodeError):

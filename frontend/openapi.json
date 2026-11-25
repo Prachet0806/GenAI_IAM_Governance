@@ -213,6 +213,21 @@
         "title": "RemediationApprovalRequest",
         "type": "object"
       },
+      "ReviewQuestionRequest": {
+        "properties": {
+          "intent": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Intent",
+            "type": "string"
+          }
+        },
+        "required": [
+          "intent"
+        ],
+        "title": "ReviewQuestionRequest",
+        "type": "object"
+      },
       "ReviewerAssignmentRequest": {
         "properties": {
           "reviewer_sub": {
@@ -2277,6 +2292,58 @@
           }
         ],
         "summary": "Enqueue Review Explanation"
+      }
+    },
+    "/reviews/{review_id}/ai/questions": {
+      "post": {
+        "operationId": "answer_review_question_reviews__review_id__ai_questions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "review_id",
+            "required": true,
+            "schema": {
+              "title": "Review Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewQuestionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Answer Review Question"
       }
     },
     "/reviews/{review_id}/assignment": {

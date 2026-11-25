@@ -34,7 +34,7 @@ function allowed(path: string[], method: string): boolean {
   }
   if (method === "POST") {
     return [
-      /^reviews\/[^/]+\/(decision|ai\/explanation|assignment|exception(\/resolve)?|remediation\/reconciliation)$/,
+      /^reviews\/[^/]+\/(decision|ai\/(explanation|questions)|assignment|exception(\/resolve)?|remediation\/reconciliation)$/,
       /^campaigns(\/[^/]+\/(reviewers|state|owner|deadline))?$/,
       /^snapshots\/[^/]+\/invalidate$/,
       /^approvals\/[^/]+\/decision$/,

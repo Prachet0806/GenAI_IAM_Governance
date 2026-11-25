@@ -1,115 +1,52 @@
 # IAM Access Certification Engine
 
-A Python prototype for IAM inventory, entitlement risk assessment, access review campaigns, gated remediation, and audit exports. It supports local SQLite/Postgres, Floci-backed AWS-shaped tests, and a separate seeded dataset. It is not production-ready; see [production readiness](docs/production-readiness.md) for limitations and required controls.
+An evidence-first IAM governance prototype: collect account/source-scoped grant paths, triage frozen policy documents, run human review campaigns, verify audit exports, and gate direct-path remediation. A role-scoped frontend serves reviewers, campaign admins, independent remediation approvers, auditors, and operators. It runs with SQLite or PostgreSQL, a seeded offline dataset, Floci, or live AWS discovery. **It does not calculate a principal's complete effective AWS access and is not production-ready.**
 
-## Current capabilities
+## What exists
 
-- Discovers IAM user direct/group policy paths, IAM role managed/inline policies and trust paths, and Identity Center account assignment paths in separate account/source scopes. Managed policy documents are fetched where available; unresolved Identity Center customer managed references are marked as missing evidence. Permission boundaries, SCPs, resource policies, group membership expansion in Identity Center, and effective permissions remain outside the declared scopes.
-- Records attempts by AWS account and declared source scope. Real IAM user and role scans require `AWS_ACCOUNT_ID` before their first AWS call, then verify it with STS. A complete scan atomically publishes immutable grant-path observations and advances that source's published snapshot; a failed or superseded attempt retains the prior publication for audit but blocks new campaigns and live remediation for that source.
-- Keeps direct, user-inline, and each group-derived path distinct. Grant identity uses account, principal, grant type, source ID, and attachment ID; policy version, document hash, and observation time belong to the snapshot.
-- Evaluates frozen policy documents with a conservative rule set, stores append-only policy risk and separate grant-path assessments, and escalates unsupported evidence and partial action wildcards to HIGH. Known Identity Center statements remain visible even when another referenced document is missing. These assessments do not establish a principal's effective permissions.
-- Creates campaigns only against a fresh complete published snapshot with assessments for every observed path. A duplicate active campaign for the same snapshot is blocked, and grant conflicts roll back the entire creation. Each review is pinned to its snapshot, grant observation, and risk assessment. Older records are labelled `legacy_unknown_path`.
-- When multiple accounts have published snapshots, campaign generation requires an explicit `account_id` in its event so one account's evidence cannot be selected implicitly.
-- Offers a mock-only reviewer CLI and an OIDC-protected API with campaign owners, deadlines, states, reviewer queues, per-review assignments, exceptions, and immutable workflow events. A closed campaign cannot reopen; open exceptions and paused campaigns block decisions.
-- Keeps remediation in dry-run mode by default. Staging live execution requires `APP_ENV=staging`, `AWS_ACCOUNT_ID`, `STAGING_REMEDIATION_ACCEPTANCE_ID`, `ENABLE_REMEDIATION=true`, `ALLOW_LIVE_REMEDIATION=true`, `DRY_RUN=false`, and a non-empty exact-match allowlist. Production live execution remains blocked. The worker supports direct managed and direct inline IAM user policy paths; group, role, trust, and Identity Center paths remain ineligible.
-- Exports unique CSV/JSON artifacts, a frozen source/review manifest evidence bundle, and a manifest with SHA-256 hashes. S3 uploads use a per-export run path and surface upload errors.
-- Persists audit events, decision-bound artifact IDs, durable AI jobs and attempts, and immutable validated AI artifacts. Legacy summaries remain a labelled compatibility view.
-- Includes a role-scoped Next.js frontend for reviewers, campaign administrators, independent remediation approvers, auditors, and platform operators. Server-side APIs enforce role and AWS account scope; the frontend does not replace the discovery, evidence, risk, or remediation safety model.
+- Separate IAM user/direct/group, role policy/trust, and Identity Center assignment scans. A complete scan publishes immutable observations for its declared scope; failed or superseded attempts retain old evidence but block new campaign/live-remediation eligibility. Missing referenced documents and unassessed surfaces are explicit.
+- Versioned, append-only policy and grant-path assessments. Severity, rule confidence, evidence completeness, and legacy HIGH routing remain distinct. Campaign reviews pin a published snapshot, observation, attachment, and assessment; old rows disclose missing provenance. Same-account/scope snapshot comparison reports observed changes, not cross-source effective access.
+- OIDC API and five frontend workspaces with server-side role/account/assignment checks, decision and workflow events, independent approval, historical audit reconstruction, and scoped CSV/JSON/evidence/manifest exports with SHA-256 verification. The seeded CLI is a demo tool, not authentication.
+- Default-off advisory explanation jobs and a default-off deterministic, stateless review Q&A endpoint. Explanation provider input is minimized and requires current versioned approval; accepted artifacts record provenance. Neither AI path decides or remediates. The candidate evaluation corpus is unreviewed and no real-provider quality result is claimed.
+- Dry-run remediation by default. Controlled staging live actions support only direct managed IAM **user** policy detachment and direct inline user policy deletion, after independent approval and exact-path pre/postflight. Group, role, trust, and Identity Center paths have no live action; production mutation is code-blocked.
 
-## GenAI explanation
+Read [roadmap and release status](docs/roadmap.md), [evidence/risk contract](docs/evidence-and-risk.md), [AI governance](docs/ai-governance.md), [API permission contract](docs/frontend-api-contract.md), [Floci testing](docs/floci.md), [product validation](docs/product-validation.md), and [deployment acceptance](docs/production-readiness.md). These are the maintained docs; generated OpenAPI is in `frontend/openapi.json`.
 
-GenAI is advisory and disabled by default. For eligible pending HIGH-risk, snapshot-pinned reviews, the worker creates an idempotent database job, sends minimized frozen rule evidence with an HMAC-pseudonymized subject to the configured provider, validates typed output and exact evidence IDs, and stores an immutable artifact. A lease and retry budget prevent duplicate workers from publishing competing artifacts. Provider or validation failures retry and then produce a labelled deterministic fallback. The worker does not write decisions, approvals, or remediation state.
+## Local seeded quickstart
 
-The assigned reviewer's `GET /reviews/{review_id}` response, audit exports, and CLI all use the same artifact projection. `authority=validated_artifact` identifies validated output and resolves citations against the review's pinned evidence. Old `ai_risk_summary` records remain readable only as `authority=legacy_compatibility`; the worker no longer writes that column. A decision event records the artifact ID visible at decision time. Missing output is explicit. Jobs pin the provider model; a model change creates a new generation, and campaign admins can queue an audited retry of a `FAILED` job with `POST /ai/jobs/{job_id}/retry`.
+If no Python environment exists, create one; otherwise use the existing environment. Install `requirements.txt` and choose a **fresh** SQLite `DB_URL` when you want a clean demo. In PowerShell:
 
-Enable it only after reviewing provider and data-handling requirements:
-
-```bash
-export ENABLE_GENAI=true
-export GOOGLE_API_KEY=your_key_here
-export AI_PROVIDER_DATA_APPROVED=true
-export AI_PSEUDONYM_KEY=your_secret_from_a_secret_manager
-export GENAI_MODEL=gemini-3.8-flash
-```
-
-The worker sends redacted risk evidence and a policy hash, not the full policy document. Resource strings can still contain sensitive context, so provider/data approval and a secret pseudonym key are required. Review [AI quality gates](docs/ai-quality-gates.md) before enabling broader brief, Q&A, or campaign insight tasks. The [product and implementation roadmap v2.1](docs/ai-roadmap-v2.1.md) sets the customer story, scope, proposed files, and release gates for future work.
-
-## Local mock quickstart
-
-```bash
+```powershell
+# Run only if .venv does not already exist:
 python -m venv .venv
-# Activate the environment for your shell, then:
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-export DB_URL=sqlite:///iam_governance.db
-export MOCK_IAM=false
-export SEEDED_IAM=true
-export LOCAL_ONLY=true
+$env:DB_URL = 'sqlite:///iam_governance.db'
+$env:MOCK_IAM = 'false'; $env:SEEDED_IAM = 'true'; $env:LOCAL_ONLY = 'true'
 python scripts/migrate.py
 python lambdas/identity_discovery/handler.py
-python lambdas/role_discovery/handler.py  # separate mock role source
+python lambdas/role_discovery/handler.py
 python lambdas/risk_evaluation/handler.py
 python lambdas/generate_reviews/handler.py
-python lambdas/ai_explanation/handler.py  # skips provider if disabled
 python scripts/review.py list --status PENDING
 ```
 
-The demo script runs these stages and a simulated reviewer cycle. It preserves the configured database; select a fresh `DB_URL` when you want a clean demo database.
+`scripts/run_demo.sh` also runs a simulated reviewer cycle and preserves the configured database. The CLI can decide only seeded `MOCK` snapshot reviews; `auto-demo` decisions cannot authorize remediation. Use the OIDC API for authenticated review decisions. `python scripts/review.py --help` lists CLI operations.
 
-## Reviewer CLI
+## IAM modes and local stack
 
-```bash
-python scripts/review.py list --status PENDING --risk HIGH
-python scripts/review.py decide --review-id <id> --decision REVOKED --comment "Least privilege review"
-python scripts/review.py stats
-python scripts/review.py audit --tail 20
-```
+| Mode | `MOCK_IAM` | `SEEDED_IAM` | Source |
+| --- | --- | --- | --- |
+| Floci SDK integration | `false` | `false` | `FLOCI` |
+| Real AWS credentials/endpoints | `true` | `false` | `AWS` |
+| Deterministic offline dataset | `false` | `true` | `MOCK` |
 
-`auto-demo` creates simulated decisions and requires `SEEDED_IAM=true` plus a pinned `MOCK` snapshot. CLI decisions are restricted to the same evidence source; legacy/unpinned, Floci-sourced, and AWS-sourced reviews are rejected. Only OIDC API decision events satisfy the non-production remediation approval gate. Use the OIDC review API for real review decisions after configuring issuer, audience, JWKS, reviewer group, and campaign administrator group.
+Set `AWS_ACCOUNT_ID` for real IAM user/role scans before the first call; STS then verifies the intended account. In Floci mode it must match `FLOCI_ACCOUNT_ID` (default `111111111111`). The live client rejects AWS endpoint overrides. Floci evidence cannot be reused for live AWS remediation. See [Floci smoke, benchmark, fault, and crash tests](docs/floci.md).
 
-Run the API behind a TLS-terminating gateway with restricted network access:
+For a local OIDC-backed integration stack, copy `.env.example` to `.env`, set a strong `POSTGRES_PASSWORD`, OIDC/API/frontend secrets and role groups, then run `docker compose up --build`. Migrations precede the API; Compose uses PostgreSQL and Floci with `MOCK_IAM=false`, GenAI off, and remediation dry-run. Frontend is bound to `127.0.0.1:3000` and Floci to `127.0.0.1:4566`. See [frontend setup](frontend/README.md). Compose does not provision a real identity provider, managed AWS resources, public TLS/WAF, worker fleet, backups, or monitoring.
 
-```bash
-uvicorn api.review_service:app --host 127.0.0.1 --port 8080
-```
+## Configuration and verification
 
-The role workspaces use the existing unversioned API. Campaign administrators can inspect scoped collection/publication attempts with `GET /discovery-attempts`, compare two published snapshots of the same account and source scope at `/snapshots/{id}/compare/{other_id}`, check readiness, create a campaign, assign reviewers, and monitor progress and lifecycle events. Reviewers use a filterable, sortable, offset-paginated `GET /reviews/queue` and can trace the observed principal-to-policy path, frozen matched statement, rule finding, and decision history. Campaign administrators can also open scoped, read-only review evidence; decision mutations still require reviewer authorization and assignment. Remediation approvers use `GET /approvals` and `/approvals/{review_id}`, then record an independent approval or decline with a reason at `/approvals/{review_id}/decision`. Auditors use `GET /audit/events`, `/audit/reviews/{review_id}`, and the scoped `/exports` endpoints to reconstruct historical evidence and download or verify CSV, JSON, evidence-bundle, and manifest artifacts. Operators use `/operations/health`, `/operations/integrations`, `/operations/jobs`, and `/operations/audit`; worker heartbeat is reported as unavailable until an actual heartbeat source is deployed. The generated frontend API schema is in `frontend/src/lib/api/schema.d.ts`; the proposed `/api/v1` routes in the contract document are not the routes currently called by the app.
+Use `.env.example` as the configuration inventory. Key groups are `DB_URL`; AWS/Floci account, region and credentials; `MOCK_IAM`/`SEEDED_IAM`; OIDC issuer/audience/JWKS/account-scope claim and role groups; frontend Auth.js settings; audit S3/local flags; and remediation environment, dry-run, allow/denylist and approval gates. `ENABLE_GENAI` and `ENABLE_REVIEW_QA` default off. Explanation traffic additionally needs provider key, pseudonym secret, `AI_PROVIDER_DATA_APPROVED`, region, and exact `AI_PROVIDER_APPROVAL_JSON`; do not enable it without the [AI data, quality, and operational gates](docs/ai-governance.md). Keep secrets outside Git.
 
-### Frontend workspaces
-
-The local frontend and container setup are described in [frontend workspaces](docs/frontend-workspaces.md) and [frontend setup](frontend/README.md). For a local OIDC-backed integration stack, copy `.env.example` to `.env`, configure the API and frontend OIDC settings and group names, then run:
-
-```bash
-docker compose up --build
-```
-
-The stack uses PostgreSQL, runs migrations before starting the API, and includes Floci with `MOCK_IAM=false`, disabled GenAI, and dry-run remediation. Floci is bound to `127.0.0.1:4566`; the frontend is bound to `127.0.0.1:3000`. The API uses the internal `http://floci:4566` endpoint. This is a local integration deployment, not AWS staging or production infrastructure. For a disposable SDK-to-Floci scan, follow [Floci integration](docs/floci-integration.md). For frontend development without containers, follow `frontend/README.md`.
-
-## Configuration
-
-- `DB_URL`: SQLite path or Postgres URL.
-- `AWS_REGION`, `AWS_PROFILE`, `AWS_ACCOUNT_ID`: AWS discovery settings. `AWS_ACCOUNT_ID` is required for IAM user and role scans so a failed STS check is recorded against the intended source. In Floci mode it must match `FLOCI_ACCOUNT_ID`; in live AWS mode set the intended real account. User/group scans need IAM policy and group read permissions; role scans additionally need `iam:ListRoles`, `iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`, and `iam:GetRolePolicy`. Identity Center scans need account assignment and permission set read permissions plus identity-store describe permissions. Live direct-path preflight also reads the current user identity.
-- `MOCK_IAM=false`: use Floci for AWS-shaped calls. `MOCK_IAM=true`: use live AWS credentials and endpoints. `SEEDED_IAM=true` selects the deterministic offline dataset and requires `MOCK_IAM=false`. `FLOCI_ENDPOINT_URL` defaults to `http://127.0.0.1:4566`; `FLOCI_ACCOUNT_ID` defaults to `111111111111`.
-- `ENABLE_GENAI`, `GOOGLE_API_KEY`, `GENAI_MODEL`, `AI_PROVIDER_DATA_APPROVED`, `AI_PSEUDONYM_KEY`: advisory explanation worker and privacy gates.
-- `DRY_RUN`, `ENABLE_REMEDIATION`, `ALLOW_LIVE_REMEDIATION`, `ALLOW_EMULATOR_MUTATION`, `REMEDIATION_ALLOWLIST`, `REMEDIATION_DENYLIST`, `STAGING_REMEDIATION_ACCEPTANCE_ID`, `REMEDIATION_WORKER_ID`: remediation gates and audit actor. Mandatory administrator and break-glass deny patterns cannot be removed by configuration.
-- `AUDIT_S3_BUCKET`, `AUDIT_S3_PREFIX`, `LOCAL_ONLY`: audit export target.
-- `APP_ENV`: environment mode; `emulator` permits separately gated Floci mutation, while only `staging` can execute live AWS remediation after its gates pass. Production remains code-blocked. The review API always requires valid OIDC configuration.
-- `MAX_DISCOVERY_AGE_HOURS`: maximum age of a complete AWS scan for non-production live remediation (default 24, maximum 168).
-- `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`, `OIDC_GROUP_CLAIM`, `OIDC_ACCOUNT_SCOPE_CLAIM`, and role-group values: OIDC authorization configuration. Staging/production require account scope. `OIDC_ALLOW_GLOBAL_SCOPE` and `OIDC_ALLOW_UNVERIFIED_REVIEWER_ASSIGNMENTS` are development-only opt-ins; reviewer assignment is blocked in shared environments until an identity-provider directory verifier is integrated. Use immutable OIDC `sub` values for actors and assignments.
-- Frontend `AUTH_OIDC_ISSUER`, `AUTH_CLIENT_ID`, `AUTH_CLIENT_SECRET`, `AUTH_SECRET`, `AUTH_SCOPE`, `IAM_API_BASE_URL`, and `FRONTEND_ORIGIN`: Auth.js OIDC client, server-side API proxy, and CSRF origin configuration. Keep client secrets and signing secrets outside source control.
-- Local Compose `POSTGRES_PASSWORD` and optional `FRONTEND_PORT`: local database credential and loopback frontend port.
-
-Copy `.env.example` for local configuration. Do not commit credentials.
-
-## Schema and audit outputs
-
-Ordered migrations are in `sql/migrations/`. Each numbered portable SQL file may have a matching `.sqlite.sql` or `.postgres.sql` file. Run `python scripts/migrate.py` before starting workers or the review API. The runner applies pending migrations transactionally, records a SHA-256 checksum in `schema_migrations`, and rejects edited or missing applied migrations. Migration 0001 also upgrades older databases that predate its compatibility columns. Add new numbered files for future schema changes; do not edit an applied migration. Export artifacts are written under `reports/` using date plus unique run ID, with a `.manifest.json` file. Set `LOCAL_ONLY=true` to skip S3.
-
-GitHub Actions is configured to run the SQLite suite, a separate Postgres 17 migration/concurrency job, a Floci IAM SDK integration scan, frontend typecheck/lint/unit tests, five Playwright role journeys, build, and API/frontend container image builds in [.github/workflows/ci.yml](.github/workflows/ci.yml). Browser journeys in `frontend/e2e` use a test-only session and mocked backend; they do not establish real OIDC or backend/cloud integrations. A workflow definition is not evidence that hosted CI passed at this checkout. Live AWS, real Identity Center, S3, OIDC-provider integration, and AI-provider calls are not exercised by these jobs.
-
-## Known boundaries
-
-- A revoked path is a decision about that path; other grants can still give the principal similar access. The system does not compute aggregate effective access. Descriptive user/policy tables can retain stale entities even though the published grant view is source-scoped.
-- Historical reviews created before snapshot pinning retain unknown path and policy-version provenance; the current mutable policy must not be treated as their historical evidence.
-- The reviewer CLI is not an authentication system.
-- Docker Compose supports a local integration stack only. Cloud infrastructure, managed identity, TLS/WAF, worker scheduling and heartbeat, secret-manager integration, provider retention approval, and production alerting are not provisioned here.
-- Local tests and the Postgres service test do not establish AWS, S3, AI-provider, or production deployment readiness.
+Run `python scripts/migrate.py` before workers/API. Ordered SQL migrations are checksum-verified and applied transactionally; change schema with a **new** numbered migration, never an edited applied file. Export artifacts use unique run paths under `reports/`; `LOCAL_ONLY=true` skips S3. The CI workflow defines SQLite/PostgreSQL, Floci, frontend unit/browser/build, and image checks, but its existence is not a hosted result at this revision. Mocked browser journeys do not prove real OIDC/API/AWS behavior. Live AWS, Identity Center, provider, S3, and production deployment require separate controlled acceptance.

@@ -46,7 +46,7 @@ GENAI_MODEL = os.getenv("GENAI_MODEL", "gemini-3.8-flash")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Schema/versioning
-SCHEMA_VERSION = "2026-11-phase0-evidence-risk"
+SCHEMA_VERSION = "2026-11-release2-ai-provenance"
 
 
 # --- Runtime getters (avoid import-time freezing for Lambda) ---
@@ -157,6 +157,18 @@ def get_genai_model() -> str:
 
 def is_genai_enabled() -> bool:
     return _get_bool("ENABLE_GENAI", False)
+
+
+def is_review_qa_enabled() -> bool:
+    """Controlled Release 2 evaluation switch; off until its release gates pass."""
+    return _get_bool("ENABLE_REVIEW_QA", False)
+
+
+def get_ai_max_calls_per_invocation() -> int:
+    try:
+        return max(1, min(int(os.getenv("AI_MAX_CALLS_PER_INVOCATION", "10")), 100))
+    except (TypeError, ValueError):
+        return 10
 
 
 def get_db_url() -> str:

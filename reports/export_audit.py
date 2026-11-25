@@ -102,9 +102,9 @@ def export_audit_report(*, campaign_id: str | None = None,
         # Integrity: counts by status (index 5 per fetch_reviews_for_export contract)
         status_counts = {}
         for row in rows:
-            if len(row) != 42:
+            if len(row) != 48:
                 raise RuntimeError(
-                    f"Unexpected export row width {len(row)}; expected 42."
+                    f"Unexpected export row width {len(row)}; expected 48."
                 )
             status = row[5]
             status_counts[status] = status_counts.get(status, 0) + 1
@@ -156,6 +156,12 @@ def export_audit_report(*, campaign_id: str | None = None,
                     "Remediation Action Events",
                     "Observed Principal ARN",
                     "Remediation Reconciliation Events",
+                    "AI Provider Provenance State",
+                    "AI Approval Version",
+                    "AI Provider Region",
+                    "AI Prompt SHA256",
+                    "AI Provider Input SHA256",
+                    "AI Input Classes",
                     "Assessment",
                     "Source Manifest SHA256",
                     "Review Manifest SHA256",
@@ -224,6 +230,12 @@ def export_audit_report(*, campaign_id: str | None = None,
                 "remediation_action_events": json.loads(r[39]),
                 "observed_principal_arn": r[40],
                 "remediation_reconciliation_events": json.loads(r[41]),
+                "ai_provider_provenance_state": r[42],
+                "ai_approval_version": r[43],
+                "ai_provider_region": r[44],
+                "ai_prompt_sha256": r[45],
+                "ai_provider_input_sha256": r[46],
+                "ai_input_classes": json.loads(r[47]) if r[47] else None,
                 **annotations[r[0]],
             }
             for r in rows

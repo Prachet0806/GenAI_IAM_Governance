@@ -8,6 +8,7 @@ import json
 import hashlib
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,6 +23,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from common import ai_artifacts, auth, config, evidence_manifest, repo, snapshot_history, workflow, workspaces
+from common.ai import provider_controls, retrieval, review_qa, telemetry
 from common.db import db
 
 @asynccontextmanager
@@ -40,6 +42,10 @@ bearer = HTTPBearer(auto_error=False)
 class DecisionRequest(BaseModel):
     decision: Literal["APPROVED", "REVOKED"]
     comment: str = Field(default="", max_length=4000)
+
+
+class ReviewQuestionRequest(BaseModel):
+    intent: str = Field(min_length=1, max_length=40)
 
 
 class ReviewerAssignmentRequest(BaseModel):
@@ -562,6 +568,7 @@ def _review_detail_payload(conn, review_id: str, review_state: dict, claims: dic
             "review_scope": "GRANT_PATH" if row[12] else "LEGACY_UNKNOWN_PATH",
             "principal_access_status": "not_evaluated",
             "ai_explanation": ai_artifacts.projection(conn, review_id),
+            "review_qa_enabled": config.is_review_qa_enabled(),
             "assigned_reviewer_sub": review_state["assigned_reviewer_sub"],
             "can_decide": decision_reason is None,
             "can_decide_reason": decision_reason,
@@ -690,6 +697,49 @@ def decide_review(
     return {"review_id": review_id, "status": request.decision}
 
 
+@app.post("/reviews/{review_id}/ai/questions")
+def answer_review_question(
+    review_id: str, request: ReviewQuestionRequest,
+    http_request: Request,
+    claims: dict = Depends(current_reviewer),
+):
+    require_reviewer_group(claims)
+    if not config.is_review_qa_enabled():
+        raise HTTPException(status_code=409, detail="Review Q&A is disabled")
+    key = telemetry.telemetry_key()
+    if key is None:
+        raise HTTPException(status_code=409, detail="Review Q&A telemetry is not configured")
+    started = time.monotonic()
+    with db.get_connection() as conn:
+        item = workflow.review_workflow(conn, review_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Review not found")
+        require_review_assignment(
+            conn, review_id, item["campaign_id"], claims["sub"], claims=claims,
+        )
+        if item["status"] != "PENDING" or item["campaign_state"] != "OPEN":
+            raise HTTPException(status_code=409, detail="Review is not open for questions")
+        bundle = retrieval.pinned_review(conn, review_id)
+        if bundle is None:
+            raise HTTPException(status_code=409, detail="Pinned review evidence unavailable")
+        intent = request.intent.strip().upper()
+        answer = (
+            review_qa.answer(bundle, intent) if intent in review_qa.INTENTS
+            else review_qa.abstain(bundle)
+        )
+        current = repo.eligible_published_snapshot(
+            conn, bundle["binding"]["account_id"], bundle["binding"]["source_scope"],
+        )
+        result = {**answer, "current_snapshot_eligible": bool(
+            current and current["snapshot_id"] == bundle["binding"]["snapshot_id"]
+        )}
+        telemetry.log_review_qa_turn(
+            request_id=http_request.state.request_id, intent=intent, result=result,
+            latency_ms=int((time.monotonic() - started) * 1000), key=key,
+        )
+        return result
+
+
 @app.post("/reviews/{review_id}/ai/explanation", status_code=202)
 def enqueue_review_explanation(review_id: str, claims: dict = Depends(current_reviewer)):
     require_reviewer_group(claims)
@@ -700,6 +750,12 @@ def enqueue_review_explanation(review_id: str, claims: dict = Depends(current_re
         or not os.getenv("GOOGLE_API_KEY")
     ):
         raise HTTPException(status_code=409, detail="AI explanation is disabled")
+    try:
+        provider_controls.current_approval(
+            model=config.get_genai_model(), prompt=provider_controls.PROMPT_PREFIX,
+        )
+    except provider_controls.ApprovalRejected:
+        raise HTTPException(status_code=409, detail="AI provider approval is unavailable") from None
     with db.get_connection() as conn:
         item = workflow.review_workflow(conn, review_id)
         if not item:
@@ -707,6 +763,13 @@ def enqueue_review_explanation(review_id: str, claims: dict = Depends(current_re
         require_review_assignment(
             conn, review_id, item["campaign_id"], claims["sub"], claims=claims
         )
+        try:
+            provider_controls.current_approval(
+                model=config.get_genai_model(), prompt=provider_controls.PROMPT_PREFIX,
+                account_id=item["account_id"],
+            )
+        except provider_controls.ApprovalRejected:
+            raise HTTPException(status_code=409, detail="AI provider approval is unavailable for this account") from None
         job = ai_artifacts.enqueue_review(
             conn, review_id, pseudonym_key=os.getenv("AI_PSEUDONYM_KEY")
         )
@@ -739,6 +802,12 @@ def retry_ai_job(job_id: str, claims: dict = Depends(current_reviewer)):
         or not os.getenv("GOOGLE_API_KEY")
     ):
         raise HTTPException(status_code=409, detail="AI explanation is disabled")
+    try:
+        provider_controls.current_approval(
+            model=config.get_genai_model(), prompt=provider_controls.PROMPT_PREFIX,
+        )
+    except provider_controls.ApprovalRejected:
+        raise HTTPException(status_code=409, detail="AI provider approval is unavailable") from None
     with db.get_connection() as conn:
         try:
             job = ai_artifacts.retry_failed_job(
@@ -751,6 +820,13 @@ def retry_ai_job(job_id: str, claims: dict = Depends(current_reviewer)):
             raise HTTPException(status_code=404, detail="AI job not found")
         item = require_review_scope(conn, claims, job["review_id"])
         require_campaign_scope(conn, claims, item["campaign_id"])
+        try:
+            provider_controls.current_approval(
+                model=config.get_genai_model(), prompt=provider_controls.PROMPT_PREFIX,
+                account_id=item["account_id"],
+            )
+        except provider_controls.ApprovalRejected:
+            raise HTTPException(status_code=409, detail="AI provider approval is unavailable for this account") from None
     return job
 
 
@@ -1578,13 +1654,24 @@ def operations_health(claims: dict = Depends(current_reviewer)):
 @app.get("/operations/integrations")
 def operations_integrations(claims: dict = Depends(current_reviewer)):
     require_remediation_operator(claims)
+    try:
+        approval = provider_controls.current_approval(
+            model=config.get_genai_model(), prompt=provider_controls.PROMPT_PREFIX,
+        )
+    except provider_controls.ApprovalRejected:
+        approval = None
     return {
         "oidc": {"configured": bool(os.getenv("OIDC_ISSUER") and os.getenv("OIDC_AUDIENCE") and os.getenv("OIDC_JWKS_URL"))},
         "aws": {"credential_source_configured": bool(os.getenv("AWS_ROLE_ARN") or os.getenv("AWS_PROFILE") or os.getenv("AWS_ACCESS_KEY_ID")),
                 "source_mode": config.iam_source_mode(),
                 "mock_mode": config.is_seeded_iam(), "region_configured": bool(os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")),
                 "connectivity": "not_checked"},
-        "genai": {"enabled": config.is_genai_enabled(), "provider_data_approved": os.getenv("AI_PROVIDER_DATA_APPROVED", "").lower() == "true"},
+        "genai": {
+            "enabled": config.is_genai_enabled(),
+            "provider_data_approved": os.getenv("AI_PROVIDER_DATA_APPROVED", "").lower() == "true",
+            "provider_approval_current": approval is not None,
+            "provider_region": approval["region"] if approval else None,
+        },
         "audit_storage": {"s3_bucket_configured": bool(os.getenv("AUDIT_S3_BUCKET")),
                           "kms_key_configured": bool(os.getenv("AUDIT_S3_KMS_KEY_ID"))},
         "remediation": {"enabled": config.is_remediation_enabled(),

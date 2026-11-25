@@ -1863,6 +1863,12 @@ def fetch_reviews_for_export(conn, *, campaign_id: str | None = None,
             json.dumps(remediation["action_events"], sort_keys=True),
             (review_evidence_binding(conn, row[0]) or {}).get("principal_arn"),
             json.dumps(remediation["reconciliation_events"], sort_keys=True),
+            ai.get("provider_provenance_state"),
+            ai.get("approval_version"),
+            ai.get("provider_region"),
+            ai.get("prompt_sha256"),
+            ai.get("provider_input_sha256"),
+            json.dumps(ai.get("input_classes"), sort_keys=True),
         ))
         results.append(tuple(row))
     return results

@@ -61,7 +61,11 @@ def test_sqlite_fresh_install_and_rerun(tmp_path, monkeypatch):
     migrate.apply_sqlite()
     migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 14
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 15
+        assert {"approval_version", "provider_region", "prompt_sha256",
+                "provider_input_sha256", "input_classes"}.issubset({
+                    row[1] for row in conn.execute("PRAGMA table_info(ai_artifacts)")
+                })
         assert conn.execute("SELECT COUNT(*) FROM governance_mutex").fetchone()[0] == 1
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -85,7 +89,7 @@ def test_sqlite_legacy_upgrade_preserves_data(tmp_path, monkeypatch):
             assert column in {
                 row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')
             }
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 14
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 15
 
 
 def test_sqlite_upgrade_from_committed_pr1_ledger(tmp_path, monkeypatch):
@@ -102,7 +106,7 @@ def test_sqlite_upgrade_from_committed_pr1_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", source)
     migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (14,)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (15,)
         assert conn.execute("SELECT role_name FROM roles WHERE role_id='R1'").fetchone() == ("Reader",)
 
 
@@ -132,7 +136,7 @@ def test_sqlite_upgrade_from_pr3_with_existing_grant_evidence(tmp_path, monkeypa
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert conn.execute("SELECT grant_type FROM grant_paths WHERE grant_id='G1'").fetchone() == ("DIRECT_MANAGED",)
         assert conn.execute("SELECT evidence_status FROM grant_observations WHERE observation_id='O1'").fetchone() == ("COMPLETE",)
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (14,)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (15,)
         assert conn.execute("SELECT principal_arn FROM grant_observations WHERE observation_id='O1'").fetchone() == (None,)
 
 
@@ -142,7 +146,7 @@ def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeyp
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", files)
     path = tmp_path / "rollback.db"
     _set_sqlite(monkeypatch, path)
-    (files / "0015_bad.sql").write_text(
+    (files / "0016_bad.sql").write_text(
         "CREATE TABLE should_rollback (id INTEGER); INSERT INTO absent VALUES (1);",
         encoding="utf-8",
     )
@@ -150,7 +154,7 @@ def test_sqlite_migration_failure_rolls_back_and_detects_drift(tmp_path, monkeyp
         migrate.apply_sqlite()
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
-    (files / "0015_bad.sql").unlink()
+    (files / "0016_bad.sql").unlink()
     migrate.apply_sqlite()
     baseline = files / "0001_baseline.sql"
     baseline.write_text(
@@ -210,6 +214,7 @@ def test_postgres_fresh_install_and_concurrent_migration(postgres_schema):
             ("0012_collection_receipts", 64),
             ("0013_grant_assessment_evidence", 64),
             ("0014_evidence_invalidations", 64),
+            ("0015_ai_provider_provenance", 64),
         ]
         cur.execute("SELECT COUNT(*) FROM governance_mutex")
         assert cur.fetchone() == (1,)
@@ -317,7 +322,7 @@ def test_postgres_upgrade_from_committed_pr1_ledger(postgres_schema, tmp_path, m
     migrate.apply_postgres()
     with psycopg2.connect(postgres_schema) as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM schema_migrations")
-        assert cur.fetchone() == (14,)
+        assert cur.fetchone() == (15,)
         cur.execute("SELECT role_name FROM roles WHERE role_id='R1'")
         assert cur.fetchone() == ("Reader",)
 

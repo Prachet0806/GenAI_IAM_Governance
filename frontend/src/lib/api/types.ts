@@ -56,6 +56,12 @@ export type AiExplanation = {
   source?: string;
   provider?: string | null;
   model?: string | null;
+  provider_provenance_state?: "recorded" | "legacy_missing" | "not_applicable";
+  approval_version?: string | null;
+  provider_region?: string | null;
+  prompt_sha256?: string | null;
+  provider_input_sha256?: string | null;
+  input_classes?: string[] | null;
   generated_at?: string;
   message?: string;
 };
@@ -152,12 +158,36 @@ export type ReviewDetail = {
   review_scope: "GRANT_PATH" | "LEGACY_UNKNOWN_PATH";
   principal_access_status: "not_evaluated";
   ai_explanation: AiExplanation;
+  review_qa_enabled: boolean;
   assigned_reviewer_sub: string | null;
   can_decide: boolean;
   can_decide_reason: string | null;
   due_at: string | null;
   exception_state: string;
   campaign_state: string;
+};
+
+export type ReviewQuestionAnswer = {
+  status: "ANSWERED" | "ABSTAINED";
+  intent: string;
+  answer: string;
+  limitations: string;
+  review_manifest_sha256: string;
+  current_snapshot_eligible: boolean | null;
+  source: "DETERMINISTIC_TEMPLATE";
+  claims: Array<{
+    type: string;
+    subject: string;
+    value: Record<string, unknown>;
+    evidence_id: string;
+    manifest_sha256: string;
+  }>;
+  evidence: {
+    retrieved: string[];
+    considered: string[];
+    cited: string[];
+    unavailable: string[];
+  };
 };
 
 export type ReviewHistoryEvent = {
